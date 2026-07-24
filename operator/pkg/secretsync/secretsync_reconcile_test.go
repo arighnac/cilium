@@ -5,7 +5,9 @@ package secretsync_test
 
 import (
 	"context"
+	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
@@ -24,12 +26,23 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	gateway_api "github.com/cilium/cilium/operator/pkg/gateway-api"
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
+	"github.com/cilium/cilium/operator/pkg/gateway-api/indexers"
 	"github.com/cilium/cilium/operator/pkg/ingress"
 	"github.com/cilium/cilium/operator/pkg/secretsync"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	syncnames "github.com/cilium/cilium/pkg/secretsync/names"
 )
 
 var secretsNamespace = "cilium-secrets-test"
+
+const testSecretSyncControllerName = "example.com/test-gateway-controller"
+
+func withGatewaySecretIndexes(b *fake.ClientBuilder) *fake.ClientBuilder {
+	return b.
+		WithIndex(&gatewayv1.Gateway{}, helpers.GatewaySecretIndex, indexers.IndexGatewayBySecret).
+		WithIndex(&gatewayv1.ListenerSet{}, helpers.ListenerSetSecretIndex, indexers.IndexListenerSetBySecret)
+}
 
 var secretFixture = []client.Object{
 	&corev1.Secret{
@@ -54,7 +67,7 @@ var secretFixture = []client.Object{
 			Name:      "test-synced-secret-no-reference",
 			Labels: map[string]string{
 				secretsync.OwningSecretNamespace: "test",
-				secretsync.OwningSecretName:      "syced-secret-no-reference",
+				secretsync.OwningSecretName:      "synced-secret-no-reference",
 			},
 		},
 	},
@@ -79,7 +92,7 @@ var secretFixture = []client.Object{
 			Name: "cilium",
 		},
 		Spec: gatewayv1.GatewayClassSpec{
-			ControllerName: "io.cilium/gateway-controller",
+			ControllerName: testSecretSyncControllerName,
 		},
 	},
 	&gatewayv1.Gateway{
@@ -95,7 +108,7 @@ var secretFixture = []client.Object{
 					Port:     443,
 					Hostname: ptr.To[gatewayv1.Hostname]("*.cilium.io"),
 					Protocol: "HTTPS",
-					TLS: &gatewayv1.GatewayTLSConfig{
+					TLS: &gatewayv1.ListenerTLSConfig{
 						CertificateRefs: []gatewayv1.SecretObjectReference{
 							{
 								Name: "synced-secret-with-source-and-ref",
@@ -136,7 +149,7 @@ var secretFixture = []client.Object{
 					Port:     443,
 					Hostname: ptr.To[gatewayv1.Hostname]("*.acme.io"),
 					Protocol: "HTTPS",
-					TLS: &gatewayv1.GatewayTLSConfig{
+					TLS: &gatewayv1.ListenerTLSConfig{
 						CertificateRefs: []gatewayv1.SecretObjectReference{
 							{
 								Name: "secret-with-non-cilium-ref",
@@ -166,7 +179,7 @@ var secretFixture = []client.Object{
 					Port:     443,
 					Hostname: ptr.To[gatewayv1.Hostname]("*.cilium.io"),
 					Protocol: "HTTPS",
-					TLS: &gatewayv1.GatewayTLSConfig{
+					TLS: &gatewayv1.ListenerTLSConfig{
 						CertificateRefs: []gatewayv1.SecretObjectReference{
 							{
 								Name: "secret-shared-not-synced",
@@ -195,18 +208,20 @@ var secretFixture = []client.Object{
 }
 
 func Test_SecretSync_Reconcile(t *testing.T) {
-	logger := hivetest.Logger(t)
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 
-	c := fake.NewClientBuilder().
+	c := withGatewaySecretIndexes(fake.NewClientBuilder().
 		WithScheme(testScheme()).
-		WithObjects(secretFixture...).
+		WithObjects(secretFixture...)).
 		Build()
+
+	gatewayHandler := gateway_api.NewSecretSyncHandler(c, logger, testSecretSyncControllerName)
 
 	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
 		{
 			RefObject:            &gatewayv1.Gateway{},
-			RefObjectEnqueueFunc: gateway_api.EnqueueTLSSecrets(c, logger),
-			RefObjectCheckFunc:   gateway_api.IsReferencedByCiliumGateway,
+			RefObjectEnqueueFunc: gatewayHandler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   gatewayHandler.IsReferencedByGateway,
 			SecretsNamespace:     secretsNamespace,
 		},
 		{
@@ -215,103 +230,109 @@ func Test_SecretSync_Reconcile(t *testing.T) {
 			RefObjectCheckFunc:   ingress.IsReferencedByCiliumIngress,
 			SecretsNamespace:     secretsNamespace + "-2",
 		},
-	})
+	},
+		time.Minute,
+		0.1,
+	)
 
 	t.Run("delete synced secret if source secret doesn't exist", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "synced-secret-no-source",
 			},
 		})
 		require.NoError(t, err)
+		// This one should not be requeued, as it doesn't exist any more.
 		require.Equal(t, ctrl.Result{}, result)
 
 		secret := &corev1.Secret{}
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-synced-secret-no-source"}, secret)
+		err = c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-synced-secret-no-source"}, secret)
 
 		require.Error(t, err)
 		require.ErrorContains(t, err, "secrets \"test-synced-secret-no-source\" not found")
 	})
 
 	t.Run("delete synced secret if source secret isn't referenced by a CIlium Gateway resource", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "synced-secret-no-reference",
 			},
 		})
 		require.NoError(t, err)
+		// This one should not be requeued, as it is not referenced by a Gateway resource.
 		require.Equal(t, ctrl.Result{}, result)
 
 		secret := &corev1.Secret{}
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-synced-secret-no-reference"}, secret)
+		err = c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-synced-secret-no-reference"}, secret)
 
 		require.Error(t, err)
 		require.ErrorContains(t, err, "secrets \"test-synced-secret-no-reference\" not found")
 	})
 
 	t.Run("keep synced secret if source secret exists and is referenced by a Gateway resource", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "synced-secret-with-source-and-ref",
 			},
 		})
 		require.NoError(t, err)
-		require.Equal(t, ctrl.Result{}, result)
+		require.True(t, resultHasResync(result))
 
 		secret := &corev1.Secret{}
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-synced-secret-with-source-and-ref"}, secret)
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "synced-secret-with-source-and-ref"), secret)
 		require.NoError(t, err)
 	})
 
 	t.Run("don't create synced secret for source secret that is referenced by a non Cilium Gateway resource", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "secret-with-non-cilium-ref",
 			},
 		})
 		require.NoError(t, err)
+		// This one should not be requeued, as it is not referenced by a Cilium Gateway resource.
 		require.Equal(t, ctrl.Result{}, result)
 
 		secret := &corev1.Secret{}
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-synced-secret-non-cilium-ref"}, secret)
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "secret-with-non-cilium-ref"), secret)
 
-		require.Error(t, err)
-		require.ErrorContains(t, err, "secrets \"test-synced-secret-non-cilium-ref\" not found")
+		require.True(t, k8sErrors.IsNotFound(err))
 	})
 
 	t.Run("create synced secret for source secret that is referenced by a Cilium Gateway resource", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "secret-with-ref-not-synced",
 			},
 		})
 		require.NoError(t, err)
-		require.Equal(t, ctrl.Result{}, result)
+		require.True(t, resultHasResync(result))
 
 		secret := &corev1.Secret{}
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-secret-with-ref-not-synced"}, secret)
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "secret-with-ref-not-synced"), secret)
 		require.NoError(t, err)
+		requireSourceAnnotations(t, secret, secretsync.SourceKindSecret, "test", "secret-with-ref-not-synced")
 	})
 
 	t.Run("create synced secret in multiple namespaces for source secret that is referenced by a Gateway and Ingress", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "secret-shared-not-synced",
 			},
 		})
 		require.NoError(t, err)
-		require.Equal(t, ctrl.Result{}, result)
+		require.True(t, resultHasResync(result))
 
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-secret-shared-not-synced"}, &corev1.Secret{})
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "secret-shared-not-synced"), &corev1.Secret{})
 		require.NoError(t, err)
 
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace + "-2", Name: "test-secret-shared-not-synced"}, &corev1.Secret{})
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace+"-2", "test", "secret-shared-not-synced"), &corev1.Secret{})
 		require.NoError(t, err)
 	})
 
@@ -324,23 +345,127 @@ func Test_SecretSync_Reconcile(t *testing.T) {
 		}
 
 		var err error
-		err = c.Delete(context.Background(), &ingress)
+		err = c.Delete(t.Context(), &ingress)
 		require.NoError(t, err)
 
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "secret-shared-not-synced",
 			},
 		})
 		require.NoError(t, err)
-		require.Equal(t, ctrl.Result{}, result)
+		// This should resync because it's still referred to by the Gateway resource.
+		require.True(t, resultHasResync(result))
 
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-secret-shared-not-synced"}, &corev1.Secret{})
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "secret-shared-not-synced"), &corev1.Secret{})
 		require.NoError(t, err)
 
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace + "-2", Name: "test-secret-shared-not-synced"}, &corev1.Secret{})
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace+"-2", "test", "secret-shared-not-synced"), &corev1.Secret{})
 		require.True(t, k8sErrors.IsNotFound(err))
+	})
+}
+
+var secretFixtureTypeChange = []client.Object{
+	&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      "cert-tls",
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			"tls.crt": []byte("cert"),
+			"tls.key": []byte("key"),
+		},
+	},
+	&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: secretsNamespace,
+			Name:      syncnames.SyncedSecretName(types.NamespacedName{Namespace: "test", Name: "cert-tls"}),
+			UID:       "stale-opaque-uid",
+			Labels: map[string]string{
+				secretsync.OwningSecretNamespace: "test",
+				secretsync.OwningSecretName:      "cert-tls",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+	},
+	&gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cilium",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: testSecretSyncControllerName,
+		},
+	},
+	&gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      "tls-gateway",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "cilium",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Hostname: ptr.To[gatewayv1.Hostname]("*.cilium.io"),
+					Protocol: "HTTPS",
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "cert-tls"},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+func Test_SecretSync_Reconcile_TypeChange(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	c := withGatewaySecretIndexes(fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(secretFixtureTypeChange...)).
+		Build()
+
+	gatewayHandler := gateway_api.NewSecretSyncHandler(c, logger, testSecretSyncControllerName)
+
+	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
+		{
+			RefObject:            &gatewayv1.Gateway{},
+			RefObjectEnqueueFunc: gatewayHandler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   gatewayHandler.IsReferencedByGateway,
+			SecretsNamespace:     secretsNamespace,
+		},
+	},
+		time.Minute,
+		0.1,
+	)
+
+	t.Run("synced secret type is updated when source secret type changes", func(t *testing.T) {
+		synced := &corev1.Secret{}
+		err := c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "cert-tls"), synced)
+		require.NoError(t, err)
+		require.Equal(t, corev1.SecretTypeOpaque, synced.Type)
+
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: "test",
+				Name:      "cert-tls",
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, resultHasResync(result))
+		synced = &corev1.Secret{}
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "cert-tls"), synced)
+		require.NoError(t, err)
+		require.Equal(t, corev1.SecretTypeTLS, synced.Type, "synced secret should adopt the source secret's type")
+		require.Equal(t, []byte("cert"), synced.Data["tls.crt"])
+		require.Equal(t, []byte("key"), synced.Data["tls.key"])
+		require.NotEqual(t, types.UID("stale-opaque-uid"), synced.UID,
+			"synced secret must be recreated (new UID) since Secret.Type is immutable")
 	})
 }
 
@@ -354,39 +479,114 @@ var secretFixtureDefaultSecret = []client.Object{
 }
 
 func Test_SecretSync_Reconcile_WithDefaultSecret(t *testing.T) {
-	logger := hivetest.Logger(t)
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 
-	c := fake.NewClientBuilder().
+	c := withGatewaySecretIndexes(fake.NewClientBuilder().
 		WithScheme(testScheme()).
-		WithObjects(secretFixtureDefaultSecret...).
+		WithObjects(secretFixtureDefaultSecret...)).
 		Build()
+	gatewayHandler := gateway_api.NewSecretSyncHandler(c, logger, testSecretSyncControllerName)
 	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
 		{
 			RefObject:            &gatewayv1.Gateway{},
-			RefObjectEnqueueFunc: gateway_api.EnqueueTLSSecrets(c, logger),
-			RefObjectCheckFunc:   gateway_api.IsReferencedByCiliumGateway,
+			RefObjectEnqueueFunc: gatewayHandler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   gatewayHandler.IsReferencedByGateway,
 			SecretsNamespace:     secretsNamespace,
 			DefaultSecret: &secretsync.DefaultSecret{
 				Namespace: "test",
 				Name:      "unsynced-secret-no-reference",
 			},
 		},
-	})
+	},
+		time.Minute,
+		0.1,
+	)
 
 	t.Run("create synced secret for source secret that is the default secret and therefore doesn't need to be referenced by any Cilium Gateway resource", func(t *testing.T) {
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: "test",
 				Name:      "unsynced-secret-no-reference",
 			},
 		})
 		require.NoError(t, err)
-		require.Equal(t, ctrl.Result{}, result)
+		require.True(t, resultHasResync(result))
 
 		secret := &corev1.Secret{}
-		err = c.Get(context.Background(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-unsynced-secret-no-reference"}, secret)
+		err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, "test", "unsynced-secret-no-reference"), secret)
 		require.NoError(t, err)
+		requireSourceAnnotations(t, secret, secretsync.SourceKindSecret, "test", "unsynced-secret-no-reference")
 	})
+}
+
+func Test_SecretSync_Reconcile_SourceNameCollision(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	first := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "secret-prod"},
+		Data:       map[string][]byte{"tls.crt": []byte("first")},
+	}
+	second := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a-secret", Name: "prod"},
+		Data:       map[string][]byte{"tls.crt": []byte("second")},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(first, second).
+		Build()
+
+	referenced := map[types.NamespacedName]struct{}{
+		{Namespace: first.Namespace, Name: first.Name}:   {},
+		{Namespace: second.Namespace, Name: second.Name}: {},
+	}
+	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
+		{
+			RefObjectCheckFunc: func(_ context.Context, _ client.Client, _ *slog.Logger, obj *corev1.Secret) bool {
+				_, ok := referenced[types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}]
+				return ok
+			},
+			SecretsNamespace: secretsNamespace,
+		},
+	}, time.Minute, 0.1)
+
+	for _, source := range []*corev1.Secret{first, second} {
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: source.Namespace, Name: source.Name},
+		})
+		require.NoError(t, err)
+		require.True(t, resultHasResync(result))
+	}
+
+	firstSynced := &corev1.Secret{}
+	err := c.Get(t.Context(), syncedSecretKey(secretsNamespace, first.Namespace, first.Name), firstSynced)
+	require.NoError(t, err)
+	require.Equal(t, []byte("first"), firstSynced.Data["tls.crt"])
+	requireSourceAnnotations(t, firstSynced, secretsync.SourceKindSecret, first.Namespace, first.Name)
+
+	secondSynced := &corev1.Secret{}
+	err = c.Get(t.Context(), syncedSecretKey(secretsNamespace, second.Namespace, second.Name), secondSynced)
+	require.NoError(t, err)
+	require.Equal(t, []byte("second"), secondSynced.Data["tls.crt"])
+	requireSourceAnnotations(t, secondSynced, secretsync.SourceKindSecret, second.Namespace, second.Name)
+	require.NotEqual(t, firstSynced.Name, secondSynced.Name)
+}
+
+func syncedSecretKey(secretsNamespace, sourceNamespace, sourceName string) types.NamespacedName {
+	return types.NamespacedName{
+		Namespace: secretsNamespace,
+		Name: syncnames.SyncedSecretName(types.NamespacedName{
+			Namespace: sourceNamespace,
+			Name:      sourceName,
+		}),
+	}
+}
+
+func requireSourceAnnotations(t *testing.T, secret *corev1.Secret, kind, namespace, name string) {
+	t.Helper()
+	require.Equal(t, kind, secret.Annotations[secretsync.SourceKindAnnotation])
+	require.Equal(t, namespace, secret.Annotations[secretsync.SourceNamespaceAnnotation])
+	require.Equal(t, name, secret.Annotations[secretsync.SourceNameAnnotation])
 }
 
 func testScheme() *runtime.Scheme {
@@ -397,4 +597,11 @@ func testScheme() *runtime.Scheme {
 	utilruntime.Must(gatewayv1.AddToScheme(scheme))
 
 	return scheme
+}
+
+// resultHasResync returns true if the Result
+// has a resync interval defined that is greater
+// that 0.
+func resultHasResync(result ctrl.Result) bool {
+	return result.RequeueAfter > 0
 }

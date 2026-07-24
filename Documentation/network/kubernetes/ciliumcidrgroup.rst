@@ -6,16 +6,9 @@
 
 .. _CiliumCIDRGroup:
 
-***************************
+***************
 CiliumCIDRGroup
-***************************
-
-.. note::
-
-    **Beta Feature:** CiliumCIDRGroup is currently in beta. We welcome your feedback
-    and encourage you to report any issues by filing a GitHub issue.
-
-    For the list of outstanding tasks and known issues, please refer to :gh-issue:`24801`.
+***************
 
 CiliumCIDRGroup (CCG) is a feature that allows administrators to reference a group of
 CIDR blocks in a :ref:`CiliumNetworkPolicy`. Unlike :ref:`CiliumEndpoint` resources,
@@ -70,3 +63,12 @@ by names or labels.
 In this example, the ``fromCIDRSet`` directive in the CNP references the
 ``vpn-example-1`` group defined in the ``CiliumCIDRGroup``. This allows the CNP to
 apply ingress rules based on the CIDRs grouped under the ``vpn-example-1`` name.
+
+
+Scalability impacts
+-------------------
+
+CiliumCIDRGroups generally result in the creation of a single
+:ref:`security identity <arch_id_security>` per group. For large groups,
+this can be a significant savings. Use CiliumCIDRGroup
+when large numbers of CIDRs must be selected.

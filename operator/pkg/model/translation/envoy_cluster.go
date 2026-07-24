@@ -7,9 +7,9 @@ import (
 	"fmt"
 	goslices "slices"
 
-	envoy_config_cluster_v3 "github.com/cilium/proxy/go/envoy/config/cluster/v3"
-	envoy_config_core_v3 "github.com/cilium/proxy/go/envoy/config/core/v3"
-	envoy_upstreams_http_v3 "github.com/cilium/proxy/go/envoy/extensions/upstreams/http/v3"
+	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_upstreams_http_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/cilium/cilium/operator/pkg/model"
@@ -31,12 +31,12 @@ const (
 	HTTPVersion3          HTTPVersionType = 3
 )
 
-func (i *cecTranslator) clusterMutators(grpcService bool, appProtocol string) []ClusterMutator {
+func (i *cecTranslator) clusterMutators(grpcService bool, appProtocol string, tls *model.BackendTLSOrigination) []ClusterMutator {
 	res := []ClusterMutator{
-		withConnectionTimeout(5),
 		withIdleTimeout(i.Config.ClusterConfig.IdleTimeoutSeconds),
 		withClusterLbPolicy(int32(envoy_config_cluster_v3.Cluster_ROUND_ROBIN)),
 		withOutlierDetection(true),
+		withTLSOrigination(i.Config.SecretsNamespace, tls),
 	}
 	if grpcService {
 		res = append(res, withProtocol(HTTPVersion2))
@@ -54,13 +54,12 @@ func (i *cecTranslator) clusterMutators(grpcService bool, appProtocol string) []
 
 func (i *cecTranslator) tcpClusterMutators(mutationFunc ...ClusterMutator) []ClusterMutator {
 	return append(mutationFunc,
-		withConnectionTimeout(5),
 		withClusterLbPolicy(int32(envoy_config_cluster_v3.Cluster_ROUND_ROBIN)),
 		withOutlierDetection(true),
 	)
 }
 
-func (i *cecTranslator) desiredEnvoyCluster(m *model.Model) []ciliumv2.XDSResource {
+func (i *cecTranslator) desiredEnvoyCluster(m *model.Model) ([]ciliumv2.XDSResource, error) {
 	envoyClusters := map[string]ciliumv2.XDSResource{}
 	var sortedClusterNames []string
 
@@ -72,8 +71,29 @@ func (i *cecTranslator) desiredEnvoyCluster(m *model.Model) []ciliumv2.XDSResour
 				sortedClusterNames = append(sortedClusterNames, clusterName)
 				envoyClusters[clusterName], _ = i.httpCluster(clusterName, clusterServiceName,
 					isGRPCService(m, ns, name, port),
-					getAppProtocol(m, ns, name, port))
+					getAppProtocol(m, ns, name, port),
+					getTLSOrigination(m, ns, name, port))
 			}
+		}
+	}
+
+	for _, be := range getHTTPExtAuthBackends(m) {
+		port := be.Port.GetPort()
+		clusterName := getHTTPExtAuthClusterName(be.Namespace, be.Name, port)
+		clusterServiceName := getClusterServiceName(be.Namespace, be.Name, port)
+		if _, exists := envoyClusters[clusterName]; !exists {
+			sortedClusterNames = append(sortedClusterNames, clusterName)
+			envoyClusters[clusterName], _ = i.httpCluster(clusterName, clusterServiceName, false, "", getTLSOrigination(m, be.Namespace, be.Name, port))
+		}
+	}
+
+	for _, be := range getGRPCExtAuthBackends(m) {
+		port := be.Port.GetPort()
+		clusterName := getGRPCExtAuthClusterName(be.Namespace, be.Name, port)
+		clusterServiceName := getClusterServiceName(be.Namespace, be.Name, port)
+		if _, exists := envoyClusters[clusterName]; !exists {
+			sortedClusterNames = append(sortedClusterNames, clusterName)
+			envoyClusters[clusterName], _ = i.httpCluster(clusterName, clusterServiceName, true, "", getTLSOrigination(m, be.Namespace, be.Name, port))
 		}
 	}
 
@@ -94,11 +114,11 @@ func (i *cecTranslator) desiredEnvoyCluster(m *model.Model) []ciliumv2.XDSResour
 		res[i] = envoyClusters[name]
 	}
 
-	return res
+	return res, nil
 }
 
 // httpCluster creates a new Envoy cluster.
-func (i *cecTranslator) httpCluster(clusterName string, clusterServiceName string, isGRPCService bool, appProtocol string) (ciliumv2.XDSResource, error) {
+func (i *cecTranslator) httpCluster(clusterName string, clusterServiceName string, isGRPCService bool, appProtocol string, tls *model.BackendTLSOrigination) (ciliumv2.XDSResource, error) {
 	cluster := &envoy_config_cluster_v3.Cluster{
 		Name: clusterName,
 		TypedExtensionProtocolOptions: map[string]*anypb.Any{
@@ -119,7 +139,7 @@ func (i *cecTranslator) httpCluster(clusterName string, clusterServiceName strin
 	}
 
 	// Apply mutation functions for customizing the cluster.
-	for _, fn := range i.clusterMutators(isGRPCService, appProtocol) {
+	for _, fn := range i.clusterMutators(isGRPCService, appProtocol, tls) {
 		cluster = fn(cluster)
 	}
 
@@ -153,6 +173,21 @@ func getClusterName(ns, name, port string) string {
 	return fmt.Sprintf("%s:%s:%s", ns, name, port)
 }
 
+// getGRPCExtAuthClusterName returns the cluster name for a gRPC ext_authz backend.
+// The "grpc:" prefix keeps it distinct from the plain HTTP cluster for the same service
+// so each carries the correct protocol config (explicitHttpConfig/HTTP2 vs useDownstreamProtocolConfig).
+func getGRPCExtAuthClusterName(ns, name, port string) string {
+	return "grpc:" + getClusterName(ns, name, port)
+}
+
+// getHTTPExtAuthClusterName returns the cluster name for an HTTP ext_authz backend.
+// The "http:" prefix isolates it from both regular route clusters and GRPC ext_authz clusters
+// for the same service, ensuring it always gets useDownstreamProtocolConfig regardless of
+// what other routes do with the same backend.
+func getHTTPExtAuthClusterName(ns, name, port string) string {
+	return "http:" + getClusterName(ns, name, port)
+}
+
 func getClusterServiceName(ns, name, port string) string {
 	// the name is having the format of "namespace/name:port"
 	return fmt.Sprintf("%s/%s:%s", ns, name, port)
@@ -174,6 +209,50 @@ func getNamespaceNamePortsMapForHTTP(m *model.Model) map[string]map[string][]str
 		}
 	}
 	return namespaceNamePortMap
+}
+
+// getHTTPExtAuthBackends returns deduplicated backends used as HTTP ext_authz services.
+// Each such backend needs its own protocol-specific cluster with useDownstreamProtocolConfig,
+// isolated from regular route clusters so that isGRPCService on the same service cannot
+// accidentally force HTTP/2 on the ext_authz upstream.
+func getHTTPExtAuthBackends(m *model.Model) []model.Backend {
+	seen := map[string]bool{}
+	var result []model.Backend
+	for _, l := range m.HTTP {
+		for _, r := range l.Routes {
+			if r.ExternalAuth == nil || r.ExternalAuth.Protocol == model.ExternalAuthProtocolGRPC {
+				continue
+			}
+			be := r.ExternalAuth.Backend
+			key := getHTTPExtAuthClusterName(be.Namespace, be.Name, be.Port.GetPort())
+			if !seen[key] {
+				seen[key] = true
+				result = append(result, be)
+			}
+		}
+	}
+	return result
+}
+
+// getGRPCExtAuthBackends returns deduplicated backends used as gRPC ext_authz services.
+// Each such backend needs its own protocol-specific cluster with HTTP/2 forced.
+func getGRPCExtAuthBackends(m *model.Model) []model.Backend {
+	seen := map[string]bool{}
+	var result []model.Backend
+	for _, l := range m.HTTP {
+		for _, r := range l.Routes {
+			if r.ExternalAuth == nil || r.ExternalAuth.Protocol != model.ExternalAuthProtocolGRPC {
+				continue
+			}
+			be := r.ExternalAuth.Backend
+			key := getGRPCExtAuthClusterName(be.Namespace, be.Name, be.Port.GetPort())
+			if !seen[key] {
+				seen[key] = true
+				result = append(result, be)
+			}
+		}
+	}
+	return result
 }
 
 // getNamespaceNamePortsMapFroTLS returns a map of namespace -> name -> ports.

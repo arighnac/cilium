@@ -5,11 +5,11 @@ package seven
 
 import (
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"slices"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/parser/options"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/k8s/utils"
+	ciliumLabels "github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/monitor/api"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 	"github.com/cilium/cilium/pkg/source"
@@ -28,7 +29,7 @@ import (
 
 // Parser is a parser for L7 payloads
 type Parser struct {
-	log               logrus.FieldLogger
+	log               *slog.Logger
 	timestampCache    *lru.Cache[string, time.Time]
 	traceContextCache *lru.Cache[string, *flowpb.TraceContext]
 	dnsGetter         getters.DNSGetter
@@ -40,7 +41,7 @@ type Parser struct {
 
 // New returns a new L7 parser
 func New(
-	log logrus.FieldLogger,
+	log *slog.Logger,
 	dnsGetter getters.DNSGetter,
 	ipGetter getters.IPGetter,
 	serviceGetter getters.ServiceGetter,
@@ -53,7 +54,6 @@ func New(
 			Enabled:            false,
 			RedactHTTPUserInfo: true,
 			RedactHTTPQuery:    false,
-			RedactKafkaAPIKey:  false,
 			RedactHttpHeaders: options.HttpHeadersList{
 				Allow: map[string]struct{}{},
 				Deny:  map[string]struct{}{},
@@ -330,7 +330,7 @@ func decodeEndpoint(endpoint accesslog.EndpointInfo, namespace, podName string) 
 	return &flowpb.Endpoint{
 		ID:          uint32(endpoint.ID),
 		Identity:    uint32(endpoint.Identity),
-		ClusterName: endpoint.Labels.Get(string(source.Kubernetes) + "." + k8sConst.PolicyLabelCluster),
+		ClusterName: endpoint.Labels.Get(string(source.Kubernetes) + ciliumLabels.SourceDelimiter + k8sConst.PolicyLabelCluster),
 		Namespace:   namespace,
 		Labels:      labels,
 		PodName:     podName,
@@ -358,11 +358,6 @@ func decodeLayer7(r *accesslog.LogRecord, opts *options.Options) *flowpb.Layer7 
 		return &flowpb.Layer7{
 			Type:   flowType,
 			Record: decodeHTTP(r.Type, r.HTTP, opts),
-		}
-	case r.Kafka != nil:
-		return &flowpb.Layer7{
-			Type:   flowType,
-			Record: decodeKafka(r.Type, r.Kafka, opts),
 		}
 	default:
 		return &flowpb.Layer7{
@@ -393,8 +388,6 @@ func (p *Parser) getSummary(logRecord *accesslog.LogRecord, flow *flowpb.Flow) s
 	}
 	if http := logRecord.HTTP; http != nil {
 		return p.httpSummary(logRecord.Type, http, flow)
-	} else if kafka := logRecord.Kafka; kafka != nil {
-		return kafkaSummary(flow)
 	} else if dns := logRecord.DNS; dns != nil {
 		return dnsSummary(logRecord.Type, dns)
 	} else if generic := logRecord.L7; generic != nil {

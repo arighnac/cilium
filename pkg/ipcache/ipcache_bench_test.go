@@ -4,49 +4,31 @@
 package ipcache
 
 import (
-	"context"
 	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/cache"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/source"
 )
 
-type dummyOwner struct{}
-
-func (d *dummyOwner) UpdateIdentities(added, deleted identity.IdentityMap) {}
-func (d *dummyOwner) GetNodeSuffix() string {
-	return "foo"
-}
-
 func BenchmarkInjectLabels(b *testing.B) {
-
-	ctx, cancel := context.WithCancel(context.Background())
-	alloc := cache.NewCachingIdentityAllocator(&dummyOwner{}, cache.AllocatorConfig{})
-	//<-alloc.InitIdentityAllocator(nil)
-	PolicyHandler = &mockUpdater{
-		identities: make(map[identity.NumericIdentity]labels.LabelArray),
-	}
-	ipc := NewIPCache(&Configuration{
-		Context:           ctx,
-		IdentityAllocator: alloc,
-		PolicyHandler:     PolicyHandler,
-		DatapathHandler:   &mockTriggerer{},
-	})
+	s := setupIPCacheTestSuite(b)
+	ipc := s.IPIdentityCache
 
 	addr := netip.MustParseAddr("1.0.0.0")
 	lbls := labels.NewLabelsFromSortedList(labels.LabelSourceCIDRGroup + ":foo=bar")
+
+	prefixes := make([]cmtypes.PrefixCluster, 0, b.N)
+
+	b.ReportAllocs()
 	b.ResetTimer()
 
-	prefixes := make([]netip.Prefix, 0, b.N)
-
-	for i := 0; i < b.N; i++ {
-		pfx := netip.PrefixFrom(addr, 30)
-		for j := 0; j < 4; j++ {
+	for i := 0; b.Loop(); i++ {
+		pfx := cmtypes.NewLocalPrefixCluster(netip.PrefixFrom(addr, 30))
+		for range 4 {
 			addr = addr.Next()
 		}
 		prefixes = append(prefixes, ipc.metadata.upsertLocked(pfx, source.Kubernetes, "cidr-policy", lbls)...)
@@ -56,7 +38,7 @@ func BenchmarkInjectLabels(b *testing.B) {
 	}
 	b.Logf("%d", len(prefixes))
 	b.Log(addr.String())
-	_, _, err := ipc.doInjectLabels(ctx, prefixes)
+	_, err := ipc.doInjectLabels(b.Context(), prefixes)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -65,9 +47,4 @@ func BenchmarkInjectLabels(b *testing.B) {
 
 	// sanity checks
 	require.Len(b, ipc.ipToIdentityCache, b.N)
-
-	b.Cleanup(func() {
-		cancel()
-	})
-
 }

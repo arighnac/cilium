@@ -5,29 +5,45 @@ runs:
   steps:
     - shell: bash
       run: |
-        echo "QUAY_ORGANIZATION=cilium" >> $GITHUB_ENV
-        echo "QUAY_ORGANIZATION_DEV=cilium" >> $GITHUB_ENV
+        REGISTRY="quay.io"
+        REGISTRY_DEV="quay.io"
+        BACKUP_REGISTRY="docker.io"
+        echo "REGISTRY=$REGISTRY" >> $GITHUB_ENV
+        echo "REGISTRY_DEV=$REGISTRY_DEV" >> $GITHUB_ENV
+        echo "BACKUP_REGISTRY=$BACKUP_REGISTRY" >> $GITHUB_ENV
+        echo "ORGANIZATION=cilium" >> $GITHUB_ENV
+        echo "ORGANIZATION_DEV=cilium" >> $GITHUB_ENV
+        echo "ORGANIZATION_STAGING=cilium" >> $GITHUB_ENV
         # no prod yet
-        echo "QUAY_CHARTS_ORGANIZATION_DEV=cilium-charts-dev" >> $GITHUB_ENV
+        echo "CHARTS_ORGANIZATION_DEV=cilium-charts-dev" >> $GITHUB_ENV
         echo "EGRESS_GATEWAY_HELM_VALUES=--helm-set=egressGateway.enabled=true" >> $GITHUB_ENV
+        echo "CONN_DISRUPT_EXTRA_ARG=" >> $GITHUB_ENV
+        echo "CONN_DISRUPT_EXTRA_TEST=" >> $GITHUB_ENV
         echo "BGP_CONTROL_PLANE_HELM_VALUES=--helm-set=bgpControlPlane.enabled=true" >> $GITHUB_ENV
         echo "CILIUM_CLI_RELEASE_REPO=cilium/cilium-cli" >> $GITHUB_ENV
-        # renovate: datasource=github-releases depName=cilium/cilium-cli
-        CILIUM_CLI_VERSION="v0.16.23"
+        CILIUM_CLI_VERSION=""
         echo "CILIUM_CLI_VERSION=$CILIUM_CLI_VERSION" >> $GITHUB_ENV
-        echo "CILIUM_CLI_IMAGE_REPO=quay.io/cilium/cilium-cli-ci" >> $GITHUB_ENV
+        echo "CILIUM_CLI_IMAGE_REPO=${REGISTRY_DEV}/cilium/cilium-cli-ci" >> $GITHUB_ENV
         echo "CILIUM_CLI_SKIP_BUILD=true" >> $GITHUB_ENV
+
+        # Use TESTOWNERS file if it exists, otherwise fall back to CODEOWNERS only
+        CILIUM_CLI_CODE_OWNERS_PATHS="CODEOWNERS"
+        if [[ -f "TESTOWNERS" ]]; then
+          CILIUM_CLI_CODE_OWNERS_PATHS+=",TESTOWNERS"
+        fi
+        echo "CILIUM_CLI_CODE_OWNERS_PATHS=$CILIUM_CLI_CODE_OWNERS_PATHS" >> $GITHUB_ENV
+
+        echo "CILIUM_CLI_EXCLUDE_OWNERS=@cilium/github-sec" >> $GITHUB_ENV
         echo "PUSH_TO_DOCKER_HUB=true" >> $GITHUB_ENV
         echo "GCP_PERF_RESULTS_BUCKET=gs://cilium-scale-results" >> $GITHUB_ENV
+        echo "CILIUM_RUNTIME_IMAGE_PREFIX=quay.io/cilium/" >> $GITHUB_ENV
 
         # renovate: datasource=github-releases depName=kubernetes-sigs/kind
-        KIND_VERSION="v0.26.0"
+        KIND_VERSION="v0.32.0"
         # renovate: datasource=docker
-        KIND_K8S_IMAGE="quay.io/cilium/kindest-node:v1.32.0@sha256:22cf2864f90cfab0d442fda2decf2eae107edd03483053a902614dec637eff76"
+        KIND_K8S_IMAGE="quay.io/cilium/kindest-node:v1.36.0@sha256:0244ee685fe1947d4826c766291f7b03ba29a6794b655ad9a579c29cb627d8a8"
         KIND_K8S_VERSION=$(echo "$KIND_K8S_IMAGE" | sed -r 's|.+:(v[0-9a-z.-]+)(@.+)?|\1|')
-        CILIUM_RUNTIME_IMAGE="quay.io/cilium/cilium-runtime:38f4286a000b2326b614bf880d29f153585b9ebf@sha256:1deea3508c08fe23b5ff686f84902558c0cef80ec213404aa94702589d3c2da4"
 
-        echo "CILIUM_RUNTIME_IMAGE=$CILIUM_RUNTIME_IMAGE" >> $GITHUB_ENV
         echo "KIND_VERSION=$KIND_VERSION" >> $GITHUB_ENV
         echo "KIND_K8S_IMAGE=$KIND_K8S_IMAGE" >> $GITHUB_ENV
         echo "KIND_K8S_VERSION=$KIND_K8S_VERSION" >> $GITHUB_ENV

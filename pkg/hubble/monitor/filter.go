@@ -6,17 +6,17 @@ package monitor
 import (
 	"context"
 	"fmt"
-
-	"github.com/sirupsen/logrus"
+	"log/slog"
 
 	observerTypes "github.com/cilium/cilium/pkg/hubble/observer/types"
 	"github.com/cilium/cilium/pkg/hubble/parser/errors"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 )
 
 // monitorFilter is an implementation of OnMonitorEvent interface that filters monitor events.
 type monitorFilter struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 
 	drop          bool
 	debug         bool
@@ -25,13 +25,12 @@ type monitorFilter struct {
 	l7            bool
 	agent         bool
 	policyVerdict bool
-	recCapture    bool
 	traceSock     bool
 }
 
 // NewMonitorFilter creates a new monitor filter.
 // If monitorEventFilters is empty, no events are allowed.
-func NewMonitorFilter(logger logrus.FieldLogger, monitorEventFilters []string) (*monitorFilter, error) {
+func NewMonitorFilter(logger *slog.Logger, monitorEventFilters []string) (*monitorFilter, error) {
 	monitorFilter := monitorFilter{logger: logger}
 
 	for _, filter := range monitorEventFilters {
@@ -50,8 +49,6 @@ func NewMonitorFilter(logger logrus.FieldLogger, monitorEventFilters []string) (
 			monitorFilter.agent = true
 		case monitorAPI.MessageTypeNamePolicyVerdict:
 			monitorFilter.policyVerdict = true
-		case monitorAPI.MessageTypeNameRecCapture:
-			monitorFilter.recCapture = true
 		case monitorAPI.MessageTypeNameTraceSock:
 			monitorFilter.traceSock = true
 		default:
@@ -59,7 +56,10 @@ func NewMonitorFilter(logger logrus.FieldLogger, monitorEventFilters []string) (
 		}
 	}
 
-	logger.WithField("filters", monitorEventFilters).Info("Configured Hubble with monitor event filters")
+	logger.Info(
+		"Configured Hubble with monitor event filters",
+		logfields.Filters, monitorEventFilters,
+	)
 	return &monitorFilter, nil
 }
 
@@ -81,18 +81,22 @@ func (m *monitorFilter) OnMonitorEvent(ctx context.Context, event *observerTypes
 			return !m.capture, nil
 		case monitorAPI.MessageTypeTrace:
 			return !m.trace, nil
-		case monitorAPI.MessageTypeAccessLog: // MessageTypeAccessLog maps to MessageTypeNameL7
-			return !m.l7, nil
 		case monitorAPI.MessageTypePolicyVerdict:
 			return !m.policyVerdict, nil
-		case monitorAPI.MessageTypeRecCapture:
-			return !m.recCapture, nil
 		case monitorAPI.MessageTypeTraceSock:
 			return !m.traceSock, nil
 		default:
 			return true, errors.ErrUnknownEventType
 		}
+
 	case *observerTypes.AgentEvent:
+		// L7 flows (HTTP, DNS, Kafka, etc.) are emitted as AgentEvents
+		// with Type = MessageTypeAccessLog. They should be controlled
+		// by the l7 monitor filter rather than the generic agent filter.
+		if payload.Type == monitorAPI.MessageTypeAccessLog {
+			return !m.l7, nil
+		}
+
 		return !m.agent, nil
 	case nil:
 		return true, errors.ErrEmptyData

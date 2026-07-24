@@ -8,25 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 	"github.com/vishvananda/netlink"
 
-	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/time"
-)
-
-var (
-	// linkCache is the singleton instance of the LinkCache, only needed to
-	// ensure that the single controller used to update the LinkCache is
-	// triggered exactly once and the same instance is handed to all users.
-	linkCache LinkCache
-	once      sync.Once
-
-	linkCacheControllerGroup = controller.NewGroup("link-cache")
 )
 
 // DeleteByName deletes the interface with the name ifName.
@@ -59,6 +49,16 @@ func Rename(curName, newName string) error {
 	return netlink.LinkSetName(link, newName)
 }
 
+// SetAltNames sets the altnames for a link
+func AddAltName(linkName, altName string) error {
+	link, err := safenetlink.LinkByName(linkName)
+	if err != nil {
+		return err
+	}
+
+	return netlink.LinkAddAltName(link, altName)
+}
+
 func GetHardwareAddr(ifName string) (mac.MAC, error) {
 	iface, err := safenetlink.LinkByName(ifName)
 	if err != nil {
@@ -75,31 +75,46 @@ func GetIfIndex(ifName string) (uint32, error) {
 	return uint32(iface.Attrs().Index), nil
 }
 
+func GetIfBufferMargins(ifName string) (uint16, uint16, error) {
+	iface, err := safenetlink.LinkByName(ifName)
+	if err != nil {
+		return 0, 0, err
+	}
+	return iface.Attrs().Headroom, iface.Attrs().Tailroom, nil
+}
+
 type LinkCache struct {
 	mu          lock.RWMutex
 	indexToName map[int]string
 }
 
-// NewLinkCache begins monitoring local interfaces for changes in order to
-// track local link information.
-func NewLinkCache() *LinkCache {
-	once.Do(func() {
-		linkCache = LinkCache{}
-		controller.NewManager().UpdateController("link-cache",
-			controller.ControllerParams{
-				Group:       linkCacheControllerGroup,
-				RunInterval: 15 * time.Second,
-				DoFunc: func(ctx context.Context) error {
-					return linkCache.syncCache()
-				},
-			},
-		)
-	})
+var Cell = cell.Module(
+	"link-cache",
+	"Provides a cache of link names to ifindex mappings",
 
-	return &linkCache
+	cell.Provide(newLinkCache),
+)
+
+type linkCacheParams struct {
+	cell.In
+	JobGroup job.Group
 }
 
-func (c *LinkCache) syncCache() error {
+func NewLinkCache() *LinkCache {
+	return &LinkCache{
+		indexToName: make(map[int]string),
+	}
+}
+
+func newLinkCache(params linkCacheParams) *LinkCache {
+	lc := NewLinkCache()
+
+	params.JobGroup.Add(job.Timer("sync", lc.SyncCache, 15*time.Second))
+
+	return lc
+}
+
+func (c *LinkCache) SyncCache(_ context.Context) error {
 	links, err := safenetlink.LinkList()
 	if err != nil {
 		return err

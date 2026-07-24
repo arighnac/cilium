@@ -35,16 +35,20 @@ func (c *FakeCiliumV2alpha1) CiliumBGPPeerConfigs() v2alpha1.CiliumBGPPeerConfig
 	return newFakeCiliumBGPPeerConfigs(c)
 }
 
-func (c *FakeCiliumV2alpha1) CiliumBGPPeeringPolicies() v2alpha1.CiliumBGPPeeringPolicyInterface {
-	return newFakeCiliumBGPPeeringPolicies(c)
-}
-
 func (c *FakeCiliumV2alpha1) CiliumCIDRGroups() v2alpha1.CiliumCIDRGroupInterface {
 	return newFakeCiliumCIDRGroups(c)
 }
 
+func (c *FakeCiliumV2alpha1) CiliumDatapathPlugins() v2alpha1.CiliumDatapathPluginInterface {
+	return newFakeCiliumDatapathPlugins(c)
+}
+
 func (c *FakeCiliumV2alpha1) CiliumEndpointSlices() v2alpha1.CiliumEndpointSliceInterface {
 	return newFakeCiliumEndpointSlices(c)
+}
+
+func (c *FakeCiliumV2alpha1) CiliumGatewayClassConfigs(namespace string) v2alpha1.CiliumGatewayClassConfigInterface {
+	return newFakeCiliumGatewayClassConfigs(c, namespace)
 }
 
 func (c *FakeCiliumV2alpha1) CiliumL2AnnouncementPolicies() v2alpha1.CiliumL2AnnouncementPolicyInterface {
@@ -55,12 +59,20 @@ func (c *FakeCiliumV2alpha1) CiliumLoadBalancerIPPools() v2alpha1.CiliumLoadBala
 	return newFakeCiliumLoadBalancerIPPools(c)
 }
 
-func (c *FakeCiliumV2alpha1) CiliumNodeConfigs(namespace string) v2alpha1.CiliumNodeConfigInterface {
-	return newFakeCiliumNodeConfigs(c, namespace)
+func (c *FakeCiliumV2alpha1) CiliumNetworkDriverClusterConfigs() v2alpha1.CiliumNetworkDriverClusterConfigInterface {
+	return newFakeCiliumNetworkDriverClusterConfigs(c)
+}
+
+func (c *FakeCiliumV2alpha1) CiliumNetworkDriverNodeConfigs() v2alpha1.CiliumNetworkDriverNodeConfigInterface {
+	return newFakeCiliumNetworkDriverNodeConfigs(c)
 }
 
 func (c *FakeCiliumV2alpha1) CiliumPodIPPools() v2alpha1.CiliumPodIPPoolInterface {
 	return newFakeCiliumPodIPPools(c)
+}
+
+func (c *FakeCiliumV2alpha1) CiliumResourceIPPools() v2alpha1.CiliumResourceIPPoolInterface {
+	return newFakeCiliumResourceIPPools(c)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

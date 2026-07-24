@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/gateway-api/conformance/utils/config"
 	"sigs.k8s.io/gateway-api/conformance/utils/http"
 	"sigs.k8s.io/gateway-api/conformance/utils/tlog"
+	"sigs.k8s.io/gateway-api/conformance/utils/weight"
 )
 
 const (
@@ -44,6 +45,10 @@ const (
 
 // Client is an interface used to make requests within conformance tests for grpc scenarios.
 // This can be overridden with custom implementations whenever necessary.
+//
+// A custom implementation must be safe for concurrent SendRPC calls: the
+// GRPCRouteWeight distribution sampler invokes the suite's client from multiple
+// goroutines.
 type Client interface {
 	SendRPC(t *testing.T, address string, expected ExpectedResponse, timeout time.Duration) (*Response, error)
 	Close()
@@ -113,15 +118,16 @@ func getMapDeterministicStr(m map[string]string) string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	out := "{"
+	var out strings.Builder
+	out.WriteString("{")
 	for i, key := range keys {
-		out += key + ":" + m[key]
+		out.WriteString(key + ":" + m[key])
 		if i != len(keys)-1 {
-			out += ","
+			out.WriteString(",")
 		}
 	}
-	out += "}"
-	return out
+	out.WriteString("}")
+	return out.String()
 }
 
 func (er *ExpectedResponse) GetTestCaseName(i int) string {
@@ -271,9 +277,12 @@ func MakeRequestAndExpectEventuallyConsistentResponse(t *testing.T, c Client, ti
 	t.Helper()
 	validateExpectedResponse(t, expected)
 	if c == nil {
+		// Only the DefaultClient we construct here is ours to close. A
+		// caller-supplied (non-nil) client is owned by the caller and must be
+		// left open so it can be reused after this helper returns.
 		c = &DefaultClient{Conn: nil}
+		defer c.Close()
 	}
-	defer c.Close()
 	sendRPC := func(elapsed time.Duration) bool {
 		resp, err := c.SendRPC(t, gwAddr, expected, timeoutConfig.MaxTimeToConsistency-elapsed)
 		if err != nil {
@@ -288,4 +297,21 @@ func MakeRequestAndExpectEventuallyConsistentResponse(t *testing.T, c Client, ti
 	}
 	http.AwaitConvergence(t, timeoutConfig.RequiredConsecutiveSuccesses, timeoutConfig.MaxTimeToConsistency, sendRPC)
 	tlog.Logf(t, "Request passed")
+}
+
+// AddEntropy adds randomness to ExpectedResponse to avoid caching issues and ensure each request is unique.
+// It randomly chooses to add a delay, random metadata, or both.
+func AddEntropy(exp *ExpectedResponse) error {
+	addRandomMetadata := func(randomValue string) error {
+		if exp.RequestMetadata == nil {
+			exp.RequestMetadata = &RequestMetadata{}
+		}
+		if exp.RequestMetadata.Metadata == nil {
+			exp.RequestMetadata.Metadata = make(map[string]string)
+		}
+		exp.RequestMetadata.Metadata["x-jitter"] = randomValue
+		return nil
+	}
+
+	return weight.AddRandomEntropy(addRandomMetadata)
 }

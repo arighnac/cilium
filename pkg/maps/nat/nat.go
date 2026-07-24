@@ -12,15 +12,11 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/timestamp"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/tuple"
-)
-
-var (
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "map-nat")
 )
 
 const (
@@ -29,10 +25,13 @@ const (
 	// MapNameSnat6Global represents global IPv6 NAT table.
 	MapNameSnat6Global = "cilium_snat_v6_external"
 
-	// MinPortSnatDefault represents default min port from range.
-	MinPortSnatDefault = 1024
-	// MaxPortSnatDefault represents default max port from range.
-	MaxPortSnatDefault = 65535
+	// mapNameSnat4AllocRetries represents the histogram of IPv4 NAT port allocation retries.
+	mapNameSnat4AllocRetries = "cilium_snat_v4_alloc_retries"
+	// mapNameSnat6AllocRetries represents the histogram of IPv6 NAT port allocation retries.
+	mapNameSnat6AllocRetries = "cilium_snat_v6_alloc_retries"
+
+	// SnatCollisionRetries represents the maximum number of port allocation retries.
+	SnatCollisionRetries = 32
 )
 
 // Map represents a NAT map.
@@ -61,18 +60,28 @@ type NatMapRecord struct {
 	Value NatEntry
 }
 
-// NatMap interface represents a NAT map, and can be reused to implement mock
-// maps for unit tests.
-type NatMap interface {
+type commonMap interface {
 	Open() error
 	Close() error
 	Path() (string, error)
+}
+
+// NatMap interface represents a NAT map, and can be reused to implement mock
+// maps for unit tests.
+type NatMap interface {
+	commonMap
 	DumpEntries() (string, error)
 	DumpWithCallback(bpf.DumpCallback) error
 }
 
+type RetriesMap interface {
+	commonMap
+	DumpPerCPUWithCallback(bpf.DumpPerCPUCallback) error
+	ClearAll() error
+}
+
 // NewMap instantiates a Map.
-func NewMap(name string, family IPFamily, entries int) *Map {
+func NewMap(registry *metrics.Registry, name string, family IPFamily, entries int) *Map {
 	var mapKey bpf.MapKey
 	var mapValue bpf.MapValue
 
@@ -94,9 +103,34 @@ func NewMap(name string, family IPFamily, entries int) *Map {
 			0,
 		).WithCache().
 			WithEvents(option.Config.GetEventBufferConfig(name)).
-			WithPressureMetric(),
+			WithPressureMetric(registry),
 		family: family,
 	}
+}
+
+type RetriesKey struct {
+	Key uint32
+}
+
+func (k *RetriesKey) String() string { return fmt.Sprintf("%d", k.Key) }
+
+func (k *RetriesKey) New() bpf.MapKey { return &RetriesKey{} }
+
+type RetriesValue struct {
+	Value uint32
+}
+
+type RetriesValues []RetriesValue
+
+func (k *RetriesValue) String() string { return fmt.Sprintf("%d", k.Value) }
+
+func (k *RetriesValue) New() bpf.MapValue { return &RetriesValue{} }
+
+func (k *RetriesValue) NewSlice() any { return &RetriesValues{} }
+
+type RetriesMapRecord struct {
+	Key   *RetriesKey
+	Value *RetriesValue
 }
 
 // DumpBatch4 uses batch iteration to walk the map and applies fn for each batch of entries.
@@ -210,9 +244,12 @@ func statStartGc(m *Map) gcStats {
 func doFlush4(m *Map) gcStats {
 	stats := statStartGc(m)
 	filterCallback := func(key bpf.MapKey, _ bpf.MapValue) {
-		err := (&m.Map).Delete(key)
+		err := (&m.Map).DeleteLocked(key)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete NAT entry")
+			m.Logger.Error("Unable to delete NAT entry",
+				logfields.Error, err,
+				logfields.Key, key,
+			)
 		} else {
 			stats.deleted++
 		}
@@ -224,9 +261,12 @@ func doFlush4(m *Map) gcStats {
 func doFlush6(m *Map) gcStats {
 	stats := statStartGc(m)
 	filterCallback := func(key bpf.MapKey, _ bpf.MapValue) {
-		err := (&m.Map).Delete(key)
+		err := (&m.Map).DeleteLocked(key)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete NAT entry")
+			m.Logger.Error("Unable to delete NAT entry",
+				logfields.Error, err,
+				logfields.Key, key,
+			)
 		} else {
 			stats.deleted++
 		}
@@ -335,15 +375,12 @@ func DeleteSwappedMapping6(m *Map, tk tuple.TupleKey) error {
 }
 
 // GlobalMaps returns all global NAT maps.
-func GlobalMaps(ipv4, ipv6, nodeport bool) (ipv4Map, ipv6Map *Map) {
-	if !nodeport {
-		return
-	}
+func GlobalMaps(registry *metrics.Registry, ipv4, ipv6 bool) (ipv4Map, ipv6Map *Map) {
 	if ipv4 {
-		ipv4Map = NewMap(MapNameSnat4Global, IPv4, maxEntries())
+		ipv4Map = NewMap(registry, MapNameSnat4Global, IPv4, maxEntries())
 	}
 	if ipv6 {
-		ipv6Map = NewMap(MapNameSnat6Global, IPv6, maxEntries())
+		ipv6Map = NewMap(registry, MapNameSnat6Global, IPv6, maxEntries())
 	}
 	return
 }
@@ -370,4 +407,63 @@ func maxEntries() int {
 		return option.Config.NATMapEntriesGlobal
 	}
 	return option.LimitTableMax
+}
+
+type natRetriesMap struct {
+	bpfMapV4 *bpf.Map
+	bpfMapV6 *bpf.Map
+}
+
+func newNATRetriesMap(ipv4Enabled bool, ipv6Enabled bool) *natRetriesMap {
+	m := &natRetriesMap{}
+
+	if ipv4Enabled {
+		m.bpfMapV4 = newRetriesMap(mapNameSnat4AllocRetries)
+	}
+
+	if ipv6Enabled {
+		m.bpfMapV6 = newRetriesMap(mapNameSnat6AllocRetries)
+	}
+
+	return m
+}
+
+func (m *natRetriesMap) init() error {
+	if m.bpfMapV4 != nil {
+		if err := m.bpfMapV4.Create(); err != nil {
+			return fmt.Errorf("failed to create nat retries v4 bpf map: %w", err)
+		}
+	}
+
+	if m.bpfMapV6 != nil {
+		if err := m.bpfMapV6.Create(); err != nil {
+			return fmt.Errorf("failed to create nat retries v6 bpf map: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func newRetriesMap(name string) *bpf.Map {
+	return bpf.NewMap(
+		name,
+		ebpf.PerCPUArray,
+		&RetriesKey{},
+		&RetriesValue{},
+		SnatCollisionRetries+1,
+		0,
+	)
+}
+
+// RetriesMaps returns the maps that contain the histograms of the number of retries.
+// This should only be used from components which aren't capable of using hive - mainly the cilium-dbg.
+// It needs to initialized beforehand via the Cilium Agent.
+func RetriesMaps(ipv4 bool, ipv6 bool) (ipv4RetriesMap, ipv6RetriesMap RetriesMap) {
+	if ipv4 {
+		ipv4RetriesMap = newRetriesMap(mapNameSnat4AllocRetries)
+	}
+	if ipv6 {
+		ipv6RetriesMap = newRetriesMap(mapNameSnat6AllocRetries)
+	}
+	return
 }

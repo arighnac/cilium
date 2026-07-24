@@ -21,20 +21,26 @@ type Interface interface {
 	CiliumBGPNodeConfigOverrides() CiliumBGPNodeConfigOverrideInformer
 	// CiliumBGPPeerConfigs returns a CiliumBGPPeerConfigInformer.
 	CiliumBGPPeerConfigs() CiliumBGPPeerConfigInformer
-	// CiliumBGPPeeringPolicies returns a CiliumBGPPeeringPolicyInformer.
-	CiliumBGPPeeringPolicies() CiliumBGPPeeringPolicyInformer
 	// CiliumCIDRGroups returns a CiliumCIDRGroupInformer.
 	CiliumCIDRGroups() CiliumCIDRGroupInformer
+	// CiliumDatapathPlugins returns a CiliumDatapathPluginInformer.
+	CiliumDatapathPlugins() CiliumDatapathPluginInformer
 	// CiliumEndpointSlices returns a CiliumEndpointSliceInformer.
 	CiliumEndpointSlices() CiliumEndpointSliceInformer
+	// CiliumGatewayClassConfigs returns a CiliumGatewayClassConfigInformer.
+	CiliumGatewayClassConfigs() CiliumGatewayClassConfigInformer
 	// CiliumL2AnnouncementPolicies returns a CiliumL2AnnouncementPolicyInformer.
 	CiliumL2AnnouncementPolicies() CiliumL2AnnouncementPolicyInformer
 	// CiliumLoadBalancerIPPools returns a CiliumLoadBalancerIPPoolInformer.
 	CiliumLoadBalancerIPPools() CiliumLoadBalancerIPPoolInformer
-	// CiliumNodeConfigs returns a CiliumNodeConfigInformer.
-	CiliumNodeConfigs() CiliumNodeConfigInformer
+	// CiliumNetworkDriverClusterConfigs returns a CiliumNetworkDriverClusterConfigInformer.
+	CiliumNetworkDriverClusterConfigs() CiliumNetworkDriverClusterConfigInformer
+	// CiliumNetworkDriverNodeConfigs returns a CiliumNetworkDriverNodeConfigInformer.
+	CiliumNetworkDriverNodeConfigs() CiliumNetworkDriverNodeConfigInformer
 	// CiliumPodIPPools returns a CiliumPodIPPoolInformer.
 	CiliumPodIPPools() CiliumPodIPPoolInformer
+	// CiliumResourceIPPools returns a CiliumResourceIPPoolInformer.
+	CiliumResourceIPPools() CiliumResourceIPPoolInformer
 }
 
 type version struct {
@@ -73,19 +79,24 @@ func (v *version) CiliumBGPPeerConfigs() CiliumBGPPeerConfigInformer {
 	return &ciliumBGPPeerConfigInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
-// CiliumBGPPeeringPolicies returns a CiliumBGPPeeringPolicyInformer.
-func (v *version) CiliumBGPPeeringPolicies() CiliumBGPPeeringPolicyInformer {
-	return &ciliumBGPPeeringPolicyInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
-}
-
 // CiliumCIDRGroups returns a CiliumCIDRGroupInformer.
 func (v *version) CiliumCIDRGroups() CiliumCIDRGroupInformer {
 	return &ciliumCIDRGroupInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
+// CiliumDatapathPlugins returns a CiliumDatapathPluginInformer.
+func (v *version) CiliumDatapathPlugins() CiliumDatapathPluginInformer {
+	return &ciliumDatapathPluginInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
 // CiliumEndpointSlices returns a CiliumEndpointSliceInformer.
 func (v *version) CiliumEndpointSlices() CiliumEndpointSliceInformer {
 	return &ciliumEndpointSliceInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// CiliumGatewayClassConfigs returns a CiliumGatewayClassConfigInformer.
+func (v *version) CiliumGatewayClassConfigs() CiliumGatewayClassConfigInformer {
+	return &ciliumGatewayClassConfigInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // CiliumL2AnnouncementPolicies returns a CiliumL2AnnouncementPolicyInformer.
@@ -98,12 +109,22 @@ func (v *version) CiliumLoadBalancerIPPools() CiliumLoadBalancerIPPoolInformer {
 	return &ciliumLoadBalancerIPPoolInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
-// CiliumNodeConfigs returns a CiliumNodeConfigInformer.
-func (v *version) CiliumNodeConfigs() CiliumNodeConfigInformer {
-	return &ciliumNodeConfigInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+// CiliumNetworkDriverClusterConfigs returns a CiliumNetworkDriverClusterConfigInformer.
+func (v *version) CiliumNetworkDriverClusterConfigs() CiliumNetworkDriverClusterConfigInformer {
+	return &ciliumNetworkDriverClusterConfigInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// CiliumNetworkDriverNodeConfigs returns a CiliumNetworkDriverNodeConfigInformer.
+func (v *version) CiliumNetworkDriverNodeConfigs() CiliumNetworkDriverNodeConfigInformer {
+	return &ciliumNetworkDriverNodeConfigInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
 // CiliumPodIPPools returns a CiliumPodIPPoolInformer.
 func (v *version) CiliumPodIPPools() CiliumPodIPPoolInformer {
 	return &ciliumPodIPPoolInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// CiliumResourceIPPools returns a CiliumResourceIPPoolInformer.
+func (v *version) CiliumResourceIPPools() CiliumResourceIPPoolInformer {
+	return &ciliumResourceIPPoolInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }

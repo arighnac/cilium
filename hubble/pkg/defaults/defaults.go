@@ -43,9 +43,36 @@ var (
 	// It may be unset.
 	ConfigFile string
 
-	// FieldMask is a list of requested fields when using "dict", "tab", or "compact"
-	// output format and no custom mask is specified.
-	FieldMask = []string{"time", "source.identity", "source.namespace", "source.pod_name", "destination.identity", "destination.namespace", "destination.pod_name", "source_service", "destination_service", "l4", "IP", "ethernet", "l7", "Type", "node_name", "is_reply", "event_type", "verdict", "Summary"}
+	// FieldMask is a list of requested fields when using "dict", "tab", or
+	// "compact" output format and no custom mask is specified.
+	FieldMask = []string{
+		"time",
+		"verdict",
+		"ethernet",
+		"IP",
+		"l4",
+		"source.identity",
+		"source.namespace",
+		"source.pod_name",
+		"destination.identity",
+		"destination.namespace",
+		"destination.pod_name",
+		"Type",
+		"node_name",
+		"l7",
+		"event_type",
+		"source_service",
+		"destination_service",
+		"is_reply",
+		"Summary",
+		"ip_trace_id",
+		"traffic_direction",
+		"policy_match_type",
+		"ingress_allowed_by",
+		"ingress_denied_by",
+		"egress_allowed_by",
+		"egress_denied_by",
+	}
 )
 
 func init() {

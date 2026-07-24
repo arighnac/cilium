@@ -7,8 +7,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -16,7 +16,6 @@ import (
 
 	observerpb "github.com/cilium/cilium/api/v1/observer"
 	peerpb "github.com/cilium/cilium/api/v1/peer"
-	recorderpb "github.com/cilium/cilium/api/v1/recorder"
 	"github.com/cilium/cilium/pkg/hubble/server/serveroption"
 )
 
@@ -27,13 +26,13 @@ var (
 
 // Server is hubble's gRPC server.
 type Server struct {
-	log  logrus.FieldLogger
+	log  *slog.Logger
 	srv  *grpc.Server
 	opts serveroption.Options
 }
 
 // NewServer creates a new hubble gRPC server.
-func NewServer(log logrus.FieldLogger, options ...serveroption.Option) (*Server, error) {
+func NewServer(log *slog.Logger, options ...serveroption.Option) (*Server, error) {
 	opts := serveroption.Options{}
 	for _, opt := range options {
 		if err := opt(&opts); err != nil {
@@ -54,11 +53,11 @@ func NewServer(log logrus.FieldLogger, options ...serveroption.Option) (*Server,
 
 func (s *Server) newGRPCServer() *grpc.Server {
 	var opts []grpc.ServerOption
-	for _, interceptor := range s.opts.GRPCUnaryInterceptors {
-		opts = append(opts, grpc.UnaryInterceptor(interceptor))
+	if len(s.opts.GRPCUnaryInterceptors) > 0 {
+		opts = append(opts, grpc.ChainUnaryInterceptor(s.opts.GRPCUnaryInterceptors...))
 	}
-	for _, interceptor := range s.opts.GRPCStreamInterceptors {
-		opts = append(opts, grpc.StreamInterceptor(interceptor))
+	if len(s.opts.GRPCStreamInterceptors) > 0 {
+		opts = append(opts, grpc.ChainStreamInterceptor(s.opts.GRPCStreamInterceptors...))
 	}
 	if s.opts.ServerTLSConfig != nil {
 		// NOTE: gosec is unable to resolve the constant and warns about "TLS
@@ -81,9 +80,6 @@ func (s *Server) initGRPCServer() {
 	}
 	if s.opts.PeerService != nil {
 		peerpb.RegisterPeerServer(srv, s.opts.PeerService)
-	}
-	if s.opts.RecorderService != nil {
-		recorderpb.RegisterRecorderServer(srv, s.opts.RecorderService)
 	}
 	reflection.Register(srv)
 	if s.opts.GRPCMetrics != nil {

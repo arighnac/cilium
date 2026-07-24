@@ -7,6 +7,8 @@ metadata:
   namespace: {{ .Values.prometheus.serviceMonitor.namespace | default (include "cilium.namespace" .) }}
   labels:
     app.kubernetes.io/part-of: cilium
+    app.kubernetes.io/name: cilium-agent
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -49,6 +51,9 @@ spec:
   {{- if and .Values.envoy.enabled .Values.envoy.prometheus.serviceMonitor.enabled }}
   - port: envoy-metrics
     interval: {{ .Values.envoy.prometheus.serviceMonitor.interval | quote }}
+    {{- if .Values.envoy.prometheus.serviceMonitor.scrapeTimeout }}
+    scrapeTimeout: {{ .Values.envoy.prometheus.serviceMonitor.scrapeTimeout | quote }}
+    {{- end }}
     honorLabels: true
     path: /metrics
     {{- with .Values.envoy.prometheus.serviceMonitor.relabelings }}

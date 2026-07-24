@@ -36,6 +36,8 @@ repository in the Cilium project:
   These owners are a stand-in for the user community to bring a user
   perspective to the review process. Consider how information is presented,
   consistency of flags and options.
+- `@cilium/committers <https://github.com/orgs/cilium/teams/committers>`__:
+  Cilium contributors with commit access.
 - `@cilium/ci-structure <https://github.com/orgs/cilium/teams/ci-structure>`__:
   Provide guidance around the best use of Cilium project continuous
   integration and testing infrastructure, including GitHub actions, VM
@@ -75,7 +77,7 @@ repository in the Cilium project:
   metrics being added or extended.
 - `@cilium/release-managers <https://github.com/orgs/cilium/teams/release-managers>`__:
   Review files related to releases like AUTHORS and VERSION.
-- `@cilium/security <https://github.com/orgs/cilium/teams/security>`__:
+- `@cilium/security-cilium <https://github.com/orgs/cilium/teams/security-cilium>`__:
   Provide feedback on changes that could have security implications for Cilium,
   and maintain security-related documentation.
 - `@cilium/vendor <https://github.com/orgs/cilium/teams/vendor>`__:
@@ -129,6 +131,7 @@ specific cloud providers:
 - `@cilium/alibabacloud <https://github.com/orgs/cilium/teams/alibabacloud>`__
 - `@cilium/aws <https://github.com/orgs/cilium/teams/aws>`__
 - `@cilium/azure <https://github.com/orgs/cilium/teams/azure>`__
+- `@cilium/gke <https://github.com/orgs/cilium/teams/gke>`__
 
 Cilium Internals
 ++++++++++++++++
@@ -137,16 +140,13 @@ The following codeowner groups cover more specific knowledge about Cilium
 Agent internals or the way that particular Cilium features interact with
 external software and protocols:
 
-- `@cilium/docker <https://github.com/orgs/cilium/teams/docker>`__:
-  Maintain the deprecated docker-plugin.
 - `@cilium/endpoint <https://github.com/orgs/cilium/teams/endpoint>`__:
   Provide background on how the Cilium Endpoint package fits into the overall
-  agent architecture, relationship with generation of policy / datapath
-  constructs, serialization and restore from disk.
+  cluster architecture, lifecycle of endpoints, relationship with generation
+  of policy / datapath constructs, serialization and restore from disk.
 - `@cilium/envoy <https://github.com/orgs/cilium/teams/envoy>`__:
   Maintain the L7 proxy integration with Envoy. This includes the
-  configurations for Envoy via xDS protocols as well as the extensible
-  proxylib framework for Go-based layer 7 filters.
+  configurations for Envoy via xDS protocols.
 - `@cilium/egress-gateway <https://github.com/orgs/cilium/teams/egress-gateway>`__:
   Maintain the egress gateway control plane and datapath logic.
 - `@cilium/fqdn <https://github.com/orgs/cilium/teams/fqdn>`__:
@@ -223,3 +223,16 @@ external software and protocols:
 - `@cilium/wireguard <https://github.com/orgs/cilium/teams/wireguard>`__:
   Maintain the kernel WireGuard configuration and datapath impacts related to
   ensuring traffic is encrypted correctly when WireGuard mode is enabled.
+- `@cilium/ztunnel <https://github.com/orgs/cilium/teams/ztunnel>`__:
+  Maintain the ztunnel mTLS-proxy integration in Cilium to ensure the ztunnel
+  agent receives the necessary information to successfully proxy pod-to-pod
+  traffic through mTLS tunnels.
+- `@cilium/network-driver <https://github.com/orgs/cilium/teams/network-driver>`__:
+  Maintain the Cilium Network Driver feature, that allows to request and share
+  networking resources, like SR-IOV devices, among workloads. Responsible for all
+  interactions between the driver and the Kubelet via the Dynamic Resource
+  Allocation (DRA) API as well as between the driver and the Container Runtime
+  via the Node Resource Interface (NRI) API. Ensure the consistency of the
+  dedicated IPAM modes with the Network Driver resources management.
+  This code owner is not related to the low level interactions with the Linux
+  network drivers.

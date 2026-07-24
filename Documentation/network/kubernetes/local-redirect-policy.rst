@@ -40,15 +40,12 @@ Prerequisites
 
 .. include:: ../../installation/k8s-install-download-release.rst
 
-Enable the feature by setting the ``localRedirectPolicy`` value to ``true``.
+Enable the feature by setting the ``localRedirectPolicies.enabled`` value to ``true``.
 
-.. parsed-literal::
-
-   helm upgrade cilium |CHART_RELEASE| \\
-     --namespace kube-system \\
-     --reuse-values \\
-     --set localRedirectPolicy=true
-
+.. cilium-helm-upgrade::
+   :namespace: kube-system
+   :extra-args: --reuse-values
+   :set: localRedirectPolicies.enabled=true
 
 Rollout the operator and agent pods to make the changes effective:
 
@@ -83,7 +80,7 @@ Validate that the Cilium Local Redirect Policy CRD has been registered.
 
     Local Redirect Policy supports either the socket-level loadbalancer or the tc loadbalancer.
     The configuration depends on your specific use case and the type of service handling required.
-    Below are the Helm setups to work with ``localRedirectPolicy=true``:
+    Below are the Helm setups to work with ``localRedirectPolicies.enabled=true``:
 
     1. Enable full kube-proxy replacement:
 
@@ -93,7 +90,8 @@ Validate that the Cilium Local Redirect Policy CRD has been registered.
       .. code-block:: yaml
 
         kubeProxyReplacement: true
-        localRedirectPolicy: true
+        localRedirectPolicies:
+          enabled: true
 
     2. Bypass the socket-level loadbalancer in pod namespaces:
 
@@ -106,7 +104,8 @@ Validate that the Cilium Local Redirect Policy CRD has been registered.
         kubeProxyReplacement: true
         socketLB:
           hostNamespaceOnly: true
-        localRedirectPolicy: true
+        localRedirectPolicies:
+          enabled: true
 
     3. Enable the socket-level loadbalancer only:
 
@@ -118,7 +117,8 @@ Validate that the Cilium Local Redirect Policy CRD has been registered.
         kubeProxyReplacement: false
         socketLB:
           enabled: true
-        localRedirectPolicy: true
+        localRedirectPolicies:
+          enabled: true
 
     4. Disable any service handling except for ClusterIP services accessed from pods:
 
@@ -130,7 +130,8 @@ Validate that the Cilium Local Redirect Policy CRD has been registered.
       .. code-block:: yaml
 
         kubeProxyReplacement: false
-        localRedirectPolicy: true
+        localRedirectPolicies:
+          enabled: true
 
 Create backend and client pods
 ==============================
@@ -142,6 +143,7 @@ port and protocol fields specified in the CiliumLocalRedirectPolicy custom
 resources that will be created in the next step.
 
 .. literalinclude:: ../../../examples/kubernetes-local-redirect/backend-pod.yaml
+   :language: yaml
 
 .. parsed-literal::
 
@@ -192,6 +194,7 @@ Create a custom resource of type CiliumLocalRedirectPolicy with ``addressMatcher
 configuration.
 
 .. literalinclude:: ../../../examples/kubernetes-local-redirect/lrp-addrmatcher.yaml
+   :language: yaml
 
 .. parsed-literal::
 
@@ -254,6 +257,34 @@ Verify that the traffic was redirected to the ``lrp-pod`` that was deployed.
     01:36:24.609007 IP 10.16.70.187.80 > 10.16.215.55.60876: Flags [P.], seq 1:239, ack 96, win 219, options [nop,nop,TS val 2962246962 ecr 2541637677], length 238: HTTP: HTTP/1.1 200 OK
     01:36:24.609052 IP 10.16.215.55.60876 > 10.16.70.187.80: Flags [.], ack 239, win 229, options [nop,nop,TS val 2541637677 ecr 2962246962], length 0
 
+The allowed addresses can be constrained clusterwide using the
+``localRedirectPolicies.addressMatcherCIDRs`` helm option:
+
+.. code-block:: yaml
+
+  localRedirectPolicies:
+    enabled: true
+    addressMatchCIDRs:
+	- 169.254.169.254/32
+
+The above would only allow traffic going to ``169.254.169.254`` to be redirected
+with an AddressMatcher rule. A policy with a disallowed address will be rejected
+and a warning log message is emitted by cilium-agent.
+
+.. note::
+
+   AddressMatcher is intended for IPs that do not belong to a
+   Kubernetes Service. If the IP and port/protocol in
+   ``redirectFrontend.addressMatcher`` coincide with an existing
+   ``ClusterIP`` Service frontend, the policy is not applied to that
+   address. Cilium refuses to override a frontend owned by another
+   Service and logs::
+
+       LocalRedirectPolicy matches an address owned by an existing service => refusing to override
+
+   To redirect traffic destined for a Service, use `ServiceMatcher`_
+   instead.
+
 .. _ServiceMatcher:
 
 ServiceMatcher
@@ -282,6 +313,7 @@ policy is used to select the backend pods where traffic is redirected to.
 Deploy the Kubernetes service for which traffic needs to be redirected.
 
 .. literalinclude:: ../../../examples/kubernetes-local-redirect/k8s-svc.yaml
+   :language: yaml
 
 .. parsed-literal::
 
@@ -308,6 +340,7 @@ Create a custom resource of type CiliumLocalRedirectPolicy with ``serviceMatcher
 configuration.
 
 .. literalinclude:: ../../../examples/kubernetes-local-redirect/lrp-svcmatcher.yaml
+   :language: yaml
 
 .. parsed-literal::
 
@@ -459,7 +492,7 @@ steers traffic to a local DNS node-cache which runs as a normal pod.
         need to modify those to match your deployment if they are different.
 
 After all ``node-local-dns`` pods are in ready status, DNS traffic will now go to the local node-cache first.
-You can verify by checking the DNS cache's metrics ``coredns_dns_request_count_total`` via curling
+You can verify by checking the DNS cache's metrics ``coredns_dns_requests_total`` via curling
 ``<node-local-dns pod IP>:9253/metrics``, the metric should increment as new DNS requests being issued from
 application pods are now redirected to the ``node-local-dns`` pod.
 
@@ -499,77 +532,6 @@ will get directed to cluster DNS pods backed by the ``kube-dns`` service.
             $ kubectl exec -it cilium-mhnhz -n kube-system -- cilium-dbg service list | grep LocalRedirect
             11   10.96.0.10:53      LocalRedirect   1 => 10.244.1.49:53 (active)
 
-kiam redirect on EKS
---------------------
-`kiam <https://github.com/uswitch/kiam>`_ agent runs on each node in an EKS
-cluster, and intercepts requests going to the AWS metadata server to fetch
-security credentials for pods.
-
-- In order to only redirect traffic from pods to the kiam agent, and pass
-  traffic from the kiam agent to the AWS metadata server without any redirection,
-  we need the socket lookup functionality in the datapath. This functionality
-  requires v5.1.16, v5.2.0 or more recent Linux kernel. Make sure the kernel
-  version installed on EKS cluster nodes satisfies these requirements.
-
-- Deploy `kiam <https://github.com/uswitch/kiam>`_ using helm charts.
-
-  .. code-block:: shell-session
-
-      $ helm repo add uswitch https://uswitch.github.io/kiam-helm-charts/charts/
-      $ helm repo update
-      $ helm install --set agent.host.iptables=false --set agent.whitelist-route-regexp=meta-data kiam uswitch/kiam
-
-  - The above command may provide instructions to prepare kiam in the cluster.
-    Follow the instructions before continuing.
-
-  - kiam must run in the ``hostNetwork`` mode and without the "--iptables" argument.
-    The install instructions above ensure this by default.
-
-- Deploy the Local Redirect Policy to redirect pod traffic to the deployed kiam agent.
-
-  .. parsed-literal::
-
-      $ kubectl apply -f \ |SCM_WEB|\/examples/kubernetes-local-redirect/kiam-lrp.yaml
-
-.. note::
-
-    - The ``addressMatcher`` ip address in the Local Redirect Policy is set to
-      the ip address of the AWS metadata server and the ``toPorts`` port
-      to the default HTTP server port. The ``toPorts`` field under
-      ``redirectBackend`` configuration in the policy is set to the port that
-      the kiam agent listens on. The port is passed as "--port" argument in
-      the ``kiam-agent DaemonSet``.
-    - The Local Redirect Policy namespace is set to the namespace
-      in which kiam-agent DaemonSet is deployed.
-
-- Once all the kiam agent pods are in ``Running`` state, the metadata requests
-  from application pods will get redirected to the node-local kiam agent pods.
-  You can verify this by running a curl command to the AWS metadata server from
-  one of the application pods, and tcpdump command on the same EKS cluster node as the
-  pod. Following is an example output, where ``192.169.98.118`` is the ip
-  address of an application pod, and ``192.168.60.99`` is the ip address of the
-  kiam agent running on the same node as the application pod.
-
-  .. code-block:: shell-session
-
-      $ kubectl exec app-pod -- curl -s -w "\n" -X GET http://169.254.169.254/latest/meta-data/
-      ami-id
-      ami-launch-index
-      ami-manifest-path
-      block-device-mapping/
-      events/
-      hostname
-      iam/
-      identity-credentials/
-      (...)
-
-  .. code-block:: shell-session
-
-      $ sudo tcpdump -i any -enn "(port 8181) and (host 192.168.60.99 and 192.168.98.118)"
-      tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
-      listening on any, link-type LINUX_SLL (Linux cooked), capture size 262144 bytes
-      05:16:05.229597  In de:e4:e9:94:b5:9f ethertype IPv4 (0x0800), length 76: 192.168.98.118.47934 > 192.168.60.99.8181: Flags [S], seq 669026791, win 62727, options [mss 8961,sackOK,TS val 2539579886 ecr 0,nop,wscale 7], length 0
-      05:16:05.229657 Out 56:8f:62:18:6f:85 ethertype IPv4 (0x0800), length 76: 192.168.60.99.8181 > 192.168.98.118.47934: Flags [S.], seq 2355192249, ack 669026792, win 62643, options [mss 8961,sackOK,TS val 4263010641 ecr 2539579886,nop,wscale 7], length 0
 
 Advanced configurations
 =======================

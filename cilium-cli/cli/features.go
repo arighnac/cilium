@@ -33,7 +33,7 @@ func newCmdFeaturesGH() *cobra.Command {
 		Short: "Stores and generates the summary for the features tested on a CI run",
 		Long: "This command will connect to GitHub to retrieve the metrics generated\n" +
 			"on a CI run and will generate a summary with the report.\n" +
-			"Requires a GitHub Token in GITHUB_TOKEN env variable with permissions to access contents. Direct Link:\n" +
+			"Requires a GitHub Token in GITHUB_TOKEN environment variable with permissions to access contents. Direct Link:\n" +
 			"https://github.com/settings/tokens/new?description=CI%20Summary%20Generator&scopes=public_repo",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			s := features.NewFeatures(nil, params)
@@ -62,9 +62,9 @@ func newCmdFeaturesStatus() *cobra.Command {
 		Short: "Display features status",
 		Long:  "This command returns features enabled from all nodes in the cluster",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			params.CiliumNamespace = namespace
-			params.CiliumOperatorNamespace = namespace
-			s := features.NewFeatures(k8sClient, params)
+			params.CiliumNamespace = RootParams.Namespace
+			params.CiliumOperatorNamespace = RootParams.Namespace
+			s := features.NewFeatures(RootK8sClient, params)
 			if err := s.PrintFeatureStatus(context.Background()); err != nil {
 				fatalf("Unable to print features status: %s", err)
 			}

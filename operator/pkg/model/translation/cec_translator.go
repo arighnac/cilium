@@ -4,14 +4,14 @@
 package translation
 
 import (
-	"maps"
 	goslices "slices"
 	"sort"
+	"strconv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/cilium/operator/pkg/model"
-	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/annotation"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/shortener"
@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	secureHost   = "secure"
 	insecureHost = "insecure"
+	secureHost   = "secure"
 
 	AppProtocolH2C = "kubernetes.io/h2c"
 	AppProtocolWS  = "kubernetes.io/ws"
@@ -28,6 +28,10 @@ const (
 )
 
 var _ CECTranslator = (*cecTranslator)(nil)
+
+type ServiceConfig struct {
+	ExternalTrafficPolicy string `json:"external_traffic_policy,omitempty"`
+}
 
 type HostNetworkConfig struct {
 	Enabled           bool                       `json:"enabled,omitempty"`
@@ -40,8 +44,9 @@ type IPConfig struct {
 }
 
 type ListenerConfig struct {
-	UseAlpn          bool `json:"use_alpn,omitempty"`
-	UseProxyProtocol bool `json:"use_proxy_protocol,omitempty"`
+	UseAlpn                  bool `json:"use_alpn,omitempty"`
+	UseProxyProtocol         bool `json:"use_proxy_protocol,omitempty"`
+	StreamIdleTimeoutSeconds int  `json:"stream_idle_timeout_seconds,omitempty"`
 }
 
 type ClusterConfig struct {
@@ -65,6 +70,7 @@ type OriginalIPDetectionConfig struct {
 type Config struct {
 	SecretsNamespace string `json:"secrets_namespace,omitempty"`
 
+	ServiceConfig             ServiceConfig             `json:"service_config"`
 	HostNetworkConfig         HostNetworkConfig         `json:"host_network_config"`
 	IPConfig                  IPConfig                  `json:"ip_config"`
 	ListenerConfig            ListenerConfig            `json:"listener_config"`
@@ -91,24 +97,39 @@ func NewCECTranslator(config Config) CECTranslator {
 }
 
 func (i *cecTranslator) Translate(namespace string, name string, model *model.Model) (*ciliumv2.CiliumEnvoyConfig, error) {
+	backendServices, err := i.desiredBackendServices(model)
+	if err != nil {
+		return nil, err
+	}
+
+	services, err := i.desiredServicesWithPorts(namespace, name, model)
+	if err != nil {
+		return nil, err
+	}
+
+	resources, err := i.desiredResources(model)
+	if err != nil {
+		return nil, err
+	}
+
 	return &ciliumv2.CiliumEnvoyConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      name,
-			Labels: map[string]string{
-				k8s.UseOriginalSourceAddressLabel: "false",
+			Annotations: map[string]string{
+				annotation.CECUseOriginalSourceAddress: strconv.FormatBool(i.shouldUseOriginalSourceAddress(model)),
 			},
 		},
 		Spec: ciliumv2.CiliumEnvoyConfigSpec{
-			BackendServices: i.desiredBackendServices(model),
-			Services:        i.desiredServicesWithPorts(namespace, name, model),
-			Resources:       i.desiredResources(model),
+			BackendServices: backendServices,
+			Services:        services,
+			Resources:       resources,
 			NodeSelector:    i.desiredNodeSelector(),
 		},
 	}, nil
 }
 
-func (i *cecTranslator) desiredBackendServices(m *model.Model) []*ciliumv2.Service {
+func (i *cecTranslator) desiredBackendServices(m *model.Model) ([]*ciliumv2.Service, error) {
 	var res []*ciliumv2.Service
 
 	for ns, v := range getNamespaceNamePortsMap(m) {
@@ -132,26 +153,34 @@ func (i *cecTranslator) desiredBackendServices(m *model.Model) []*ciliumv2.Servi
 		}
 		return res[i].Ports[0] < res[j].Ports[0]
 	})
-	return res
+	return res, nil
 }
 
-func (i *cecTranslator) desiredServicesWithPorts(namespace string, name string, m *model.Model) []*ciliumv2.ServiceListener {
-	// Find all the ports used in the model and build a set of them
+func (i *cecTranslator) desiredServicesWithPorts(namespace string, name string, m *model.Model) ([]*ciliumv2.ServiceListener, error) {
+	if m.NeedsPerPortListeners() {
+		return i.desiredServicesWithPortsSplit(namespace, name, m)
+	}
+	return i.desiredServicesWithPortsCombined(namespace, name, m)
+}
+
+// desiredServicesWithPortsCombined returns a single ServiceListener covering all ports.
+func (i *cecTranslator) desiredServicesWithPortsCombined(namespace string, name string, m *model.Model) ([]*ciliumv2.ServiceListener, error) {
 	allPorts := make(map[uint16]struct{})
 
 	for _, hl := range m.HTTP {
-		if _, ok := allPorts[uint16(hl.Port)]; !ok {
-			allPorts[uint16(hl.Port)] = struct{}{}
-		}
+		allPorts[uint16(hl.Port)] = struct{}{}
 	}
 	for _, tlsl := range m.TLSPassthrough {
-		if _, ok := allPorts[uint16(tlsl.Port)]; !ok {
+		if len(tlsl.Routes) > 0 {
 			allPorts[uint16(tlsl.Port)] = struct{}{}
 		}
 	}
 
-	// ensure the ports are stably sorted
-	ports := goslices.Sorted(maps.Keys(allPorts))
+	ports := make([]uint16, 0, len(allPorts))
+	for p := range allPorts {
+		ports = append(ports, p)
+	}
+	goslices.Sort(ports)
 
 	return []*ciliumv2.ServiceListener{
 		{
@@ -159,17 +188,117 @@ func (i *cecTranslator) desiredServicesWithPorts(namespace string, name string, 
 			Name:      shortener.ShortenK8sResourceName(name),
 			Ports:     ports,
 		},
-	}
+	}, nil
 }
 
-func (i *cecTranslator) desiredResources(m *model.Model) []ciliumv2.XDSResource {
+// desiredServicesWithPortsSplit returns per-port ServiceListeners for HTTPS and
+// TLS passthrough, plus one shared entry for plaintext HTTP ports.
+func (i *cecTranslator) desiredServicesWithPortsSplit(namespace string, name string, m *model.Model) ([]*ciliumv2.ServiceListener, error) {
+	shortenedName := shortener.ShortenK8sResourceName(name)
+	var result []*ciliumv2.ServiceListener
+
+	// All TLS passthrough ports are excluded from the plaintext HTTP port list,
+	// since they are handled by the TLS passthrough section below.
+	tlsPassthroughPorts := map[uint32]bool{}
+	for _, p := range m.TLSPassthroughPorts() {
+		tlsPassthroughPorts[p] = true
+	}
+
+	// Plaintext HTTP ports.
+	var httpPorts []uint16
+	for _, hl := range m.HTTP {
+		if len(hl.TLS) == 0 && !tlsPassthroughPorts[hl.Port] {
+			httpPorts = append(httpPorts, uint16(hl.Port))
+		}
+	}
+	goslices.Sort(httpPorts)
+	httpPorts = goslices.Compact(httpPorts)
+	if len(httpPorts) > 0 {
+		result = append(result, &ciliumv2.ServiceListener{
+			Namespace: namespace,
+			Name:      shortenedName,
+			Ports:     httpPorts,
+			Listener:  listenerName,
+		})
+	}
+
+	// One entry per HTTPS port.
+	for _, port := range m.HTTPSPortsSorted() {
+		envoyListenerName := listenerNameForPort(port)
+		result = append(result, &ciliumv2.ServiceListener{
+			Namespace: namespace,
+			Name:      shortenedName,
+			Ports:     []uint16{uint16(port)},
+			Listener:  envoyListenerName,
+		})
+	}
+
+	// TLS passthrough ports.
+	if m.NeedsPerPortTLSPassthroughListeners() {
+		// One entry per TLS passthrough port.
+		for _, port := range m.TLSPassthroughPorts() {
+			envoyListenerName := listenerNameForPort(port)
+			result = append(result, &ciliumv2.ServiceListener{
+				Namespace: namespace,
+				Name:      shortenedName,
+				Ports:     []uint16{uint16(port)},
+				Listener:  envoyListenerName,
+			})
+		}
+	} else {
+		var ptPorts []uint16
+		for _, tlsl := range m.TLSPassthrough {
+			if len(tlsl.Routes) > 0 {
+				ptPorts = append(ptPorts, uint16(tlsl.Port))
+			}
+		}
+		goslices.Sort(ptPorts)
+		ptPorts = goslices.Compact(ptPorts)
+		if len(ptPorts) > 0 {
+			result = append(result, &ciliumv2.ServiceListener{
+				Namespace: namespace,
+				Name:      shortenedName,
+				Ports:     ptPorts,
+				Listener:  listenerName,
+			})
+		}
+	}
+
+	return result, nil
+}
+
+func (i *cecTranslator) desiredResources(m *model.Model) ([]ciliumv2.XDSResource, error) {
 	var res []ciliumv2.XDSResource
 
-	res = append(res, i.desiredEnvoyListener(m)...)
-	res = append(res, i.desiredEnvoyHTTPRouteConfiguration(m)...)
-	res = append(res, i.desiredEnvoyCluster(m)...)
+	listener, err := i.desiredEnvoyListener(m)
+	if err != nil {
+		return nil, err
+	}
 
-	return res
+	httpRoutes, err := i.desiredEnvoyHTTPRouteConfiguration(m)
+	if err != nil {
+		return nil, err
+	}
+
+	clusters, err := i.desiredEnvoyCluster(m)
+	if err != nil {
+		return nil, err
+	}
+	res = append(res, listener...)
+	res = append(res, httpRoutes...)
+	res = append(res, clusters...)
+
+	return res, nil
+}
+
+func (i *cecTranslator) shouldUseOriginalSourceAddress(m *model.Model) bool {
+	for _, l := range m.HTTP {
+		if l.Gamma {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (i *cecTranslator) desiredNodeSelector() *slim_metav1.LabelSelector {
@@ -214,6 +343,30 @@ func getAppProtocol(m *model.Model, ns string, name string, port string) string 
 	return ""
 }
 
+func getTLSOrigination(m *model.Model, ns string, name string, port string) *model.BackendTLSOrigination {
+	for _, l := range m.HTTP {
+		for _, r := range l.Routes {
+			for _, be := range r.Backends {
+				if be.Name == name && be.Namespace == ns && be.Port != nil && be.Port.GetPort() == port {
+					if be.TLS != nil {
+						return be.TLS
+					}
+				}
+			}
+			if r.ExternalAuth != nil {
+				be := r.ExternalAuth.Backend
+				if be.Name == name && be.Namespace == ns && be.Port != nil && be.Port.GetPort() == port {
+					if be.TLS != nil {
+						return be.TLS
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // getNamespaceNamePortsMap returns a map of namespace -> name -> ports.
 // it gets all HTTP and TLS routes.
 // The ports are sorted and unique.
@@ -240,6 +393,9 @@ func getNamespaceNamePortsMap(m *model.Model) map[string]map[string][]string {
 				}
 				mergeBackendsInNamespaceNamePortMap([]model.Backend{*rm.Backend}, namespaceNamePortMap)
 			}
+			if r.ExternalAuth != nil {
+				mergeBackendsInNamespaceNamePortMap([]model.Backend{r.ExternalAuth.Backend}, namespaceNamePortMap)
+			}
 		}
 	}
 
@@ -250,6 +406,28 @@ func getNamespaceNamePortsMap(m *model.Model) map[string]map[string][]string {
 	}
 
 	return namespaceNamePortMap
+}
+
+// getUniqueAuthFilters returns a deduplicated list of HTTPExternalAuthFilter from all routes.
+// Two filters are considered identical when all HCM-level config fields match (protocol, backend,
+// path prefix, forward-body size, allowed headers). Routes sharing the same backend with different
+// configs each get their own filter instance, which is enabled only for the routes that reference it.
+func (i *cecTranslator) getUniqueAuthFilters(m *model.Model) []*model.HTTPExternalAuthFilter {
+	seen := map[string]struct{}{}
+	var result []*model.HTTPExternalAuthFilter
+	for _, l := range m.HTTP {
+		for _, r := range l.Routes {
+			if r.ExternalAuth == nil {
+				continue
+			}
+			key := extAuthzFilterKey(r.ExternalAuth)
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				result = append(result, r.ExternalAuth)
+			}
+		}
+	}
+	return result
 }
 
 func mergeBackendsInNamespaceNamePortMap(backends []model.Backend, namespaceNamePortMap map[string]map[string][]string) {

@@ -7,10 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/gopacket/gopacket/layers"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
@@ -84,7 +84,7 @@ func (h *icmpHandler) ProcessFlow(ctx context.Context, flow *flowpb.Flow) error 
 	}
 
 	if icmp := l4.GetICMPv6(); icmp != nil {
-		labels := []string{"IPv4", layers.CreateICMPv6TypeCode(uint8(icmp.Type), uint8(icmp.Code)).String()}
+		labels := []string{"IPv6", layers.CreateICMPv6TypeCode(uint8(icmp.Type), uint8(icmp.Code)).String()}
 		labels = append(labels, labelValues...)
 		h.icmp.WithLabelValues(labels...).Inc()
 	}
@@ -106,11 +106,11 @@ func (h *icmpHandler) HandleConfigurationUpdate(cfg *api.MetricConfig) error {
 
 func (h *icmpHandler) SetFilters(cfg *api.MetricConfig) error {
 	var err error
-	h.AllowList, err = filters.BuildFilterList(context.Background(), cfg.IncludeFilters, filters.DefaultFilters(logrus.New()))
+	h.AllowList, err = filters.BuildFilterList(context.Background(), cfg.IncludeFilters, filters.DefaultFilters(slog.Default()))
 	if err != nil {
 		return err
 	}
-	h.DenyList, err = filters.BuildFilterList(context.Background(), cfg.ExcludeFilters, filters.DefaultFilters(logrus.New()))
+	h.DenyList, err = filters.BuildFilterList(context.Background(), cfg.ExcludeFilters, filters.DefaultFilters(slog.Default()))
 	if err != nil {
 		return err
 	}

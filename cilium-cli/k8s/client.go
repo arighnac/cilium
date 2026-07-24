@@ -13,13 +13,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/blang/semver/v4"
-	"helm.sh/helm/v3/pkg/action"
-	"helm.sh/helm/v3/pkg/cli/output"
+	"helm.sh/helm/v4/pkg/action"
+	"helm.sh/helm/v4/pkg/cli/output"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Register all auth providers (azure, gcp, oidc, openstack, ..）
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 
 	"github.com/cilium/cilium/api/v1/models"
@@ -50,6 +52,10 @@ import (
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	ciliumv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	ciliumClientset "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned"
+	slimcorev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	ciliumnetworkingv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1"
+	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned/typed/core/v1"
+	slim_networkingv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned/typed/networking/v1"
 	"github.com/cilium/cilium/pkg/safeio"
 	"github.com/cilium/cilium/pkg/versioncheck"
 )
@@ -63,15 +69,17 @@ func init() {
 }
 
 type Client struct {
-	Clientset          kubernetes.Interface
-	ExtensionClientset apiextensionsclientset.Interface // k8s api extension needed to retrieve CRDs
-	DynamicClientset   dynamic.Interface
-	CiliumClientset    ciliumClientset.Interface
-	Config             *rest.Config
-	RawConfig          clientcmdapi.Config
-	RESTClientGetter   genericclioptions.RESTClientGetter
-	contextName        string
-	HelmActionConfig   *action.Configuration
+	Clientset                 kubernetes.Interface
+	ExtensionClientset        apiextensionsclientset.Interface // k8s api extension needed to retrieve CRDs
+	DynamicClientset          dynamic.Interface
+	CiliumClientset           ciliumClientset.Interface
+	SlimCoreV1Clientset       slim_corev1.CoreV1Interface
+	SlimNetworkingV1Clientset slim_networkingv1.NetworkingV1Interface
+	Config                    *rest.Config
+	RawConfig                 clientcmdapi.Config
+	RESTClientGetter          genericclioptions.RESTClientGetter
+	contextName               string
+	HelmActionConfig          *action.Configuration
 }
 
 func NewClient(contextName, kubeconfig, ciliumNamespace string, impersonateAs string, impersonateGroup []string) (*Client, error) {
@@ -118,6 +126,16 @@ func NewClient(contextName, kubeconfig, ciliumNamespace string, impersonateAs st
 		return nil, err
 	}
 
+	slimCoreV1Clientset, err := slim_corev1.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	slimNetworkingV1Clientset, err := slim_networkingv1.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
 	if contextName == "" {
 		contextName = rawConfig.CurrentContext
 	}
@@ -126,21 +144,22 @@ func NewClient(contextName, kubeconfig, ciliumNamespace string, impersonateAs st
 	// Use the default Helm driver (Kubernetes secret).
 	helmDriver := ""
 	actionConfig := action.Configuration{}
-	logger := func(_ string, _ ...interface{}) {}
-	if err := actionConfig.Init(&restClientGetter, ciliumNamespace, helmDriver, logger); err != nil {
+	if err := actionConfig.Init(&restClientGetter, ciliumNamespace, helmDriver); err != nil {
 		return nil, err
 	}
 
 	return &Client{
-		CiliumClientset:    ciliumClientset,
-		Clientset:          clientset,
-		ExtensionClientset: extensionClientset,
-		Config:             config,
-		DynamicClientset:   dynamicClientset,
-		RawConfig:          rawConfig,
-		RESTClientGetter:   &restClientGetter,
-		contextName:        contextName,
-		HelmActionConfig:   &actionConfig,
+		CiliumClientset:           ciliumClientset,
+		Clientset:                 clientset,
+		ExtensionClientset:        extensionClientset,
+		SlimCoreV1Clientset:       slimCoreV1Clientset,
+		SlimNetworkingV1Clientset: slimNetworkingV1Clientset,
+		Config:                    config,
+		DynamicClientset:          dynamicClientset,
+		RawConfig:                 rawConfig,
+		RESTClientGetter:          &restClientGetter,
+		contextName:               contextName,
+		HelmActionConfig:          &actionConfig,
 	}, nil
 }
 
@@ -227,8 +246,8 @@ func (c *Client) GetService(ctx context.Context, namespace, name string, opts me
 	return c.Clientset.CoreV1().Services(namespace).Get(ctx, name, opts)
 }
 
-func (c *Client) GetEndpoints(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*corev1.Endpoints, error) {
-	return c.Clientset.CoreV1().Endpoints(namespace).Get(ctx, name, opts)
+func (c *Client) GetEndpointSlice(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*discoveryv1.EndpointSlice, error) {
+	return c.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(ctx, name, opts)
 }
 
 func (c *Client) CreateDeployment(ctx context.Context, namespace string, deployment *appsv1.Deployment, opts metav1.CreateOptions) (*appsv1.Deployment, error) {
@@ -237,6 +256,10 @@ func (c *Client) CreateDeployment(ctx context.Context, namespace string, deploym
 
 func (c *Client) GetDeployment(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*appsv1.Deployment, error) {
 	return c.Clientset.AppsV1().Deployments(namespace).Get(ctx, name, opts)
+}
+
+func (c *Client) ListDeployment(ctx context.Context, namespace string, options metav1.ListOptions) (*appsv1.DeploymentList, error) {
+	return c.Clientset.AppsV1().Deployments(namespace).List(ctx, options)
 }
 
 func (c *Client) DeleteDeployment(ctx context.Context, namespace, name string, opts metav1.DeleteOptions) error {
@@ -281,6 +304,10 @@ func (c *Client) CreateNamespace(ctx context.Context, namespace *corev1.Namespac
 	return c.Clientset.CoreV1().Namespaces().Create(ctx, namespace, opts)
 }
 
+func (c *Client) UpdateNamespace(ctx context.Context, namespace *corev1.Namespace, opts metav1.UpdateOptions) (*corev1.Namespace, error) {
+	return c.Clientset.CoreV1().Namespaces().Update(ctx, namespace, opts)
+}
+
 func (c *Client) GetNamespace(ctx context.Context, namespace string, options metav1.GetOptions) (*corev1.Namespace, error) {
 	return c.Clientset.CoreV1().Namespaces().Get(ctx, namespace, options)
 }
@@ -323,9 +350,9 @@ func (c *Client) PodLogs(namespace, name string, opts *corev1.PodLogOptions) *re
 	return c.Clientset.CoreV1().Pods(namespace).GetLogs(name, opts)
 }
 
-func (c *Client) CiliumLogs(ctx context.Context, namespace, pod string, since time.Time, previous bool) (string, error) {
+func (c *Client) ContainerLogs(ctx context.Context, namespace, pod, containerName string, since time.Time, previous bool) (string, error) {
 	opts := &corev1.PodLogOptions{
-		Container:  defaults.AgentContainerName,
+		Container:  containerName,
 		Timestamps: true,
 		SinceTime:  &metav1.Time{Time: since},
 		Previous:   previous,
@@ -347,6 +374,39 @@ func (c *Client) CiliumLogs(ctx context.Context, namespace, pod string, since ti
 
 func (c *Client) ListServices(ctx context.Context, namespace string, options metav1.ListOptions) (*corev1.ServiceList, error) {
 	return c.Clientset.CoreV1().Services(namespace).List(ctx, options)
+}
+
+// transientExecErrorSubstrings are error message fragments that indicate a
+// transient failure of the Kubernetes API server -> kubelet exec proxy rather
+// than a genuine failure of the executed command, and are therefore worth
+// retrying. On managed clusters (seen on AKS) the proxy is occasionally
+// unreachable for tens of seconds at a time. They are intentionally specific to
+// the exec-proxy tunnel so that benign command stderr (e.g. cilium-operator
+// "level=debug" log lines) is not mistaken for a transient error and needlessly
+// retried.
+var transientExecErrorSubstrings = []string{
+	"i/o timeout", // e.g. "dial tcp <apiserver>:443: i/o timeout"
+	"error dialing backend",
+	"unable to upgrade connection",
+	"Bad Gateway",         // HTTP 502
+	"Service Unavailable", // HTTP 503
+	"Gateway Timeout",     // HTTP 504
+	"TLS handshake timeout",
+}
+
+// IsTransientExecError reports whether err looks like a transient failure of
+// the Kubernetes API server exec proxy, as opposed to a genuine failure of the
+// command that was executed in the pod. Callers that exec through the proxy in
+// a loop (e.g. waiting for a NodePort or collecting features) use this to retry
+// proxy blips without treating them as a real result.
+func IsTransientExecError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return slices.ContainsFunc(transientExecErrorSubstrings, func(substr string) bool {
+		return strings.Contains(msg, substr)
+	})
 }
 
 func (c *Client) ExecInPodWithStderr(ctx context.Context, namespace, pod, container string, command []string) (bytes.Buffer, bytes.Buffer, error) {
@@ -428,11 +488,6 @@ func (c *Client) KVStoreMeshStatus(ctx context.Context, namespace, pod string) (
 	stdout, stderr, err := c.ExecInPodWithStderr(ctx, namespace, pod, defaults.ClusterMeshKVStoreMeshContainerName,
 		[]string{defaults.ClusterMeshBinaryName, "kvstoremesh-dbg", "status", "-o", "json"})
 	if err != nil {
-		// Cilium v1.14 has a separate kvstoremesh container, with a separate binary
-		if strings.Contains(err.Error(), "stat /usr/bin/clustermesh-apiserver: no such file or directory") {
-			return nil, ErrKVStoreMeshStatusNotImplemented
-		}
-
 		// Try to figure out if the status command is not yet supported in this version
 		stderrStr := stderr.String()
 		if strings.Contains(stderrStr, "Usage:") || strings.Contains(stderrStr, "unknown command") {
@@ -547,6 +602,7 @@ const (
 	KindMicrok8s
 	KindRancherDesktop
 	KindK3s
+	KindOpenShift
 )
 
 func (k Kind) String() string {
@@ -569,6 +625,8 @@ func (k Kind) String() string {
 		return "rancher-desktop"
 	case KindK3s:
 		return "K3s"
+	case KindOpenShift:
+		return "OpenShift"
 	default:
 		return "invalid"
 	}
@@ -638,8 +696,16 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 	if err != nil {
 		return f
 	}
-	// Assume k3s if the k8s master node runs k3s
 	for _, node := range nodeList.Items {
+		if _, ok := node.Labels["cloud.google.com/gke-nodepool"]; ok {
+			f.Kind = KindGKE
+			return f
+		}
+		if _, ok := node.Labels["cloud.google.com/gke-os-distribution"]; ok {
+			f.Kind = KindGKE
+			return f
+		}
+
 		isMaster := node.Labels["node-role.kubernetes.io/master"]
 		if isMaster != "true" {
 			continue
@@ -648,9 +714,21 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 		if !ok {
 			instanceType = node.Labels[corev1.LabelInstanceType]
 		}
+		// Assume k3s if the k8s master node runs k3s
 		if instanceType == "k3s" {
 			f.Kind = KindK3s
 			return f
+		}
+	}
+
+	apiList, err := c.GetServerGroups()
+	if err == nil {
+		apiGroups := apiList.Groups
+		for i := range apiGroups {
+			if apiGroups[i].Name == "route.openshift.io" {
+				f.Kind = KindOpenShift
+				return f
+			}
 		}
 	}
 
@@ -677,24 +755,12 @@ func (c *Client) ListNodes(ctx context.Context, options metav1.ListOptions) (*co
 	return c.Clientset.CoreV1().Nodes().List(ctx, options)
 }
 
+func (c *Client) ListSlimNodes(ctx context.Context, options metav1.ListOptions) (*slimcorev1.NodeList, error) {
+	return c.SlimCoreV1Clientset.Nodes().List(ctx, options)
+}
+
 func (c *Client) PatchNode(ctx context.Context, nodeName string, pt types.PatchType, data []byte) (*corev1.Node, error) {
 	return c.Clientset.CoreV1().Nodes().Patch(ctx, nodeName, pt, data, metav1.PatchOptions{})
-}
-
-func (c *Client) ListCiliumExternalWorkloads(ctx context.Context, opts metav1.ListOptions) (*ciliumv2.CiliumExternalWorkloadList, error) {
-	return c.CiliumClientset.CiliumV2().CiliumExternalWorkloads().List(ctx, opts)
-}
-
-func (c *Client) GetCiliumExternalWorkload(ctx context.Context, name string, opts metav1.GetOptions) (*ciliumv2.CiliumExternalWorkload, error) {
-	return c.CiliumClientset.CiliumV2().CiliumExternalWorkloads().Get(ctx, name, opts)
-}
-
-func (c *Client) CreateCiliumExternalWorkload(ctx context.Context, cew *ciliumv2.CiliumExternalWorkload, opts metav1.CreateOptions) (*ciliumv2.CiliumExternalWorkload, error) {
-	return c.CiliumClientset.CiliumV2().CiliumExternalWorkloads().Create(ctx, cew, opts)
-}
-
-func (c *Client) DeleteCiliumExternalWorkload(ctx context.Context, name string, opts metav1.DeleteOptions) error {
-	return c.CiliumClientset.CiliumV2().CiliumExternalWorkloads().Delete(ctx, name, opts)
 }
 
 func (c *Client) ListCiliumNetworkPolicies(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2.CiliumNetworkPolicyList, error) {
@@ -719,10 +785,6 @@ func (c *Client) GetCiliumLocalRedirectPolicy(ctx context.Context, namespace, na
 
 func (c *Client) DeleteCiliumLocalRedirectPolicy(ctx context.Context, namespace, name string, opts metav1.DeleteOptions) error {
 	return c.CiliumClientset.CiliumV2().CiliumLocalRedirectPolicies(namespace).Delete(ctx, name, opts)
-}
-
-func (c *Client) ListCiliumBGPPeeringPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPPeeringPolicyList, error) {
-	return c.CiliumClientset.CiliumV2alpha1().CiliumBGPPeeringPolicies().List(ctx, opts)
 }
 
 func (c *Client) ListCiliumBGPClusterConfigs(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPClusterConfigList, error) {
@@ -824,6 +886,40 @@ func (c *Client) ProxyGet(ctx context.Context, namespace, name, url string) (str
 	return string(rawbody), nil
 }
 
+func (c *Client) createDialer(url *url.URL) (httpstream.Dialer, error) {
+	var errWebsocket, errSPDY error
+
+	// We cannot control if errors from these constructors are due to lack of server support.
+	// In the case of such errors, ignore them and later chose which dialer to return.
+	dialerWebsocket, errWebsocket := portforward.NewSPDYOverWebsocketDialer(url, c.Config)
+
+	transport, upgrader, errSPDY := spdy.RoundTripperFor(c.Config)
+	dialerSPDY := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, url)
+
+	// NewFallBackDialer returns a httpstream.Dialer which attempts a
+	// connection with a primry dialer and a secondary dialer. However, it
+	// does this by calling a method on both the primary and secondary
+	// dialers. This means that both of them must not be nil if we want to
+	// avoid a crash. Therefore, if either primary or secondary encountered
+	// an error, return the other one.
+	if errSPDY != nil && errWebsocket == nil {
+		return dialerWebsocket, nil
+	}
+	if errWebsocket != nil && errSPDY == nil {
+		return dialerSPDY, nil
+	}
+
+	if errSPDY != nil && errWebsocket != nil {
+		return nil, fmt.Errorf("Error while creating k8s dialer: (websocket) %w, (spdy) %w", errWebsocket, errSPDY)
+	}
+
+	// Default to the SPDY connection
+	dialerFallback := portforward.NewFallbackDialer(dialerSPDY, dialerWebsocket, func(err error) bool {
+		return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
+	})
+	return dialerFallback, nil
+}
+
 func (c *Client) ProxyTCP(ctx context.Context, namespace, name string, port uint16, handler func(io.ReadWriteCloser) error) error {
 	request := c.Clientset.CoreV1().RESTClient().Post().
 		Resource(corev1.ResourcePods.String()).
@@ -831,12 +927,10 @@ func (c *Client) ProxyTCP(ctx context.Context, namespace, name string, port uint
 		Name(name).
 		SubResource("portforward")
 
-	transport, upgrader, err := spdy.RoundTripperFor(c.Config)
+	dialer, err := c.createDialer(request.URL())
 	if err != nil {
-		return fmt.Errorf("creating round tripper: %w", err)
+		return err
 	}
-
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, request.URL())
 
 	const portForwardProtocolV1Name = "portforward.k8s.io"
 	conn, proto, err := dialer.Dial(portForwardProtocolV1Name)
@@ -939,6 +1033,10 @@ func (c *Client) ListNetworkPolicies(ctx context.Context, o metav1.ListOptions) 
 	return c.Clientset.NetworkingV1().NetworkPolicies(corev1.NamespaceAll).List(ctx, o)
 }
 
+func (c *Client) ListSlimNetworkPolicies(ctx context.Context, namespace string, o metav1.ListOptions) (*ciliumnetworkingv1.NetworkPolicyList, error) {
+	return c.SlimNetworkingV1Clientset.NetworkPolicies(namespace).List(ctx, o)
+}
+
 func (c *Client) ListCiliumIdentities(ctx context.Context) (*ciliumv2.CiliumIdentityList, error) {
 	return c.CiliumClientset.CiliumV2().CiliumIdentities().List(ctx, metav1.ListOptions{})
 }
@@ -947,12 +1045,16 @@ func (c *Client) ListCiliumNodes(ctx context.Context) (*ciliumv2.CiliumNodeList,
 	return c.CiliumClientset.CiliumV2().CiliumNodes().List(ctx, metav1.ListOptions{})
 }
 
-func (c *Client) ListCiliumNodeConfigs(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumNodeConfigList, error) {
-	return c.CiliumClientset.CiliumV2alpha1().CiliumNodeConfigs(namespace).List(ctx, opts)
+func (c *Client) ListCiliumNodeConfigs(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2.CiliumNodeConfigList, error) {
+	return c.CiliumClientset.CiliumV2().CiliumNodeConfigs(namespace).List(ctx, opts)
 }
 
 func (c *Client) ListCiliumPodIPPools(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumPodIPPoolList, error) {
 	return c.CiliumClientset.CiliumV2alpha1().CiliumPodIPPools().List(ctx, opts)
+}
+
+func (c *Client) ListCiliumL2AnnouncementPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumL2AnnouncementPolicyList, error) {
+	return c.CiliumClientset.CiliumV2alpha1().CiliumL2AnnouncementPolicies().List(ctx, opts)
 }
 
 func (c *Client) GetLogs(ctx context.Context, namespace, name, container string, opts corev1.PodLogOptions, out io.Writer) error {
@@ -1002,15 +1104,11 @@ func (c *Client) GetCiliumVersion(ctx context.Context, p *corev1.Pod) (*semver.V
 }
 
 func (c *Client) GetRunningCiliumVersion(ciliumHelmReleaseName string) (string, error) {
-	release, err := action.NewGet(c.HelmActionConfig).Run(ciliumHelmReleaseName)
+	m, err := action.NewGetMetadata(c.HelmActionConfig).Run(ciliumHelmReleaseName)
 	if err != nil {
 		return "", err
 	}
-	return release.Chart.Metadata.Version, nil
-}
-
-func (c *Client) ListCiliumLoadBalancerIPPools(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumLoadBalancerIPPoolList, error) {
-	return c.CiliumClientset.CiliumV2alpha1().CiliumLoadBalancerIPPools().List(ctx, opts)
+	return m.Version, nil
 }
 
 func (c *Client) ListCiliumLocalRedirectPolicies(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2.CiliumLocalRedirectPolicyList, error) {
@@ -1057,8 +1155,7 @@ func (c *Client) GetHelmValues(_ context.Context, releaseName string, namespace 
 	}
 	helmDriver := ""
 	actionConfig := action.Configuration{}
-	logger := func(_ string, _ ...interface{}) {}
-	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver, logger); err != nil {
+	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver); err != nil {
 		return "", err
 	}
 	helmGetValsClient := action.NewGetValues(&actionConfig)
@@ -1081,8 +1178,7 @@ func (c *Client) GetHelmMetadata(_ context.Context, releaseName string, namespac
 	}
 	helmDriver := ""
 	actionConfig := action.Configuration{}
-	logger := func(_ string, _ ...interface{}) {}
-	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver, logger); err != nil {
+	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver); err != nil {
 		return "", err
 	}
 
@@ -1190,4 +1286,46 @@ func (c *Client) DeleteGeneric(ctx context.Context, obj Object) error {
 	dynamicClient := c.DynamicClientset.Resource(resource).Namespace(obj.GetNamespace())
 
 	return dynamicClient.Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
+}
+
+func (c *Client) GetServerGroups() (*metav1.APIGroupList, error) {
+	return c.Clientset.Discovery().ServerGroups()
+}
+
+// OpenshiftClusterVersion represents the OpenShift ClusterVersion resource
+type OpenshiftClusterVersion struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Status            ClusterVersionStatus `json:"status,omitempty"`
+}
+
+// ClusterVersionStatus represents the status of the OpenShift ClusterVersion
+type ClusterVersionStatus struct {
+	Desired ClusterVersionUpdate `json:"desired,omitempty"`
+}
+
+// ClusterVersionUpdate represents the desired version information
+type ClusterVersionUpdate struct {
+	Version string `json:"version,omitempty"`
+}
+
+// GetOpenshiftClusterVersion retrieves the OpenShift ClusterVersion resource
+func (c *Client) GetOpenshiftClusterVersion(ctx context.Context) (*OpenshiftClusterVersion, error) {
+	gvr := schema.GroupVersionResource{
+		Group:    "config.openshift.io",
+		Version:  "v1",
+		Resource: "clusterversions",
+	}
+
+	unstructuredObj, err := c.DynamicClientset.Resource(gvr).Get(ctx, "version", metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ClusterVersion: %w", err)
+	}
+
+	var cv OpenshiftClusterVersion
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.UnstructuredContent(), &cv); err != nil {
+		return nil, fmt.Errorf("failed to convert ClusterVersion: %w", err)
+	}
+
+	return &cv, nil
 }

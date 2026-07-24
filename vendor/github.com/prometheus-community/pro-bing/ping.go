@@ -1,3 +1,16 @@
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package probing is a simple but powerful ICMP echo (ping) library.
 //
 // Here is a very simple example that sends and receives three packets:
@@ -116,7 +129,7 @@ func New(addr string) *Pinger {
 		protocol:          "udp",
 		awaitingSequences: firstSequence,
 		TTL:               64,
-		tclass:            192, // CS6 (network control)
+		tclass:            0,
 		logger:            StdLogger{Logger: log.New(log.Writer(), log.Prefix(), log.Flags())},
 	}
 }
@@ -353,8 +366,10 @@ func (p *Pinger) updateStatistics(pkt *Packet) {
 func (p *Pinger) SetIPAddr(ipaddr *net.IPAddr) {
 	p.ipv4 = isIPv4(ipaddr.IP)
 
+	p.statsMu.Lock()
 	p.ipaddr = ipaddr
 	p.addr = ipaddr.String()
+	p.statsMu.Unlock()
 }
 
 // IPAddr returns the ip address of the target host.
@@ -407,7 +422,9 @@ func (p *Pinger) Resolve() error {
 
 	p.ipv4 = isIPv4(ipaddr.IP)
 
+	p.statsMu.Lock()
 	p.ipaddr = ipaddr
+	p.statsMu.Unlock()
 
 	return nil
 }
@@ -416,10 +433,14 @@ func (p *Pinger) Resolve() error {
 // DNS name like "www.google.com" or IP like "127.0.0.1".
 func (p *Pinger) SetAddr(addr string) error {
 	oldAddr := p.addr
+	p.statsMu.Lock()
 	p.addr = addr
+	p.statsMu.Unlock()
 	err := p.Resolve()
 	if err != nil {
+		p.statsMu.Lock()
 		p.addr = oldAddr
+		p.statsMu.Unlock()
 		return err
 	}
 	return nil
@@ -557,6 +578,15 @@ func (p *Pinger) RunWithContext(ctx context.Context) error {
 		}
 		conn.SetIfIndex(iface.Index)
 	}
+
+	if p.Source != "" {
+		ip := net.ParseIP(p.Source)
+		if ip == nil {
+			return fmt.Errorf("invalid source address: %s", p.Source)
+		}
+		conn.SetSource(ip)
+	}
+
 	return p.run(ctx, conn)
 }
 
@@ -852,7 +882,9 @@ func (p *Pinger) processPacket(recv *packet) error {
 		inPkt.Seq = pkt.Seq
 		// If we've already received this sequence, ignore it.
 		if _, inflight := p.awaitingSequences[*pktUUID][pkt.Seq]; !inflight {
+			p.statsMu.Lock()
 			p.PacketsRecvDuplicates++
+			p.statsMu.Unlock()
 			if p.OnDuplicateRecv != nil {
 				p.OnDuplicateRecv(inPkt)
 			}
@@ -945,7 +977,9 @@ func (p *Pinger) sendICMP(conn packetConn) error {
 		}
 		// mark this sequence as in-flight
 		p.awaitingSequences[currentUUID][p.sequence] = struct{}{}
+		p.statsMu.Lock()
 		p.PacketsSent++
+		p.statsMu.Unlock()
 		p.sequence++
 		if p.sequence > 65535 {
 			newUUID := uuid.New()

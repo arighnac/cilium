@@ -8,13 +8,29 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/hive/job"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/envoy"
+	iptables "github.com/cilium/cilium/pkg/datapath/iptables/fake"
+	util "github.com/cilium/cilium/pkg/envoy/util"
 	"github.com/cilium/cilium/pkg/proxy/types"
 	"github.com/cilium/cilium/pkg/time"
 )
+
+func proxyPortsForTest(t *testing.T) *ProxyPorts {
+	fakeIPTablesManager := iptables.NewManager()
+	config := ProxyPortsConfig{
+		ProxyPortrangeMin:          10000,
+		ProxyPortrangeMax:          20000,
+		RestoredProxyPortsAgeLimit: 0,
+	}
+
+	p := NewProxyPorts(hivetest.Logger(t), config, fakeIPTablesManager)
+	p.Trigger = job.NewTrigger(job.WithDebounce(10 * time.Second))
+
+	return p
+}
 
 func (p *ProxyPorts) released(pp *ProxyPort) bool {
 	p.mutex.Lock()
@@ -23,18 +39,30 @@ func (p *ProxyPorts) released(pp *ProxyPort) bool {
 	return pp.nRedirects == 0 && pp.ProxyPort == 0 && !pp.configured && !pp.acknowledged
 }
 
+func (p *ProxyPorts) zeroProxyPort(pp *ProxyPort) bool {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return pp.ProxyPort == 0
+}
+
+func (p *ProxyPorts) releaseProxyPortWithWait(name string, portReuseWait time.Duration) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.releaseProxyPort(name, portReuseWait)
+}
+
 func TestPortAllocator(t *testing.T) {
 	testRunDir := t.TempDir()
-	socketDir := envoy.GetSocketDir(testRunDir)
-	err := os.MkdirAll(socketDir, 0700)
+	socketDir := util.GetSocketDir(testRunDir)
+	err := os.MkdirAll(socketDir, 0o700)
 	require.NoError(t, err)
 	if err == nil {
 		defer func() {
 			os.RemoveAll(socketDir)
 		}()
 	}
-	p, cleaner := proxyPortsForTest()
-	defer cleaner()
+	p := proxyPortsForTest(t)
 
 	port, err := p.AllocateCRDProxyPort("listener1")
 	require.NoError(t, err)
@@ -66,19 +94,18 @@ func TestPortAllocator(t *testing.T) {
 	require.False(t, pp.acknowledged)
 	require.Zero(t, pp.ProxyPort)
 
-	err = p.releaseProxyPort("listener1", 10*time.Millisecond)
+	err = p.releaseProxyPortWithWait("listener1", time.Minute /* extra high wait time - as it should not be used */)
 	require.NoError(t, err)
 
-	// Proxy port is not released immediately
+	require.True(t, p.released(pp), "Proxy port is not released immediately")
 	require.Zero(t, pp.nRedirects)
 	require.Zero(t, pp.ProxyPort)
 	port1a, _, err = p.GetProxyPort("listener1")
 	require.NoError(t, err)
 	require.Zero(t, port1a)
 
-	require.Eventually(t, func() bool {
-		return p.released(pp)
-	}, 100*time.Millisecond, time.Millisecond)
+	// Cancel timed proxy port release - otherwise it will interfere with upcoming test logic
+	pp.releaseCancel()
 
 	// ProxyPort lingers and can still be found, but it's port is zeroed
 	port1b, _, err := p.GetProxyPort("listener1")
@@ -138,7 +165,7 @@ func TestPortAllocator(t *testing.T) {
 	require.Equal(t, port2, pp.ProxyPort)
 
 	// 2nd release decreases the count to zero
-	err = p.releaseProxyPort("listener1", time.Microsecond)
+	err = p.releaseProxyPortWithWait("listener1", time.Microsecond)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -184,7 +211,7 @@ func TestPortAllocator(t *testing.T) {
 	require.Equal(t, port3, pp.rulesPort)
 
 	// Release marks the port as unallocated
-	err = p.releaseProxyPort("listener1", time.Microsecond)
+	err = p.releaseProxyPortWithWait("listener1", time.Microsecond)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -217,16 +244,15 @@ func TestPortAllocator(t *testing.T) {
 
 func TestRestoredPort(t *testing.T) {
 	testRunDir := t.TempDir()
-	socketDir := envoy.GetSocketDir(testRunDir)
-	err := os.MkdirAll(socketDir, 0700)
+	socketDir := util.GetSocketDir(testRunDir)
+	err := os.MkdirAll(socketDir, 0o700)
 	require.NoError(t, err)
 	if err == nil {
 		defer func() {
 			os.RemoveAll(socketDir)
 		}()
 	}
-	p, cleaner := proxyPortsForTest()
-	defer cleaner()
+	p := proxyPortsForTest(t)
 
 	// simulate proxy port restored from file
 	const ppName = string("cilium-http-egress")
@@ -274,13 +300,15 @@ func TestRestoredPort(t *testing.T) {
 
 	// Release
 	require.Nil(t, pp.releaseCancel)
-	err = p.releaseProxyPort(ppName, time.Microsecond)
+	err = p.releaseProxyPortWithWait(ppName, time.Microsecond)
 	require.NoError(t, err)
 	require.Zero(t, pp.nRedirects)
 
 	// wait for port reuse wait to pass
 	// waiting time is set up to 1s (instead of exactly 1ms) to avoid potential flake in CI
-	require.Eventually(t, func() bool { return assert.Zero(t, pp.ProxyPort) }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool {
+		return p.zeroProxyPort(pp)
+	}, time.Second, time.Millisecond)
 	require.False(t, pp.configured)
 	require.False(t, pp.acknowledged)
 
@@ -294,4 +322,54 @@ func TestRestoredPort(t *testing.T) {
 	require.Equal(t, newPort, pp.ProxyPort)
 	require.True(t, pp.configured)
 	require.False(t, pp.acknowledged)
+}
+
+func TestReallocateCRDProxyPort(t *testing.T) {
+	testRunDir := t.TempDir()
+	socketDir := util.GetSocketDir(testRunDir)
+	err := os.MkdirAll(socketDir, 0o700)
+	require.NoError(t, err)
+	if err == nil {
+		defer func() {
+			os.RemoveAll(socketDir)
+		}()
+	}
+	p := proxyPortsForTest(t)
+
+	// First allocation using AllocateCRDProxyPort
+	port1, err := p.AllocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.NotEqual(t, uint16(0), port1)
+
+	// Upon a bind failure, the port would NOT be acknowledged
+	name, pp := p.FindByTypeWithReference(types.ProxyTypeCRD, "listener1", false)
+	require.Equal(t, "listener1", name)
+	require.Equal(t, port1, pp.ProxyPort)
+	require.Zero(t, pp.rulesPort)
+	require.True(t, pp.configured)
+	require.False(t, pp.acknowledged)
+
+	// Reallocation should allocate a new port
+	port2, err := p.ReallocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.NotEqual(t, uint16(0), port2)
+	require.NotEqual(t, port1, port2, "ReallocateCRDProxyPort should allocate a new port")
+
+	// Verify the port was reset and new port allocated
+	name2, pp2 := p.FindByTypeWithReference(types.ProxyTypeCRD, "listener1", false)
+	require.Equal(t, "listener1", name2)
+	require.Equal(t, port2, pp2.ProxyPort)
+	require.Equal(t, uint16(0), pp2.rulesPort, "rulesPort should be reset to 0 after reallocation")
+	require.True(t, pp2.configured)
+	require.False(t, pp2.acknowledged, "acknowledged should be reset to false after reallocation")
+
+	// Verify old port is marked as available for reuse
+	inuse, exists := p.allocatedPorts[port1]
+	require.True(t, exists)
+	require.False(t, inuse, "old port should be marked as available for reuse")
+
+	// Verify new port is marked as in use
+	inuse2, exists2 := p.allocatedPorts[port2]
+	require.True(t, exists2)
+	require.True(t, inuse2, "new port should be marked as in use")
 }

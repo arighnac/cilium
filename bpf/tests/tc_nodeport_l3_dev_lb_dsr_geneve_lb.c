@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
 
 /* Enable code paths under test */
@@ -16,8 +15,6 @@
 #define DSR_ENCAP_GENEVE	3
 #define DSR_ENCAP_MODE		DSR_ENCAP_GENEVE
 #define ENCAP_IFINDEX		42
-
-#define DISABLE_LOOPBACK_LB	1
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_IPV6		{ .addr = { 0x1, 0x0, 0x0, 0x0, 0x0, 0x0 } }
@@ -34,8 +31,7 @@
 #define REMOTE_NODE_IP		v4_node_one
 
 static volatile const __u8 *client_mac = mac_one;
-/* this matches the default node_config.h: */
-static volatile const __u8 lb_mac[ETH_ALEN] = { 0xce, 0x72, 0xa7, 0x03, 0x88, 0x56 };
+static volatile const __u8 *lb_mac = mac_host;
 
 #define ctx_redirect mock_ctx_redirect
 
@@ -49,27 +45,10 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 	return CTX_ACT_REDIRECT;
 }
 
-#define SECCTX_FROM_IPCACHE 1
-
-#include <bpf_host.c>
+#include "lib/bpf_host.h"
 
 #include "lib/ipcache.h"
 #include "lib/lb.h"
-
-#define FROM_NETDEV	0
-#define TO_NETDEV	1
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(max_entries, 2);
-	__array(values, int());
-} entry_call_map __section(".maps") = {
-	.values = {
-		[FROM_NETDEV] = &cil_from_netdev,
-		[TO_NETDEV] = &cil_to_netdev,
-	},
-};
 
 /* Test that a SVC request that is LBed to a DSR remote backend
  * - gets DNATed,
@@ -111,7 +90,7 @@ int ipv4_tc_nodeport_l3_dev_dsr_geneve_fwd_setup(struct __ctx_buff *ctx)
 	__u64 flags = BPF_F_ADJ_ROOM_FIXED_GSO;
 	__u16 revnat_id = 1;
 
-	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP, FRONTEND_PORT, 1, 124,
 			  BACKEND_IP, BACKEND_PORT, IPPROTO_TCP, 0);
 
@@ -123,10 +102,7 @@ int ipv4_tc_nodeport_l3_dev_dsr_geneve_fwd_setup(struct __ctx_buff *ctx)
 
 	skb_adjust_room(ctx, -__ETH_HLEN, BPF_ADJ_ROOM_MAC, flags);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_receive_packet(ctx);
 }
 
 CHECK("tc", "ipv4_tc_nodeport_l3_dev_dsr_geneve_fwd")
@@ -221,7 +197,7 @@ int ipv6_tc_nodeport_l3_dev_dsr_geneve_fwd_setup(struct __ctx_buff *ctx)
 	union v6addr backend_ip = BACKEND_IPV6;
 	__u16 revnat_id = 1;
 
-	lb_v6_add_service(&frontend_ip, FRONTEND_PORT, 1, revnat_id);
+	lb_v6_add_service(&frontend_ip, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v6_add_backend(&frontend_ip, FRONTEND_PORT, 1, 124,
 			  &backend_ip, BACKEND_PORT, IPPROTO_TCP, 0);
 
@@ -233,10 +209,7 @@ int ipv6_tc_nodeport_l3_dev_dsr_geneve_fwd_setup(struct __ctx_buff *ctx)
 
 	skb_adjust_room(ctx, -__ETH_HLEN, BPF_ADJ_ROOM_MAC, flags);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_receive_packet(ctx);
 }
 
 CHECK("tc", "ipv6_tc_nodeport_l3_dev_dsr_geneve_fwd")

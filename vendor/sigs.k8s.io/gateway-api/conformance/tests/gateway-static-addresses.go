@@ -64,10 +64,11 @@ var GatewayStaticAddresses = suite.ConformanceTest{
 	Manifests: []string{
 		"tests/gateway-static-addresses.yaml",
 	},
+	Parallel: true,
 	Test: func(t *testing.T, s *suite.ConformanceTestSuite) {
 		gwNN := types.NamespacedName{
 			Name:      "gateway-static-addresses",
-			Namespace: "gateway-conformance-infra",
+			Namespace: suite.InfrastructureNamespace,
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), s.TimeoutConfig.DefaultTestTimeout)
 		defer cancel()
@@ -133,10 +134,16 @@ var GatewayStaticAddresses = suite.ConformanceTest{
 			Reason: string(v1.GatewayReasonProgrammed),
 		})
 		kubernetes.GatewayStatusMustHaveListeners(t, s.Client, s.TimeoutConfig, gwNN, finalExpectedListenerState)
-		require.Len(t, currentGW.Spec.Addresses, 1, "expected only 1 address left specified on Gateway")
+		require.Eventually(t, func() bool {
+			err = s.Client.Get(ctx, gwNN, currentGW)
+			if err != nil {
+				return false
+			}
+			return len(currentGW.Status.Addresses) == 1
+		}, s.TimeoutConfig.GatewayMustHaveAddress, s.TimeoutConfig.DefaultPollInterval, "expected only 1 status address on Gateway")
 		statusAddresses := extractStatusAddresses(currentGW.Status.Addresses)
-		require.NotContains(t, statusAddresses, unusableAddress.Value, "should contain the unusable address")
-		require.NotContains(t, statusAddresses, invalidAddress.Value, "should contain the invalid address")
+		require.NotContains(t, statusAddresses, unusableAddress.Value, "should not contain the unusable address")
+		require.NotContains(t, statusAddresses, invalidAddress.Value, "should not contain the invalid address")
 		require.Contains(t, statusAddresses, usableAddress.Value, "should contain the usable address")
 		for _, addr := range currentGW.Status.Addresses {
 			if usableAddress.Value != addr.Value {
@@ -160,7 +167,7 @@ func extractStatusAddresses(addresses []v1.GatewayStatusAddress) []string {
 // Private Helper Functions
 // -----------------------------------------------------------------------------
 
-func filterAddr(addrs []v1.GatewayAddress, filter v1.GatewayAddress) (newAddrs []v1.GatewayAddress) {
+func filterAddr(addrs []v1.GatewaySpecAddress, filter v1.GatewaySpecAddress) (newAddrs []v1.GatewaySpecAddress) {
 	for _, addr := range addrs {
 		if addr.Value != filter.Value {
 			newAddrs = append(newAddrs, addr)

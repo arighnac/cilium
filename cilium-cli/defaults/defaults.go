@@ -32,6 +32,7 @@ const (
 	RelayContainerName  = "hubble-relay"
 	RelayDeploymentName = "hubble-relay"
 	RelayConfigMapName  = "hubble-relay-config"
+	RelayPodSelector    = "app.kubernetes.io/name=hubble-relay"
 
 	HubbleUIDeploymentName = "hubble-ui"
 
@@ -53,7 +54,6 @@ const (
 	ClusterMeshAdminSecretName             = "clustermesh-apiserver-admin-cert"
 	ClusterMeshClientSecretName            = "clustermesh-apiserver-client-cert"
 	ClusterMeshRemoteSecretName            = "clustermesh-apiserver-remote-cert"
-	ClusterMeshExternalWorkloadSecretName  = "clustermesh-apiserver-external-workload-cert"
 	ClusterMeshConnectionModeBidirectional = "bidirectional"
 	ClusterMeshConnectionModeMesh          = "mesh"
 	ClusterMeshConnectionModeUnicast       = "unicast"
@@ -64,21 +64,6 @@ const (
 	SPIREAgentConfigMapName    = "spire-agent"
 
 	ConnectivityCheckNamespace = "cilium-test"
-
-	// renovate: datasource=docker
-	ConnectivityCheckAlpineCurlImage = "quay.io/cilium/alpine-curl:v1.10.0@sha256:913e8c9f3d960dde03882defa0edd3a919d529c2eb167caa7f54194528bde364"
-	// renovate: datasource=docker
-	ConnectivityPerformanceImage = "quay.io/cilium/network-perf:a816f935930cb2b40ba43230643da4d5751a5711@sha256:679d3a370c696f63884da4557a4466f3b5569b4719bb4f86e8aac02fbe390eea"
-	// renovate: datasource=docker
-	ConnectivityCheckJSONMockImage = "quay.io/cilium/json-mock:v1.3.8@sha256:5aad04835eda9025fe4561ad31be77fd55309af8158ca8663a72f6abb78c2603"
-	// renovate: datasource=docker
-	ConnectivityDNSTestServerImage = "docker.io/coredns/coredns:1.12.0@sha256:40384aa1f5ea6bfdc77997d243aec73da05f27aed0c5e9d65bfa98933c519d97"
-	// renovate: datasource=docker
-	ConnectivityTestConnDisruptImage = "quay.io/cilium/test-connection-disruption:v0.0.14@sha256:c3fd56e326ae16f6cb63dbb2e26b4e47ec07a123040623e11399a7fe1196baa0"
-	// renovate: datasource=docker
-	ConnectivityTestFRRImage = "quay.io/frrouting/frr:10.2.1@sha256:c8543d3e0a1348cc0f2b19154fd8b0300e237773dbec65d9d6d6570c1d088deb"
-	// renovate: datasource=docker
-	ConnectivityTestSocatImage = "docker.io/alpine/socat:1.8.0.1@sha256:d95d6a210a87164533d444e8d7ebd586231b3387a27ee7c0732ade3d6c3b0f4d"
 
 	ConfigMapName = "cilium-config"
 
@@ -163,6 +148,7 @@ var (
 		"Unknown L3 target address",
 		"Host datapath not ready",
 		"Unknown ICMPv4 code",
+		"Unknown ICMPv6 code",
 		"Forbidden ICMPv6 message",
 		"No egress gateway found",
 	}
@@ -173,9 +159,35 @@ var (
 		"inbound_state_invalid",  // XfrmInStateInvalid
 	}
 
+	LogCodeOwners  = false
 	LogCheckLevels = []string{
 		LogLevelError,
 		LogLevelWarning,
+	}
+
+	ConnectivityCheckImagesTest = map[string]string{
+		// renovate: datasource=docker
+		"ConnectivityCheckAlpineCurlImage": "quay.io/cilium/alpine-curl:v1.10.0@sha256:913e8c9f3d960dde03882defa0edd3a919d529c2eb167caa7f54194528bde364",
+		// renovate: datasource=docker
+		"ConnectivityCheckJSONMockImage": "quay.io/cilium/json-mock:v1.4.1@sha256:6a66df90808a39c02e7a9d58af7bf0e54d8f8b7d4bc528f48c891969a7049195",
+		// renovate: datasource=docker
+		"ConnectivityDNSTestServerImage": "registry.k8s.io/coredns/coredns:v1.14.6@sha256:900f9c109f7a33545d3c811516e8376df9019147b750f5ce3e254468769176ea",
+		// renovate: datasource=docker
+		"ConnectivityTestConnDisruptImage": "quay.io/cilium/test-connection-disruption:v0.0.17@sha256:62374cfd0e87e6541244331ccf477a21c527c3eefa9d841b97af79996939be0c",
+		// renovate: datasource=docker
+		"ConnectivityTestFRRImage": "quay.io/frrouting/frr:10.7.0@sha256:65e5967b922572c0565d968388fb06af69d7e9b3b3eea40ad7e3810687667f68",
+		// renovate: datasource=docker
+		"ConnectivityTestSocatImage": "docker.io/alpine/socat:1.8.1.3@sha256:4e625a62c9ea40ccbce93b9a4fcc6b41740a9f308389c216f34c88ce3abb275b",
+	}
+
+	ConnectivityCheckOptionalImagesTest = map[string]string{
+		// renovate: datasource=docker
+		"ConnectivityTestEchoImage": "gcr.io/k8s-staging-gateway-api/echo-advanced:v20251204-v1.4.1",
+	}
+
+	ConnectivityCheckImagesPerf = map[string]string{
+		// renovate: datasource=docker
+		"ConnectivityPerformanceImage": "quay.io/cilium/network-perf:3.21-1782913202-88c270c@sha256:c115a00b80bbf4ff49857dd545f0c40025f226d79051b2c8fdab3e8b938c7f92",
 	}
 
 	// The following variables are set at compile time via LDFLAGS.

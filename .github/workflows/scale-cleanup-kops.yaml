@@ -23,10 +23,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # renovate: datasource=golang-version depName=go
-  go_version: 1.23.5
   # renovate: datasource=docker depName=google/cloud-sdk
-  gcloud_version: 506.0.0
+  gcloud_version: 576.0.0
 
 jobs:
   cleanup-kops-clusters:
@@ -35,7 +33,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -44,20 +42,20 @@ jobs:
         uses: ./.github/actions/set-env-variables
 
       - name: Install Kops
-        uses: cilium/scale-tests-action/install-kops@99bcf57d537bcf05a2851a4a847d6a560e838824 # main
+        uses: cilium/scale-tests-action/install-kops@d89fc21b123f4047828366d1505a8bb5d414c07d # main
 
       - name: Setup gcloud credentials
-        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f # v2.1.7
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_PERF_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PERF_SA }}
+          project_id: ${{ secrets.GCP_PERF_PROJECT_ID }}
           create_credentials_file: true
           export_environment_variables: true
 
       - name: Setup gcloud CLI
-        uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         with:
-          project_id: ${{ secrets.GCP_PERF_PROJECT_ID }}
           version: ${{ env.gcloud_version }}
 
       - name: Cleanup stale clusters
@@ -67,7 +65,7 @@ jobs:
           if ./kops get clusters --state ${{ secrets.GCP_PERF_KOPS_STATE_STORE }} -o json > /tmp/clusters.json
           then
             echo "Clusters list fetched successfully"
-            date=`date -u +%Y-%m-%d'T'%H:%M'Z' -d "3 hour ago"`
+            date=$(date -u +%Y-%m-%d'T'%H:%M'Z' -d "3 hour ago")
             cat /tmp/clusters.json | jq -r --arg date "$date" '.[] | select(.metadata.creationTimestamp < $date) | .metadata.name' > /tmp/stale-clusters.txt
             # iterate through list of cluster names in /tmp/stale-clusters.txt
             while IFS= read -r cluster; do

@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -25,7 +26,10 @@ import (
 	"golang.org/x/tools/txtar"
 )
 
-var updateFlag = flag.Bool("scripttest.update", false, "Update scripttest files")
+var (
+	updateFlag = flag.Bool("scripttest.update", false, "Update scripttest files")
+	breakFlag  = flag.Bool("scripttest.break", false, "Break on error")
+)
 
 // DefaultCmds returns a set of broadly useful script commands.
 //
@@ -58,12 +62,25 @@ func DefaultConds() map[string]script.Cond {
 	return conds
 }
 
+type logBuffer struct {
+	strings.Builder
+	t testing.TB
+}
+
+func (lb *logBuffer) Flush() error {
+	if lb.Len() > 0 {
+		lb.t.Log(strings.TrimSuffix(lb.String(), "\n"))
+	}
+	lb.Reset()
+	return nil
+}
+
 // Run runs the script from the given filename starting at the given initial state.
 // When the script completes, Run closes the state.
 func Run(t testing.TB, e *script.Engine, s *script.State, filename string, testScript io.Reader) {
 	t.Helper()
 	err := func() (err error) {
-		log := new(strings.Builder)
+		log := &logBuffer{t: t}
 		log.WriteString("\n") // Start output on a new line for consistent indentation.
 
 		// Defer writing to the test log in case the script engine panics during execution,
@@ -76,26 +93,17 @@ func Run(t testing.TB, e *script.Engine, s *script.State, filename string, testS
 				err = closeErr
 			}
 
-			if log.Len() > 0 {
-				t.Log(strings.TrimSuffix(log.String(), "\n"))
+			if *breakFlag && err != nil && !errors.Is(err, script.ParseError) {
+				fmt.Fprintf(log, "Breaking on error: %s\n", err)
+				e.ExecuteLine(s, "break", log)
 			}
+
+			log.Flush()
 		}()
 
 		if testing.Verbose() {
 			// Add the environment to the start of the script log.
-			wait, err := script.Env().Run(s)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if wait != nil {
-				stdout, stderr, err := wait(s)
-				if err != nil {
-					t.Fatalf("env: %v\n%s", err, stderr)
-				}
-				if len(stdout) > 0 {
-					s.Logf("%s\n", stdout)
-				}
-			}
+			err = e.ExecuteLine(s, "env", log)
 		}
 
 		return e.Execute(s, filename, bufio.NewReader(testScript), log)
@@ -154,7 +162,21 @@ func CachedExec() script.Cond {
 		})
 }
 
-func Test(t *testing.T, ctx context.Context, newEngine func(tb testing.TB, args []string) *script.Engine, env []string, pattern string) {
+type testOptions struct {
+	noParallel bool
+}
+
+type testOpt = func(*testOptions)
+
+// NoParallel runs the test sequentially instead of in parallel (e.g. does not call [testing.T.Parallel]).
+func NoParallel(o *testOptions) { o.noParallel = true }
+
+func Test(t *testing.T, ctx context.Context, newEngine func(tb testing.TB, args []string) *script.Engine, env []string, pattern string, opts ...testOpt) {
+	var o testOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	gracePeriod := 100 * time.Millisecond
 	if deadline, ok := t.Deadline(); ok {
 		timeout := time.Until(deadline)
@@ -187,9 +209,17 @@ func Test(t *testing.T, ctx context.Context, newEngine func(tb testing.TB, args 
 		file := file
 		wd, _ := os.Getwd()
 		absFile := filepath.Join(wd, file)
+		dataDir := filepath.Dir(absFile)
+		env = slices.Clone(env)
+		env = append(env, fmt.Sprintf("DATADIR=%s", dataDir))
 		name := strings.TrimSuffix(filepath.Base(file), ".txt")
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+			if !*breakFlag && !o.noParallel {
+				// The break-on-error flag is set. This will open /dev/tty and set it to raw mode
+				// which will mess up logs from other parallel tests. To avoid that, run the tests
+				// sequentially when -scripttest.break is set.
+				t.Parallel()
+			}
 
 			workdir := t.TempDir()
 			s, err := script.NewState(ctx, workdir, env)
@@ -197,6 +227,7 @@ func Test(t *testing.T, ctx context.Context, newEngine func(tb testing.TB, args 
 				t.Fatal(err)
 			}
 			s.DoUpdate = *updateFlag
+			s.BreakOnError = *breakFlag
 
 			// Unpack archive.
 			a, err := txtar.ParseFile(file)

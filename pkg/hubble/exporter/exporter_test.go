@@ -7,10 +7,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/cilium/fake"
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	timestamp "google.golang.org/protobuf/types/known/timestamppb"
 
@@ -18,6 +19,7 @@ import (
 	observerpb "github.com/cilium/cilium/api/v1/observer"
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type bytesWriteCloser struct{ bytes.Buffer }
@@ -27,6 +29,17 @@ func (bwc *bytesWriteCloser) Close() error { return nil }
 type ioWriteCloser struct{ io.Writer }
 
 func (wc *ioWriteCloser) Close() error { return nil }
+
+func TestNewExporterLogOptionsJSON(t *testing.T) {
+	// when slog encounters a marshalling error, it stores it in the field with
+	// the prefix '!ERROR'. Example:
+	//   {..., "options":"!ERROR:json: unsupported type: exporter.NewWriterFunc"}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	_, err := NewExporter(log)
+	assert.NoError(t, err)
+	assert.NotContains(t, buf.String(), "!ERROR")
+}
 
 func TestExporter(t *testing.T) {
 	// override node name for unit test.
@@ -48,20 +61,18 @@ func TestExporter(t *testing.T) {
 		{Timestamp: &timestamp.Timestamp{Seconds: 4}, Event: &observerpb.LostEvent{}},
 	}
 	buf := &bytesWriteCloser{bytes.Buffer{}}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(t)
 
 	opts := DefaultOptions
-	opts.NewWriterFunc = func() (io.WriteCloser, error) {
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
 		return buf, nil
 	}
 
 	exporter, err := newExporter(log, opts)
 	assert.NoError(t, err)
 
-	ctx := context.Background()
 	for _, ev := range events {
-		err := exporter.Export(ctx, ev)
+		err := exporter.Export(t.Context(), ev)
 		assert.NoError(t, err)
 
 	}
@@ -120,11 +131,10 @@ func TestExporterWithFilters(t *testing.T) {
 		},
 	}
 	buf := &bytesWriteCloser{bytes.Buffer{}}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(t)
 
 	opts := DefaultOptions
-	opts.NewWriterFunc = func() (io.WriteCloser, error) {
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
 		return buf, nil
 	}
 
@@ -139,7 +149,7 @@ func TestExporterWithFilters(t *testing.T) {
 	exporter, err := newExporter(log, opts)
 	assert.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	cancelled := false
@@ -161,6 +171,27 @@ func TestExporterWithFilters(t *testing.T) {
 `, buf.String())
 }
 
+func TestEventToExportEvent_DefaultCase(t *testing.T) {
+	buf := &bytesWriteCloser{bytes.Buffer{}}
+	log := hivetest.Logger(t)
+
+	opts := DefaultOptions
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
+		return buf, nil
+	}
+
+	exporter, err := newExporter(log, opts)
+	assert.NoError(t, err)
+
+	nilEvent := &v1.Event{
+		Timestamp: &timestamp.Timestamp{Seconds: 456},
+		Event:     nil,
+	}
+
+	result := exporter.eventToExportEvent(nilEvent)
+	assert.Nil(t, result)
+}
+
 func TestEventToExportEvent(t *testing.T) {
 	// override node name for unit test.
 	nodeName := nodeTypes.GetName()
@@ -171,11 +202,10 @@ func TestEventToExportEvent(t *testing.T) {
 	}()
 
 	buf := &bytesWriteCloser{bytes.Buffer{}}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(t)
 
 	opts := DefaultOptions
-	opts.NewWriterFunc = func() (io.WriteCloser, error) {
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
 		return buf, nil
 	}
 
@@ -254,11 +284,10 @@ func TestExporterWithFieldMask(t *testing.T) {
 		},
 	}
 	buf := &bytesWriteCloser{bytes.Buffer{}}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(t)
 
 	opts := DefaultOptions
-	opts.NewWriterFunc = func() (io.WriteCloser, error) {
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
 		return buf, nil
 	}
 	for _, opt := range []Option{
@@ -271,15 +300,12 @@ func TestExporterWithFieldMask(t *testing.T) {
 	exporter, err := newExporter(log, opts)
 	assert.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	for _, ev := range events {
-		err := exporter.Export(ctx, ev)
+		err := exporter.Export(t.Context(), ev)
 		assert.NoError(t, err)
 	}
 
-	//nolint: testifylint
+	// nolint: testifylint
 	assert.Equal(t, `{"flow":{"source":{"namespace":"nsA","pod_name":"podA"}}}
 {"flow":{}}
 `, buf.String())
@@ -319,11 +345,10 @@ func TestExporterOnExportEvent(t *testing.T) {
 	var abortRequested bool
 
 	buf := &bytesWriteCloser{bytes.Buffer{}}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(t)
 
 	opts := DefaultOptions
-	opts.NewWriterFunc = func() (io.WriteCloser, error) {
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
 		return buf, nil
 	}
 	for _, opt := range []Option{
@@ -356,7 +381,7 @@ func TestExporterOnExportEvent(t *testing.T) {
 	exporter, err := newExporter(log, opts)
 	assert.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, ev := range events {
 		err := exporter.Export(ctx, ev)
 		assert.NoError(t, err)
@@ -367,10 +392,269 @@ func TestExporterOnExportEvent(t *testing.T) {
 	assert.Falsef(t, hookNoOpFuncCalledAfterAbort, "hook no-op func was called after abort requested by previous hook")
 
 	// ensure that aborting OnExportEvent hook processing works (debug_event should not be exported)
-	//nolint: testifylint
+	// nolint: testifylint
 	assert.Equal(t, `{"Timestamp":{"seconds":3},"Event":{}}
 {"flow":{"time":"1970-01-01T00:00:01Z","node_name":"my-node"},"node_name":"my-node","time":"1970-01-01T00:00:01Z"}
 `, buf.String())
+}
+
+func TestExporterWithFieldAggregate(t *testing.T) {
+	opts := DefaultOptions
+
+	// Test WithFieldAggregate with valid fields.
+	err := WithFieldAggregate([]string{"source.identity", "destination.pod_name"})(&opts)
+	assert.NoError(t, err)
+	assert.NotNil(t, opts.FieldAggregate)
+
+	// Test WithFieldAggregate with invalid fields.
+	err = WithFieldAggregate([]string{"invalid-field"})(&opts)
+	assert.Error(t, err)
+}
+
+func TestExporterWithAggregationInterval(t *testing.T) {
+	opts := DefaultOptions
+
+	// Test WithAggregationInterval with valid duration.
+	testInterval := 60 * time.Second
+	err := WithAggregationInterval(testInterval)(&opts)
+	assert.NoError(t, err)
+	assert.Equal(t, testInterval, opts.aggregationInterval)
+
+	// Test with zero duration.
+	err = WithAggregationInterval(0)(&opts)
+	assert.NoError(t, err)
+	assert.Equal(t, time.Duration(0), opts.aggregationInterval)
+}
+
+func TestOptionsGetters(t *testing.T) {
+	opts := DefaultOptions
+
+	// Test FieldAggregate getter.
+	testFields := []string{"source.identity", "destination.pod_name"}
+	err := WithFieldAggregate(testFields)(&opts)
+	assert.NoError(t, err)
+	retrievedFieldAggregate := opts.FieldAggregate
+	assert.NotNil(t, retrievedFieldAggregate)
+
+	// Test AggregationInterval getter.
+	testInterval := 45 * time.Second
+	err = WithAggregationInterval(testInterval)(&opts)
+	assert.NoError(t, err)
+	retrievedInterval := opts.aggregationInterval
+	assert.Equal(t, testInterval, retrievedInterval)
+}
+
+func TestExporterAggregatorConfiguration(t *testing.T) {
+	// Test that aggregator is not initialized when field aggregation is not active.
+	buf := &bytesWriteCloser{bytes.Buffer{}}
+	log := hivetest.Logger(t)
+
+	opts := DefaultOptions
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
+		return buf, nil
+	}
+
+	exporter, err := newExporter(log, opts)
+	assert.NoError(t, err)
+	assert.Nil(t, exporter.aggregator)
+	assert.False(t, exporter.opts.FieldAggregate.Active())
+
+	fieldAggregateIntervalOption := WithAggregationInterval(100 * time.Millisecond)
+	err = fieldAggregateIntervalOption(&opts)
+	assert.NoError(t, err)
+
+	fieldAggregateOption := WithFieldAggregate([]string{"source.namespace", "destination.namespace", "verdict"})
+	err = fieldAggregateOption(&opts)
+	assert.NoError(t, err)
+
+	exporterWithAggregation, err := newExporter(log, opts)
+	assert.NoError(t, err)
+	assert.NotNil(t, exporterWithAggregation.aggregator)
+	assert.True(t, exporterWithAggregation.opts.FieldAggregate.Active())
+
+	// Clean up and test that Stop() works correctly.
+	err = exporterWithAggregation.Stop()
+	assert.NoError(t, err)
+	assert.Nil(t, exporterWithAggregation.aggregator.stop, "stop channel should be nil after Stop()")
+
+	err = exporter.Stop()
+	assert.NoError(t, err)
+	assert.Nil(t, exporter.writer)
+
+	// Multiple Stop() calls should be safe.
+	err = exporter.Stop()
+	assert.NoError(t, err)
+	err = exporterWithAggregation.Stop()
+	assert.NoError(t, err)
+}
+
+func TestExporterAggregationDisabledWhenIntervalZero(t *testing.T) {
+	buf := &bytesWriteCloser{bytes.Buffer{}}
+	log := hivetest.Logger(t)
+
+	opts := DefaultOptions
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
+		return buf, nil
+	}
+
+	// Configure field aggregation fields but interval=0.
+	fieldAggregateOption := WithFieldAggregate([]string{"verdict"})
+	err := fieldAggregateOption(&opts)
+	assert.NoError(t, err)
+	zeroInterval := WithAggregationInterval(0)
+	err = zeroInterval(&opts)
+	assert.NoError(t, err)
+
+	exporter, err := newExporter(log, opts)
+	assert.NoError(t, err)
+	defer exporter.Stop()
+
+	assert.Nil(t, exporter.aggregator, "aggregator should be disabled when interval <= 0")
+
+	// Send two flow events that would otherwise aggregate.
+	for range 2 {
+		err := exporter.Export(t.Context(), &v1.Event{Event: &flowpb.Flow{Verdict: flowpb.Verdict_FORWARDED}})
+		assert.NoError(t, err)
+	}
+
+	// Expect two separate JSON lines (raw export) because aggregation is disabled.
+	output := buf.String()
+	lineCount := 0
+	for ln := range bytes.SplitSeq([]byte(output), []byte("\n")) {
+		if len(ln) > 0 {
+			lineCount++
+		}
+	}
+	assert.Equal(t, 2, lineCount, "expected two raw exported flow lines, got output: %s", output)
+}
+
+func TestExporterAggregationEventRouting(t *testing.T) {
+	t.Run("non-flow events exported without aggregation", func(t *testing.T) {
+		buf := &bytesWriteCloser{bytes.Buffer{}}
+		log := hivetest.Logger(t)
+
+		opts := DefaultOptions
+		opts.newWriterFunc = func() (io.WriteCloser, error) {
+			return buf, nil
+		}
+		// No aggregation configured.
+		exporter, err := newExporter(log, opts)
+		assert.NoError(t, err)
+		defer exporter.Stop()
+
+		nonFlowEvent := &v1.Event{Timestamp: &timestamp.Timestamp{Seconds: 100}, Event: &observerpb.AgentEvent{}}
+		err = exporter.Export(t.Context(), nonFlowEvent)
+		assert.NoError(t, err)
+
+		// Should be exported immediately.
+		assert.Contains(t, buf.String(), "agent_event", "Non-flow events should be exported without aggregation")
+	})
+
+	t.Run("non-flow events exported even with aggregation enabled", func(t *testing.T) {
+		buf := &bytesWriteCloser{bytes.Buffer{}}
+		log := hivetest.Logger(t)
+
+		opts := DefaultOptions
+		opts.newWriterFunc = func() (io.WriteCloser, error) {
+			return buf, nil
+		}
+
+		err := WithAggregationInterval(100 * time.Millisecond)(&opts)
+		assert.NoError(t, err)
+		err = WithFieldAggregate([]string{"verdict"})(&opts)
+		assert.NoError(t, err)
+
+		exporter, err := newExporter(log, opts)
+		assert.NoError(t, err)
+		defer exporter.Stop()
+
+		nonFlowEvent := &v1.Event{Timestamp: &timestamp.Timestamp{Seconds: 100}, Event: &observerpb.AgentEvent{}}
+		err = exporter.Export(t.Context(), nonFlowEvent)
+		assert.NoError(t, err)
+
+		// Non-flow events should be exported immediately even when aggregation is enabled.
+		assert.Contains(t, buf.String(), "agent_event", "Non-flow events should be exported even with aggregation enabled")
+	})
+
+	t.Run("flow events routed to aggregator", func(t *testing.T) {
+		buf := &bytesWriteCloser{bytes.Buffer{}}
+		log := hivetest.Logger(t)
+
+		opts := DefaultOptions
+		opts.newWriterFunc = func() (io.WriteCloser, error) {
+			return buf, nil
+		}
+
+		err := WithAggregationInterval(100 * time.Millisecond)(&opts)
+		assert.NoError(t, err)
+		err = WithFieldAggregate([]string{"verdict"})(&opts)
+		assert.NoError(t, err)
+
+		exporter, err := newExporter(log, opts)
+		assert.NoError(t, err)
+		defer exporter.Stop()
+
+		flowEvent := &v1.Event{Event: &flowpb.Flow{Verdict: flowpb.Verdict_DROPPED}}
+		err = exporter.Export(t.Context(), flowEvent)
+		assert.NoError(t, err)
+
+		// Flow events should go to aggregator.
+		assert.Eventually(t, func() bool {
+			exporter.aggregator.aggregator.mu.RLock()
+			count := len(exporter.aggregator.aggregator.m)
+			exporter.aggregator.aggregator.mu.RUnlock()
+			return count == 1
+		}, time.Second, 10*time.Millisecond)
+	})
+}
+
+func TestProcessedFlowToAggregatedExportEvent(t *testing.T) {
+	buf := &bytesWriteCloser{bytes.Buffer{}}
+	log := hivetest.Logger(t)
+
+	opts := DefaultOptions
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
+		return buf, nil
+	}
+
+	err := WithAggregationInterval(100 * time.Millisecond)(&opts)
+	assert.NoError(t, err)
+
+	err = WithFieldAggregate([]string{"verdict", "source.pod_name"})(&opts)
+	assert.NoError(t, err)
+
+	exporter, err := newExporter(log, opts)
+	assert.NoError(t, err)
+	defer exporter.Stop()
+
+	// Create a pre-processed flow.
+	processedFlow := &flowpb.Flow{
+		Verdict: flowpb.Verdict_FORWARDED,
+		Source: &flowpb.Endpoint{
+			PodName: "test-pod", // Only pod_name should be present as defined in FieldAggregate.
+
+		},
+	}
+
+	ingressCount, egressCount, unknownDirectionCount := 5, 3, 1
+
+	result := processedFlowToAggregatedExportEvent(processedFlow, ingressCount, egressCount, unknownDirectionCount)
+	assert.NotNil(t, result)
+
+	flow := result.GetFlow()
+	assert.NotNil(t, flow)
+
+	aggregate := flow.GetAggregate()
+	assert.NotNil(t, aggregate)
+	assert.Equal(t, uint32(ingressCount), aggregate.IngressFlowCount)
+	assert.Equal(t, uint32(egressCount), aggregate.EgressFlowCount)
+	assert.Equal(t, uint32(unknownDirectionCount), aggregate.UnknownDirectionFlowCount)
+
+	assert.Equal(t, processedFlow.Verdict, flow.Verdict)
+	assert.Equal(t, "test-pod", flow.Source.PodName)
+	assert.Nil(t, flow.Destination) // Should not have any fields not defined in FieldAggregate.
+	assert.Empty(t, flow.GetNodeName())
+	assert.Nil(t, flow.GetTime())
 }
 
 func BenchmarkExporter(b *testing.B) {
@@ -440,11 +724,10 @@ func BenchmarkExporter(b *testing.B) {
 	}
 
 	buf := &ioWriteCloser{io.Discard}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(b)
 
 	opts := DefaultOptions
-	opts.NewWriterFunc = func() (io.WriteCloser, error) {
+	opts.newWriterFunc = func() (io.WriteCloser, error) {
 		return buf, nil
 	}
 	for _, opt := range []Option{
@@ -465,11 +748,9 @@ func BenchmarkExporter(b *testing.B) {
 	exporter, err := newExporter(log, opts)
 	assert.NoError(b, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := b.Context()
 
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		event := &allowEvent
 		if i%10 == 0 { // 10% doesn't match allow filter
 			event = &noAllowEvent

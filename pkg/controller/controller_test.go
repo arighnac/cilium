@@ -5,6 +5,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -19,7 +20,33 @@ func TestUpdateRemoveController(t *testing.T) {
 	mngr := NewManager()
 	mngr.UpdateController("test", ControllerParams{})
 	require.NoError(t, mngr.RemoveController("test"))
-	require.Error(t, mngr.RemoveController("not-exits"))
+}
+
+func TestRemoveControllerNotFound(t *testing.T) {
+	mngr := NewManager()
+
+	err := mngr.RemoveController("not-exists")
+	require.ErrorIs(t, err, errControllerNotFound)
+}
+
+func TestRemoveControllerEmptyMap(t *testing.T) {
+	var mngr Manager
+
+	err := mngr.RemoveController("not-exists")
+	require.ErrorIs(t, err, errControllerMapEmpty)
+}
+
+func TestRemoveControllerAndWaitNotFound(t *testing.T) {
+	mngr := NewManager()
+
+	require.NoError(t, mngr.RemoveControllerAndWait("not-exists"))
+}
+
+func TestRemoveControllerAndWaitEmptyMap(t *testing.T) {
+	var mngr Manager
+
+	err := mngr.RemoveControllerAndWait("not-exists")
+	require.ErrorIs(t, err, errControllerMapEmpty)
 }
 
 func TestCreateController(t *testing.T) {
@@ -220,4 +247,150 @@ func TestWaitForTermination(t *testing.T) {
 	default:
 		t.Fail()
 	}
+}
+
+type testEvent struct {
+	name          string
+	doFunc        ControllerFunc
+	result        int32
+	waitToExecute bool
+	start         chan struct{}
+	complete      chan struct{}
+}
+
+func TestConcurrentControllerUpdate(t *testing.T) {
+	var (
+		result        atomic.Int32
+		waitToExecute = make(chan struct{})
+	)
+
+	events := make([]testEvent, 3)
+	for i := range len(events) {
+		// wait on the first function so we can apply multiple updates
+		// while the inner doFunc is blocked.
+		wait := i == 0
+		name := fmt.Sprintf("func%d", i)
+		complete := make(chan struct{})
+		start := make(chan struct{})
+		events[i] = testEvent{
+			name: name,
+			doFunc: func(ctx context.Context) error {
+				t.Log("Running " + name)
+				close(start)
+				if events[i].waitToExecute {
+					<-waitToExecute
+				}
+				result.Store(int32(i))
+				close(complete)
+				return nil
+			},
+			result:        int32(i),
+			waitToExecute: wait,
+			start:         start,
+			complete:      complete,
+		}
+	}
+
+	t.Log("Executing the first update")
+	mngr := NewManager()
+	mngr.UpdateController("test", ControllerParams{
+		DoFunc: events[0].doFunc,
+	})
+	<-events[0].start
+
+	t.Log("Applying subsequent updates while the controller is executing")
+	for i := 1; i < len(events); i++ {
+		mngr.UpdateController("test", ControllerParams{
+			DoFunc: events[i].doFunc,
+		})
+	}
+
+	t.Log("Completing the first execution")
+	close(waitToExecute)
+	<-events[0].complete
+
+	t.Log("Waiting for a later function to complete")
+	err := errors.New("Intermediate updates should have been elided")
+	select {
+	case <-events[1].complete:
+	case <-events[2].complete:
+		err = nil
+	}
+
+	require.NoError(t, err)
+	require.NoError(t, mngr.RemoveControllerAndWait("test"))
+	require.Equal(t, result.Load(), events[len(events)-1].result)
+}
+
+func TestControllerUpdateDuringJitter(t *testing.T) {
+	var afterCalls atomic.Int32
+	timeAfterCh := make(chan time.Time)
+
+	// Mock timeAfter to never fire, and track how many times the controller
+	// enters the jitter sleep block.
+	oldTimeAfter := timeAfter
+	defer func() { timeAfter = oldTimeAfter }()
+	timeAfter = func(d time.Duration) <-chan time.Time {
+		afterCalls.Add(1)
+		return timeAfterCh
+	}
+
+	mngr := NewManager()
+
+	var runs atomic.Int32
+	doFunc := func(ctx context.Context) error {
+		runs.Add(1)
+		return nil
+	}
+
+	// 1. Start controller with a jitter > 0.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 1 * time.Hour,
+	})
+
+	// Wait until the controller has entered the jitter sleep (afterCalls == 1)
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return afterCalls.Load() == 1
+	}, 5*time.Second))
+	require.Equal(t, int32(0), runs.Load())
+
+	// 2. Update it with Jitter = 0. It should run immediately.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 0,
+	})
+
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return runs.Load() == 1
+	}, 5*time.Second))
+
+	runs.Store(0)
+
+	// 3. Update it with Jitter > 0 again. It should go back to sleep.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 1 * time.Hour,
+	})
+
+	// Wait until it enters the second jitter sleep.
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return afterCalls.Load() == 2
+	}, 5*time.Second))
+	require.Equal(t, int32(0), runs.Load())
+
+	// 4. Update it with Jitter > 0 again. This should restart the jitter sleep.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 1 * time.Hour,
+	})
+
+	// Wait until it enters the third jitter sleep.
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return afterCalls.Load() == 3
+	}, 5*time.Second))
+	require.Equal(t, int32(0), runs.Load())
+
+	// Cleanup
+	require.NoError(t, mngr.RemoveControllerAndWait("test-jitter"))
 }

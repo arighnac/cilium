@@ -6,22 +6,21 @@ package envoy
 import (
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	envoyAPI "github.com/cilium/proxy/go/cilium/api"
 	"github.com/stretchr/testify/require"
 )
 
 func TestHandleIPUpsert(t *testing.T) {
-	cache := newNPHDSCache(nil)
+	cache := newNPHDSCache(hivetest.Logger(t), nil)
 
-	msg, err := cache.Lookup(NetworkPolicyHostsTypeURL, "123")
-	require.NoError(t, err)
+	msg := cache.Lookup(NetworkPolicyHostsTypeURL, "123")
 	require.Nil(t, msg)
 
-	err = cache.handleIPUpsert(nil, "123", "1.2.3.0/32", 123)
+	err := cache.handleIPUpsert(nil, "123", "1.2.3.0/32", 123)
 	require.NoError(t, err)
 
-	msg, err = cache.Lookup(NetworkPolicyHostsTypeURL, "123")
-	require.NoError(t, err)
+	msg = cache.Lookup(NetworkPolicyHostsTypeURL, "123")
 	require.NotNil(t, msg)
 	npHost := msg.(*envoyAPI.NetworkPolicyHosts)
 	require.NotNil(t, npHost)
@@ -33,8 +32,7 @@ func TestHandleIPUpsert(t *testing.T) {
 	err = cache.handleIPUpsert(npHost, "123", "::1/128", 123)
 	require.NoError(t, err)
 
-	msg, err = cache.Lookup(NetworkPolicyHostsTypeURL, "123")
-	require.NoError(t, err)
+	msg = cache.Lookup(NetworkPolicyHostsTypeURL, "123")
 	require.NotNil(t, msg)
 	npHost = msg.(*envoyAPI.NetworkPolicyHosts)
 	require.NotNil(t, npHost)
@@ -47,8 +45,7 @@ func TestHandleIPUpsert(t *testing.T) {
 	err = cache.handleIPUpsert(npHost, "123", "1.2.3.0/32", 123)
 	require.NoError(t, err)
 
-	msg, err = cache.Lookup(NetworkPolicyHostsTypeURL, "123")
-	require.NoError(t, err)
+	msg = cache.Lookup(NetworkPolicyHostsTypeURL, "123")
 	require.NotNil(t, msg)
 	npHost = msg.(*envoyAPI.NetworkPolicyHosts)
 	require.NotNil(t, npHost)

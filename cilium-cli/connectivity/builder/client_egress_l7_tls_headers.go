@@ -20,16 +20,17 @@ func (t clientEgressL7TlsHeaders) build(ct *check.ConnectivityTest, templates ma
 }
 
 func clientEgressL7TlsHeadersTest(ct *check.ConnectivityTest, templates map[string]string, portRanges bool) {
-	testName := "seq-client-egress-l7-tls-headers"
+	testName := "client-egress-l7-tls-headers"
 	yamlFile := templates["clientEgressL7TLSPolicyYAML"]
 	if portRanges {
-		testName = "seq-client-egress-l7-tls-headers-port-range"
+		testName = "client-egress-l7-tls-headers-port-range"
 		yamlFile = templates["clientEgressL7TLSPolicyPortRangeYAML"]
 	}
 	// Test L7 HTTPS interception using an egress policy on the clients.
 	newTest(testName, ct).
 		WithFeatureRequirements(features.RequireEnabled(features.L7Proxy)).
-		WithFeatureRequirements(features.RequireEnabled(features.PolicySecretBackendK8s)).
+		WithFeatureRequirements(features.RequireEnabled(features.PolicySecretsOnlyFromSecretsNamespace)).
+		WithFeatureRequirements(features.RequireEnabled(features.PolicySecretSync)).
 		WithCABundleSecret().
 		WithCertificate("externaltarget-tls", ct.Params().ExternalTarget).
 		WithCiliumPolicy(yamlFile).                                   // L7 allow policy with TLS interception
@@ -45,12 +46,12 @@ func clientEgressL7TlsHeadersTest(ct *check.ConnectivityTest, templates map[stri
 }
 
 func clientEgressL7ExtraTlsHeadersTest(ct *check.ConnectivityTest, templates map[string]string) {
-	testName := "seq-client-egress-l7-extra-tls-headers"
+	testName := "client-egress-l7-extra-tls-headers"
 	yamlFile := templates["clientEgressL7TLSPolicyYAML"]
 	// Test L7 HTTPS interception using an egress policy on the clients.
 	newTest(testName, ct).
 		WithFeatureRequirements(features.RequireEnabled(features.L7Proxy)).
-		WithFeatureRequirements(features.RequireEnabled(features.PolicySecretBackendK8s)).
+		WithFeatureRequirements(features.RequireEnabled(features.PolicySecretsOnlyFromSecretsNamespace)).
 		WithFeatureRequirements(features.RequireEnabled(features.PolicySecretSync)).
 		WithCABundleSecret().
 		WithCertificate("externaltarget-tls", ct.Params().ExternalTarget). // Only one certificate for ExternalTarget

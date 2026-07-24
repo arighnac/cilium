@@ -23,27 +23,65 @@ import (
 	"github.com/cilium/cilium/cilium-cli/utils/features"
 )
 
+const FakeExternalTarget1 string = "fake.external.first.target"
+const FakeExternalTarget2 string = "fake.external.second.target"
+
+func curlFakeDNS(domain string, ip string) []string {
+	return []string{
+		"--resolve",
+		fmt.Sprintf("%s:80:%s", domain, ip),
+		"--resolve",
+		fmt.Sprintf("%s:443:%s", domain, ip),
+	}
+}
+
 // PodToWorld sends multiple HTTP(S) requests to ExternalTarget
 // from each client Pods.
-func PodToWorld(opts ...RetryOption) check.Scenario {
+func PodToWorld(ipv6 bool, fakeDNS bool, opts ...RetryOption) check.Scenario {
 	cond := &retryCondition{}
 	for _, op := range opts {
 		op(cond)
 	}
-	return &podToWorld{rc: cond}
+	return &podToWorld{
+		ScenarioBase: check.NewScenarioBase(),
+		rc:           cond,
+		ipv6:         ipv6,
+		fakeDNS:      fakeDNS,
+	}
 }
 
 // podToWorld implements a Scenario.
 type podToWorld struct {
-	rc *retryCondition
+	check.ScenarioBase
+
+	rc      *retryCondition
+	ipv6    bool
+	fakeDNS bool
 }
 
 func (s *podToWorld) Name() string {
 	return "pod-to-world"
 }
 
+func (s *podToWorld) curlOptionalFakeDNS(domain string, ipFam features.IPFamily, params check.Parameters) []string {
+	if !s.fakeDNS {
+		return []string{}
+	}
+
+	var ipAddr string
+	if ipFam == features.IPFamilyV6 {
+		ipAddr = params.ExternalIPv6
+	} else {
+		ipAddr = params.ExternalIPv4
+	}
+	return curlFakeDNS(FakeExternalTarget1, ipAddr)
+}
+
 func (s *podToWorld) Run(ctx context.Context, t *check.Test) {
 	extTarget := t.Context().Params().ExternalTarget
+	if s.fakeDNS {
+		extTarget = FakeExternalTarget1
+	}
 	http := check.HTTPEndpoint(extTarget+"-http", "http://"+extTarget)
 	https := check.HTTPEndpoint(extTarget+"-https", "https://"+extTarget)
 	httpsindex := check.HTTPEndpoint(extTarget+"-https-index", fmt.Sprintf("https://%s/index.html", extTarget))
@@ -57,25 +95,36 @@ func (s *podToWorld) Run(ctx context.Context, t *check.Test) {
 	ct := t.Context()
 
 	for _, client := range ct.ClientPods() {
-		// With http, over port 80.
-		httpOpts := s.rc.CurlOptions(http, features.IPFamilyAny, client, ct.Params())
-		t.NewAction(s, fmt.Sprintf("http-to-%s-%d", extTarget, i), &client, http, features.IPFamilyAny).Run(func(a *check.Action) {
-			a.ExecInPod(ctx, ct.CurlCommand(http, features.IPFamilyAny, httpOpts...))
-			a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
-		})
+		t.ForEachIPFamily(func(ipFam features.IPFamily) {
+			// IPv6 to world may not be supported in all environments, even though IPv6 is enabled
+			// and working in the cluster internally.
+			if ipFam == features.IPFamilyV6 && !s.ipv6 {
+				return
+			}
 
-		// With https, over port 443.
-		httpsOpts := s.rc.CurlOptions(https, features.IPFamilyAny, client, ct.Params())
-		t.NewAction(s, fmt.Sprintf("https-to-%s-%d", extTarget, i), &client, https, features.IPFamilyAny).Run(func(a *check.Action) {
-			a.ExecInPod(ctx, ct.CurlCommand(https, features.IPFamilyAny, httpsOpts...))
-			a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
-		})
+			// With http, over port 80.
+			httpOpts := s.rc.CurlOptions(http, ipFam, client, ct.Params())
+			httpOpts = append(httpOpts, s.curlOptionalFakeDNS(extTarget, ipFam, t.Context().Params())...)
+			t.NewAction(s, fmt.Sprintf("http-to-%s-%s-%d", extTarget, ipFam, i), &client, http, ipFam).Run(func(a *check.Action) {
+				a.ExecInPod(ctx, a.CurlCommand(http, httpOpts...))
+				a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
+			})
 
-		// With https, over port 443, index.html.
-		httpsindexOpts := s.rc.CurlOptions(httpsindex, features.IPFamilyAny, client, ct.Params())
-		t.NewAction(s, fmt.Sprintf("https-to-%s-index-%d", extTarget, i), &client, httpsindex, features.IPFamilyAny).Run(func(a *check.Action) {
-			a.ExecInPod(ctx, ct.CurlCommand(httpsindex, features.IPFamilyAny, httpsindexOpts...))
-			a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
+			// With https, over port 443.
+			httpsOpts := s.rc.CurlOptions(https, ipFam, client, ct.Params())
+			httpsOpts = append(httpsOpts, s.curlOptionalFakeDNS(extTarget, ipFam, t.Context().Params())...)
+			t.NewAction(s, fmt.Sprintf("https-to-%s-%s-%d", extTarget, ipFam, i), &client, https, ipFam).Run(func(a *check.Action) {
+				a.ExecInPod(ctx, a.CurlCommand(https, httpsOpts...))
+				a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
+			})
+
+			// With https, over port 443, index.html.
+			httpsindexOpts := s.rc.CurlOptions(httpsindex, ipFam, client, ct.Params())
+			httpsindexOpts = append(httpsindexOpts, s.curlOptionalFakeDNS(extTarget, ipFam, t.Context().Params())...)
+			t.NewAction(s, fmt.Sprintf("https-to-%s-index-%s-%d", extTarget, ipFam, i), &client, httpsindex, ipFam).Run(func(a *check.Action) {
+				a.ExecInPod(ctx, a.CurlCommand(httpsindex, httpsindexOpts...))
+				a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
+			})
 		})
 
 		i++
@@ -84,19 +133,44 @@ func (s *podToWorld) Run(ctx context.Context, t *check.Test) {
 
 // PodToWorld2 sends an HTTPS request to ExternalOtherTarget from random client
 // Pods.
-func PodToWorld2() check.Scenario {
-	return &podToWorld2{}
+func PodToWorld2(ipv6 bool, fakeDNS bool) check.Scenario {
+	return &podToWorld2{
+		ScenarioBase: check.NewScenarioBase(),
+		ipv6:         ipv6,
+		fakeDNS:      fakeDNS,
+	}
 }
 
 // podToWorld2 implements a Scenario.
-type podToWorld2 struct{}
+type podToWorld2 struct {
+	check.ScenarioBase
+	ipv6    bool
+	fakeDNS bool
+}
 
 func (s *podToWorld2) Name() string {
 	return "pod-to-world-2"
 }
 
+func (s *podToWorld2) curlOptionalFakeDNS(domain string, ipFam features.IPFamily, params check.Parameters) []string {
+	if !s.fakeDNS {
+		return []string{}
+	}
+
+	var ipAddr string
+	if ipFam == features.IPFamilyV6 {
+		ipAddr = params.ExternalIPv6
+	} else {
+		ipAddr = params.ExternalIPv4
+	}
+	return curlFakeDNS(FakeExternalTarget2, ipAddr)
+}
+
 func (s *podToWorld2) Run(ctx context.Context, t *check.Test) {
 	extTarget := t.Context().Params().ExternalOtherTarget
+	if s.fakeDNS {
+		extTarget = FakeExternalTarget2
+	}
 	https := check.HTTPEndpoint(extTarget+"-https", "https://"+extTarget)
 
 	fp := check.FlowParameters{
@@ -108,11 +182,20 @@ func (s *podToWorld2) Run(ctx context.Context, t *check.Test) {
 	ct := t.Context()
 
 	for _, client := range ct.ClientPods() {
-		// With https, over port 443.
-		t.NewAction(s, fmt.Sprintf("https-%s-%d", extTarget, i), &client, https, features.IPFamilyAny).Run(func(a *check.Action) {
-			a.ExecInPod(ctx, ct.CurlCommand(https, features.IPFamilyAny))
-			a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
-			a.ValidateMetrics(ctx, client, a.GetEgressMetricsRequirements())
+		t.ForEachIPFamily(func(ipFam features.IPFamily) {
+			// IPv6 to world may not be supported in all environments, even though IPv6 is enabled
+			// and working in the cluster internally.
+			if ipFam == features.IPFamilyV6 && !s.ipv6 {
+				return
+			}
+
+			// With https, over port 443.
+			httpsOpts := s.curlOptionalFakeDNS(extTarget, ipFam, t.Context().Params())
+			t.NewAction(s, fmt.Sprintf("https-%s-%s-%d", extTarget, ipFam, i), &client, https, ipFam).Run(func(a *check.Action) {
+				a.ExecInPod(ctx, a.CurlCommand(https, httpsOpts...))
+				a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
+				a.ValidateMetrics(ctx, client, a.GetEgressMetricsRequirements())
+			})
 		})
 
 		i++
@@ -122,7 +205,8 @@ func (s *podToWorld2) Run(ctx context.Context, t *check.Test) {
 // PodToWorldWithTLSIntercept sends an HTTPS request to one.one.one.one (default value of ExternalTarget) from from random client
 func PodToWorldWithTLSIntercept(curlOpts ...string) check.Scenario {
 	s := &podToWorldWithTLSIntercept{
-		curlOpts: []string{"--cacert", "/tmp/test-ca.crt"}, // skip TLS verification as it will be our internal cert
+		curlOpts:     []string{"--cacert", "/tmp/test-ca.crt"}, // skip TLS verification as it will be our internal cert
+		ScenarioBase: check.NewScenarioBase(),
 	}
 
 	s.curlOpts = append(s.curlOpts, curlOpts...)
@@ -132,6 +216,8 @@ func PodToWorldWithTLSIntercept(curlOpts ...string) check.Scenario {
 
 // podToWorldWithTLSIntercept implements a Scenario.
 type podToWorldWithTLSIntercept struct {
+	check.ScenarioBase
+
 	curlOpts []string
 }
 
@@ -163,7 +249,7 @@ func (s *podToWorldWithTLSIntercept) Run(ctx context.Context, t *check.Test) {
 		// With https, over port 443.
 		t.NewAction(s, fmt.Sprintf("https-to-%s-%d", extTarget, i), &client, https, features.IPFamilyAny).Run(func(a *check.Action) {
 			a.WriteDataToPod(ctx, "/tmp/test-ca.crt", caBundle)
-			a.ExecInPod(ctx, ct.CurlCommand(https, features.IPFamilyAny, s.curlOpts...))
+			a.ExecInPod(ctx, a.CurlCommand(https, s.curlOpts...))
 			a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
 		})
 
@@ -175,8 +261,9 @@ func (s *podToWorldWithTLSIntercept) Run(ctx context.Context, t *check.Test) {
 // The goal is to make sure the secret update path is verified.
 func PodToWorldWithExtraTLSIntercept(caName string, curlOpts ...string) check.Scenario {
 	s := &podToWorldWithExtraTLSIntercept{
-		caName:   caName,
-		curlOpts: []string{"--cacert", "/tmp/test-ca.crt"}, // skip TLS verification as it will be our internal cert
+		caName:       caName,
+		curlOpts:     []string{"--cacert", "/tmp/test-ca.crt"}, // skip TLS verification as it will be our internal cert
+		ScenarioBase: check.NewScenarioBase(),
 	}
 
 	s.curlOpts = append(s.curlOpts, curlOpts...)
@@ -185,6 +272,8 @@ func PodToWorldWithExtraTLSIntercept(caName string, curlOpts ...string) check.Sc
 }
 
 type podToWorldWithExtraTLSIntercept struct {
+	check.ScenarioBase
+
 	caName   string
 	curlOpts []string
 }
@@ -219,7 +308,7 @@ func (s *podToWorldWithExtraTLSIntercept) Run(ctx context.Context, t *check.Test
 			https := check.HTTPEndpoint(target+"-https", "https://"+target)
 			t.NewAction(s, fmt.Sprintf("https-to-%s-%d", target, i), &client, https, features.IPFamilyAny).Run(func(a *check.Action) {
 				a.WriteDataToPod(ctx, "/tmp/test-ca.crt", caBundle)
-				a.ExecInPod(ctx, ct.CurlCommand(https, features.IPFamilyAny, s.curlOpts...))
+				a.ExecInPod(ctx, a.CurlCommand(https, s.curlOpts...))
 				a.ValidateFlows(ctx, client, a.GetEgressRequirements(fp))
 			})
 		}

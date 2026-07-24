@@ -20,11 +20,16 @@ func PodToCIDR(opts ...RetryOption) check.Scenario {
 	for _, op := range opts {
 		op(cond)
 	}
-	return &podToCIDR{rc: cond}
+	return &podToCIDR{
+		ScenarioBase: check.NewScenarioBase(),
+		rc:           cond,
+	}
 }
 
 // podToCIDR implements a Scenario.
 type podToCIDR struct {
+	check.ScenarioBase
+
 	rc *retryCondition
 }
 
@@ -35,14 +40,22 @@ func (s *podToCIDR) Name() string {
 func (s *podToCIDR) Run(ctx context.Context, t *check.Test) {
 	ct := t.Context()
 
-	for _, ip := range []string{ct.Params().ExternalIP, ct.Params().ExternalOtherIP} {
+	var externalIPs []string
+	if ct.Features[features.IPv4].Enabled {
+		externalIPs = append(externalIPs, ct.Params().ExternalIPv4, ct.Params().ExternalOtherIPv4)
+	}
+	if ct.Features[features.IPv6].Enabled && ct.Params().ExternalTargetIPv6Capable {
+		externalIPs = append(externalIPs, ct.Params().ExternalIPv6, ct.Params().ExternalOtherIPv6)
+	}
+
+	for _, ip := range externalIPs {
 		ep := check.HTTPEndpoint(ipToName(ip), ipToURL(ip))
 
 		var i int
 		for _, src := range ct.ClientPods() {
-			t.NewAction(s, fmt.Sprintf("%s-%d", ep.Name(), i), &src, ep, features.IPFamilyAny).Run(func(a *check.Action) {
-				opts := s.rc.CurlOptions(ep, features.IPFamilyAny, src, ct.Params())
-				a.ExecInPod(ctx, ct.CurlCommand(ep, features.IPFamilyAny, opts...))
+			t.NewAction(s, fmt.Sprintf("%s-%d", ep.Name(), i), &src, ep, features.GetIPFamily(ip)).Run(func(a *check.Action) {
+				opts := s.rc.CurlOptions(ep, features.GetIPFamily(ip), src, ct.Params())
+				a.ExecInPod(ctx, a.CurlCommand(ep, opts...))
 
 				a.ValidateFlows(ctx, src, a.GetEgressRequirements(check.FlowParameters{
 					RSTAllowed: true,

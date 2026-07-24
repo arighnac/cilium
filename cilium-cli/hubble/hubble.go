@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 
-	"helm.sh/helm/v3/pkg/cli/values"
+	"helm.sh/helm/v4/pkg/cli/values"
 
 	"github.com/cilium/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium/cilium-cli/internal/helm"
@@ -32,7 +32,7 @@ type Parameters struct {
 	HelmReleaseName string
 }
 
-func (p *Parameters) Log(format string, a ...interface{}) {
+func (p *Parameters) Log(format string, a ...any) {
 	fmt.Fprintf(p.Writer, format+"\n", a...)
 }
 

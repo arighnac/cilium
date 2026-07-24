@@ -6,11 +6,11 @@ package api
 import (
 	"context"
 	"errors"
-	"io"
+	"log/slog"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -75,7 +75,6 @@ func (t *testHandler) ProcessFlow(ctx context.Context, p *pb.Flow) error {
 }
 
 func TestRegister(t *testing.T) {
-
 	flow1 := &pb.Flow{
 		EventType: &pb.CiliumEventType{Type: monitorAPI.MessageTypeAccessLog},
 		L7: &pb.Layer7{
@@ -95,25 +94,34 @@ func TestRegister(t *testing.T) {
 		Destination: &pb.Endpoint{Namespace: "bar", PodName: "bar-123", Workloads: []*pb.Workload{{Name: "api"}}},
 		Verdict:     pb.Verdict_FORWARDED,
 	}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+	log := hivetest.Logger(t)
 
-	t.Run("Should not register handler", func(t *testing.T) {
-
-		r := NewRegistry(log)
+	t.Run("Should not register non-enabled handler", func(t *testing.T) {
+		r := NewRegistry()
 
 		handler := &testHandler{}
 
 		r.Register("test", &testPlugin{handler: handler})
 
-		//exhaustruct:ignore
-		handlers, err := r.ConfigureHandlers(nil, &Config{})
-		assert.NoError(t, err)
+		handlers, err := r.ConfigureHandlers(log, nil, &Config{})
+		require.NoError(t, err)
+		assert.Empty(t, *handlers)
+	})
+
+	t.Run("Should not register unknown handler", func(t *testing.T) {
+		r := NewRegistry()
+
+		handler := &testHandler{}
+
+		r.Register("test", &testPlugin{handler: handler})
+
+		config := &Config{Metrics: []*MetricConfig{{Name: "unknown"}}}
+		handlers, err := r.ConfigureHandlers(log, nil, config)
+		require.NoError(t, err)
 		assert.Empty(t, *handlers)
 	})
 
 	t.Run("Should register handler", func(t *testing.T) {
-
 		promRegistry := prometheus.NewRegistry()
 		options := []*ContextOptionConfig{
 			{
@@ -130,7 +138,6 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("Should remove metrics series with ContextPod", func(t *testing.T) {
-
 		promRegistry := prometheus.NewRegistry()
 		options := []*ContextOptionConfig{
 			{
@@ -145,9 +152,9 @@ func TestRegister(t *testing.T) {
 		opts, _ := ParseContextOptions(options)
 		handlers := initHandlers(t, opts, promRegistry, log)
 
-		ExecuteAllProcessFlow(context.TODO(), flow1, *handlers)
-		ExecuteAllProcessFlow(context.TODO(), flow2, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
+		ExecuteAllProcessFlow(t.Context(), flow1, *handlers)
+		ExecuteAllProcessFlow(t.Context(), flow2, *handlers)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 2)
 
@@ -157,7 +164,7 @@ func TestRegister(t *testing.T) {
 				Namespace: "foo",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 1)
 
@@ -167,13 +174,12 @@ func TestRegister(t *testing.T) {
 				Namespace: "bar",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesNotExists(t, promRegistry)
 	})
 
 	t.Run("Should not remove metrics series with ContextWorkloadName", func(t *testing.T) {
-
 		promRegistry := prometheus.NewRegistry()
 		options := []*ContextOptionConfig{
 			{
@@ -188,9 +194,9 @@ func TestRegister(t *testing.T) {
 		opts, _ := ParseContextOptions(options)
 		handlers := initHandlers(t, opts, promRegistry, log)
 
-		ExecuteAllProcessFlow(context.TODO(), flow1, *handlers)
-		ExecuteAllProcessFlow(context.TODO(), flow2, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
+		ExecuteAllProcessFlow(t.Context(), flow1, *handlers)
+		ExecuteAllProcessFlow(t.Context(), flow2, *handlers)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 1)
 
@@ -200,7 +206,7 @@ func TestRegister(t *testing.T) {
 				Namespace: "foo",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 1)
 
@@ -210,13 +216,12 @@ func TestRegister(t *testing.T) {
 				Namespace: "bar",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 1)
 	})
 
 	t.Run("Should remove metrics series with LabelsContext", func(t *testing.T) {
-
 		promRegistry := prometheus.NewRegistry()
 		options := []*ContextOptionConfig{
 			{
@@ -227,9 +232,9 @@ func TestRegister(t *testing.T) {
 		opts, _ := ParseContextOptions(options)
 		handlers := initHandlers(t, opts, promRegistry, log)
 
-		ExecuteAllProcessFlow(context.TODO(), flow1, *handlers)
-		ExecuteAllProcessFlow(context.TODO(), flow2, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
+		ExecuteAllProcessFlow(t.Context(), flow1, *handlers)
+		ExecuteAllProcessFlow(t.Context(), flow2, *handlers)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 2)
 
@@ -239,7 +244,7 @@ func TestRegister(t *testing.T) {
 				Namespace: "foo",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 1)
 
@@ -249,13 +254,12 @@ func TestRegister(t *testing.T) {
 				Namespace: "bar",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesNotExists(t, promRegistry)
 	})
 
 	t.Run("Should not remove metrics series with LabelsContext without namespace", func(t *testing.T) {
-
 		promRegistry := prometheus.NewRegistry()
 		options := []*ContextOptionConfig{
 			{
@@ -266,9 +270,9 @@ func TestRegister(t *testing.T) {
 		opts, _ := ParseContextOptions(options)
 		handlers := initHandlers(t, opts, promRegistry, log)
 
-		ExecuteAllProcessFlow(context.TODO(), flow1, *handlers)
-		ExecuteAllProcessFlow(context.TODO(), flow2, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
+		ExecuteAllProcessFlow(t.Context(), flow1, *handlers)
+		ExecuteAllProcessFlow(t.Context(), flow2, *handlers)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ProcessCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 2)
 
@@ -278,7 +282,7 @@ func TestRegister(t *testing.T) {
 				Namespace: "foo",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 1, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 2)
 
@@ -288,21 +292,21 @@ func TestRegister(t *testing.T) {
 				Namespace: "bar",
 			},
 		}, *handlers)
-		assert.EqualValues(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
+		assert.Equal(t, 2, (*handlers)[0].Handler.(*testHandler).ListMetricCalled)
 
 		verifyMetricSeriesExists(t, promRegistry, 2)
 	})
 
 }
 
-func initHandlers(t *testing.T, opts *ContextOptions, promRegistry *prometheus.Registry, log *logrus.Logger) *[]NamedHandler {
+func initHandlers(t *testing.T, opts *ContextOptions, promRegistry *prometheus.Registry, log *slog.Logger) *[]NamedHandler {
 	counter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "test",
 		Name:      "events",
 	}, opts.GetLabelNames())
 	promRegistry.MustRegister(counter)
 
-	r := NewRegistry(log)
+	r := NewRegistry()
 
 	handler := &testHandler{}
 	handler.ContextOptions = opts
@@ -317,10 +321,10 @@ func initHandlers(t *testing.T, opts *ContextOptions, promRegistry *prometheus.R
 			},
 		},
 	}
-	handlers, err := r.ConfigureHandlers(nil, cfg)
-	assert.NoError(t, err)
-	assert.Len(t, *handlers, 1)
-	assert.EqualValues(t, 1, (*handlers)[0].Handler.(*testHandler).InitCalled)
+	handlers, err := r.ConfigureHandlers(log, nil, cfg)
+	require.NoError(t, err)
+	require.Len(t, *handlers, 1)
+	assert.Equal(t, 1, (*handlers)[0].Handler.(*testHandler).InitCalled)
 	return handlers
 }
 

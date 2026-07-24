@@ -111,7 +111,7 @@ func (m *mutualAuthHandler) authenticate(ar *authRequest) (*authResponse, error)
 	}
 	defer conn.Close()
 
-	var expirationTime *time.Time = &clientCert.Leaf.NotAfter
+	var expirationTime = &clientCert.Leaf.NotAfter
 
 	// set up TLS socket
 
@@ -220,7 +220,7 @@ func (m *mutualAuthHandler) handleConnection(ctx context.Context, conn net.Conn)
 }
 
 func (m *mutualAuthHandler) GetCertificateForIncomingConnection(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	m.log.Debug("Got new TLS connection", "SNI", info.ServerName)
+	m.log.Debug("Got new TLS connection", logfields.SNI, info.ServerName)
 	id, err := m.cert.SNIToNumericIdentity(info.ServerName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get identity for SNI %s: %w", info.ServerName, err)
@@ -278,12 +278,19 @@ func (m *mutualAuthHandler) verifyPeerCertificate(id *identity.NumericIdentity, 
 			Intermediates: x509.NewCertPool(),
 		}
 
-		var leaf *x509.Certificate
-		for _, cert := range chain {
+		if len(chain) == 0 {
+			return nil, fmt.Errorf("no certificate chains found")
+		}
+		leaf := chain[0]
+		if leaf.IsCA {
+			return nil, fmt.Errorf("leaf certificate cannot be a CA")
+		}
+		for i := 1; i < len(chain); i++ {
+			cert := chain[i]
 			if cert.IsCA {
 				opts.Intermediates.AddCert(cert)
 			} else {
-				leaf = cert
+				return nil, fmt.Errorf("found additional non-CA certificate in chain")
 			}
 		}
 		if leaf == nil {
@@ -294,7 +301,7 @@ func (m *mutualAuthHandler) verifyPeerCertificate(id *identity.NumericIdentity, 
 		}
 
 		if id != nil { // this will be empty in the peer connection
-			m.log.Debug("Validating Server SNI", "SNI_ID", id.String())
+			m.log.Debug("Validating Server SNI", logfields.SNIID, id)
 			if valid, err := m.cert.ValidateIdentity(*id, leaf); err != nil {
 				return nil, fmt.Errorf("failed to validate SAN: %w", err)
 			} else if !valid {
@@ -304,7 +311,7 @@ func (m *mutualAuthHandler) verifyPeerCertificate(id *identity.NumericIdentity, 
 
 		expirationTime = &leaf.NotAfter
 
-		m.log.Debug("Validated certificate", "uri-san", leaf.URIs)
+		m.log.Debug("Validated certificate", logfields.URISan, leaf.URIs)
 	}
 
 	return expirationTime, nil

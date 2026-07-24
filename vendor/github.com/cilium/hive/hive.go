@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -105,6 +106,7 @@ type Hive struct {
 	flags           *pflag.FlagSet
 	viper           *viper.Viper
 	lifecycle       cell.Lifecycle
+	metrics         Metrics
 	populated       bool
 	invokes         []func(*slog.Logger, time.Duration) error
 	configOverrides []any
@@ -133,6 +135,7 @@ func NewWithOptions(opts Options, cells ...cell.Cell) *Hive {
 		lifecycle: &cell.DefaultLifecycle{
 			LogThreshold: opts.LogThreshold,
 		},
+		metrics:         NopMetrics{},
 		shutdown:        make(chan error, 1),
 		configOverrides: nil,
 	}
@@ -220,14 +223,45 @@ func AddConfigOverride[Cfg cell.Flagger](h *Hive, override func(*Cfg)) {
 	h.configOverrides = append(h.configOverrides, override)
 }
 
+// RunOptionFunc is a functional option type for configuring hive on Run stage.
+type RunOptionFunc func(*Hive)
+
+// WithStartTimeout overrides hive StartTimeout option.
+func WithStartTimeout(timeout time.Duration) RunOptionFunc {
+	return func(h *Hive) {
+		h.opts.StartTimeout = timeout
+	}
+}
+
+// WithStopTimeout overrides hive StopTimeout option.
+func WithStopTimeout(timeout time.Duration) RunOptionFunc {
+	return func(h *Hive) {
+		h.opts.StopTimeout = timeout
+	}
+}
+
+// WithLogThreshold overrides hive LogThreshold option.
+func WithLogThreshold(threshold time.Duration) RunOptionFunc {
+	return func(h *Hive) {
+		h.opts.LogThreshold = threshold
+	}
+}
+
 // Run populates the cell configurations and runs the hive cells.
 // Interrupt signal or call to Shutdowner.Shutdown() will cause the hive to stop.
-func (h *Hive) Run(log *slog.Logger) error {
+func (h *Hive) Run(log *slog.Logger, opts ...RunOptionFunc) error {
+	for _, opt := range opts {
+		opt(h)
+	}
+
 	startCtx, cancel := context.WithTimeout(context.Background(), h.opts.StartTimeout)
 	defer cancel()
 
 	var errs error
 	if err := h.Start(log, startCtx); err != nil {
+		if errors.Is(err, ErrPopulate{}) {
+			return err
+		}
 		errs = errors.Join(errs, fmt.Errorf("failed to start: %w", err))
 	}
 
@@ -265,6 +299,8 @@ func (h *Hive) Populate(log *slog.Logger) error {
 		return nil
 	}
 	h.populated = true
+
+	start := time.Now()
 
 	// Provide all the parsed settings to the config cells.
 	err := h.container.Provide(
@@ -318,6 +354,20 @@ func (h *Hive) Populate(log *slog.Logger) error {
 			return err
 		}
 	}
+
+	if err := h.container.Invoke(func(in struct {
+		dig.In
+		Metrics Metrics `optional:"true"`
+	},
+	) {
+		if in.Metrics != nil {
+			h.metrics = in.Metrics
+		}
+	}); err != nil {
+		return err
+	}
+
+	h.metrics.PopulateDuration(time.Since(start))
 	return nil
 }
 
@@ -325,12 +375,27 @@ func (h *Hive) AppendInvoke(invoke func(*slog.Logger, time.Duration) error) {
 	h.invokes = append(h.invokes, invoke)
 }
 
+type ErrPopulate struct {
+	err error
+}
+
+// Error implements error.
+func (e ErrPopulate) Error() string {
+	return fmt.Sprintf("failed to populate object graph: %s", dig.RootCause(e.err))
+}
+
+func (e ErrPopulate) Pretty() string {
+	return fmt.Sprintf("Failed to populate object graph:\n%+v", e.err)
+}
+
+var _ error = ErrPopulate{}
+
 // Start starts the hive. The context allows cancelling the start.
 // If context is cancelled and the start hooks do not respect the cancellation
 // then after 5 more seconds the process will be terminated forcefully.
 func (h *Hive) Start(log *slog.Logger, ctx context.Context) error {
 	if err := h.Populate(log); err != nil {
-		return err
+		return ErrPopulate{err}
 	}
 
 	defer close(h.fatalOnTimeout(ctx))
@@ -339,10 +404,12 @@ func (h *Hive) Start(log *slog.Logger, ctx context.Context) error {
 	start := time.Now()
 	err := h.lifecycle.Start(log, ctx)
 	if err == nil {
-		log.Info("Started", "duration", time.Since(start))
+		log.Info("Started hive", "duration", time.Since(start))
 	} else {
-		log.Error("Start failed", "error", err, "duration", time.Since(start))
+		log.Error("Failed to start hive", "error", err, "duration", time.Since(start))
 	}
+
+	h.metrics.StartDuration(time.Since(start))
 	return err
 }
 
@@ -351,8 +418,17 @@ func (h *Hive) Start(log *slog.Logger, ctx context.Context) error {
 // then after 5 more seconds the process will be terminated forcefully.
 func (h *Hive) Stop(log *slog.Logger, ctx context.Context) error {
 	defer close(h.fatalOnTimeout(ctx))
-	log.Info("Stopping")
-	return h.lifecycle.Stop(log, ctx)
+	log.Info("Stopping hive")
+	start := time.Now()
+	err := h.lifecycle.Stop(log, ctx)
+	if err == nil {
+		log.Info("Stopped hive", "duration", time.Since(start))
+	} else {
+		log.Error("Failed to stop hive", "error", err, "duration", time.Since(start))
+	}
+
+	h.metrics.StopDuration(time.Since(start))
+	return err
 }
 
 func (h *Hive) fatalOnTimeout(ctx context.Context) chan struct{} {
@@ -392,28 +468,30 @@ func (h *Hive) Shutdown(opts ...ShutdownOption) {
 	}
 }
 
-func (h *Hive) PrintObjects() {
-	if err := h.Populate(slog.Default()); err != nil {
-		panic(fmt.Sprintf("Failed to populate object graph: %s", err))
+func (h *Hive) PrintObjects(w io.Writer, log *slog.Logger) error {
+	if err := h.Populate(log); err != nil {
+		err := ErrPopulate{err}
+		fmt.Fprintf(w, "ERROR: %s\n", err.Pretty())
+		return err
 	}
 
-	fmt.Printf("Cells:\n\n")
-	ip := cell.NewInfoPrinter()
+	fmt.Fprintf(w, "Cells:\n\n")
+	ip := cell.NewInfoPrinter(w)
 	for _, c := range h.cells {
 		c.Info(h.container).Print(2, ip)
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
-	h.lifecycle.PrintHooks()
+	h.lifecycle.PrintHooks(w)
+	return nil
 }
 
-func (h *Hive) PrintDotGraph() {
+func (h *Hive) PrintDotGraph() error {
 	if err := h.Populate(slog.Default()); err != nil {
-		panic(fmt.Sprintf("Failed to populate object graph: %s", err))
+		err := ErrPopulate{err}
+		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err.Pretty())
+		return err
 	}
-
-	if err := dig.Visualize(h.container, os.Stdout); err != nil {
-		panic(fmt.Sprintf("Failed to dig.Visualize(): %s", err))
-	}
+	return dig.Visualize(h.container, os.Stdout)
 }
 
 // getEnvName returns the environment variable to be used for the given option name.
@@ -429,12 +507,14 @@ func (h *Hive) ScriptCommands(log *slog.Logger) (map[string]script.Cmd, error) {
 	}
 	m := map[string]script.Cmd{}
 	m["hive"] = hiveScriptCmd(h, log)
+	m["hive/start"] = hiveStartCmd(h, log)
+	m["hive/stop"] = hiveStopCmd(h, log)
 
 	// Gather the commands from the hive.
-	h.container.Invoke(func(sc ScriptCmds) {
+	err := h.container.Invoke(func(sc ScriptCmds) {
 		for name, cmd := range sc.Map() {
 			m[name] = cmd
 		}
 	})
-	return m, nil
+	return m, err
 }

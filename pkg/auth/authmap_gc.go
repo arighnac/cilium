@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"log/slog"
 
-	datapathTypes "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/addressing"
 	"github.com/cilium/cilium/pkg/node/manager"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -23,10 +23,10 @@ import (
 )
 
 type authMapGarbageCollector struct {
-	logger        *slog.Logger
-	authmap       authMap
-	nodeIDHandler datapathTypes.NodeIDHandler
-	policyRepo    policyRepository
+	logger          *slog.Logger
+	authmap         authMap
+	nodeIDHandler   node.IDHandler
+	authTypeFetcher authTypeFetcher
 
 	ciliumNodesMutex      lock.Mutex
 	ciliumNodesDiscovered map[uint16]struct{}
@@ -47,16 +47,18 @@ func (r *authMapGarbageCollector) Name() string {
 	return "authmap-gc"
 }
 
-type policyRepository interface {
+// authTypeFetcher returns the AuthTypes required by the policy between two
+// identities. Today this is satisfied by the policy compute cell.
+type authTypeFetcher interface {
 	GetAuthTypes(localID, remoteID identity.NumericIdentity) policyTypes.AuthTypes
 }
 
-func newAuthMapGC(logger *slog.Logger, authmap authMap, nodeIDHandler datapathTypes.NodeIDHandler, policyRepo policyRepository) *authMapGarbageCollector {
+func newAuthMapGC(logger *slog.Logger, authmap authMap, nodeIDHandler node.IDHandler, authTypeFetcher authTypeFetcher) *authMapGarbageCollector {
 	return &authMapGarbageCollector{
-		logger:        logger,
-		authmap:       authmap,
-		nodeIDHandler: nodeIDHandler,
-		policyRepo:    policyRepo,
+		logger:          logger,
+		authmap:         authmap,
+		nodeIDHandler:   nodeIDHandler,
+		authTypeFetcher: authTypeFetcher,
 
 		ciliumNodesDiscovered: map[uint16]struct{}{
 			0: {}, // Local node 0 is always available
@@ -107,9 +109,9 @@ func (r *authMapGarbageCollector) NodeAdd(newNode nodeTypes.Node) error {
 	if r.ciliumNodesDiscovered != nil {
 		remoteNodeIDs := r.remoteNodeIDs(newNode)
 		r.logger.Debug("Node discovered - mark to keep",
-			"name", newNode.Identity().Name,
-			"cluster", newNode.Identity().Cluster,
-			"node_ids", remoteNodeIDs,
+			logfields.Name, newNode.Identity().Name,
+			logfields.ClusterName, newNode.Identity().Cluster,
+			logfields.NodeIDs, remoteNodeIDs,
 		)
 		for _, rID := range remoteNodeIDs {
 			r.ciliumNodesDiscovered[rID] = struct{}{}
@@ -129,9 +131,9 @@ func (r *authMapGarbageCollector) NodeDelete(deletedNode nodeTypes.Node) error {
 
 	remoteNodeIDs := r.remoteNodeIDs(deletedNode)
 	r.logger.Debug("Node deleted - mark for deletion",
-		"name", deletedNode.Identity().Name,
-		"cluster", deletedNode.Identity().Cluster,
-		"node_ids", remoteNodeIDs,
+		logfields.Name, deletedNode.Identity().Name,
+		logfields.ClusterName, deletedNode.Identity().Cluster,
+		logfields.NodeIDs, remoteNodeIDs,
 	)
 	for _, rID := range remoteNodeIDs {
 		r.ciliumNodesDeleted[rID] = struct{}{}
@@ -144,10 +146,6 @@ func (r *authMapGarbageCollector) AllNodeValidateImplementation() {
 }
 
 func (r *authMapGarbageCollector) NodeValidateImplementation(node nodeTypes.Node) error {
-	return nil
-}
-
-func (r *authMapGarbageCollector) NodeConfigurationChanged(config datapathTypes.LocalNodeConfiguration) error {
 	return nil
 }
 
@@ -192,7 +190,7 @@ func (r *authMapGarbageCollector) cleanupMissingNodes() error {
 
 	err := r.authmap.DeleteIf(func(key authKey, info authInfo) bool {
 		if _, ok := r.ciliumNodesDiscovered[key.remoteNodeID]; !ok {
-			r.logger.Debug("Deleting entry due to removed remote node", "remote_node_id", key.remoteNodeID)
+			r.logger.Debug("Deleting entry due to removed remote node", logfields.RemoteNodeID, key.remoteNodeID)
 			return true
 		}
 		return false
@@ -210,7 +208,7 @@ func (r *authMapGarbageCollector) cleanupMissingNodes() error {
 func (r *authMapGarbageCollector) cleanupDeletedNode(nodeID uint16) error {
 	return r.authmap.DeleteIf(func(key authKey, info authInfo) bool {
 		if key.remoteNodeID == nodeID {
-			r.logger.Debug("Deleting entry due to removed node", "node_id", nodeID)
+			r.logger.Debug("Deleting entry due to removed node", logfields.NodeID, nodeID)
 			return true
 		}
 		return false
@@ -295,11 +293,11 @@ func (r *authMapGarbageCollector) cleanupMissingIdentities() error {
 
 	err := r.authmap.DeleteIf(func(key authKey, info authInfo) bool {
 		if _, ok := r.ciliumIdentitiesDiscovered[key.localIdentity]; !ok {
-			r.logger.Debug("Deleting entry due to removed local identity", "local_identity", key.localIdentity)
+			r.logger.Debug("Deleting entry due to removed local identity", logfields.LocalIdentity, key.localIdentity)
 			return true
 		}
 		if _, ok := r.ciliumIdentitiesDiscovered[key.remoteIdentity]; !ok {
-			r.logger.Debug("Deleting entry due to removed remote identity", "remote_identity", key.remoteIdentity)
+			r.logger.Debug("Deleting entry due to removed remote identity", logfields.RemoteIdentity, key.remoteIdentity)
 			return true
 		}
 		return false
@@ -342,12 +340,13 @@ func (r *authMapGarbageCollector) cleanupEntriesWithoutAuthPolicy(_ context.Cont
 	r.logger.Debug("Cleaning up entries which no longer require authentication by a policy")
 
 	err := r.authmap.DeleteIf(func(key authKey, info authInfo) bool {
-		authTypes := r.policyRepo.GetAuthTypes(key.localIdentity, key.remoteIdentity)
+		authTypes := r.authTypeFetcher.GetAuthTypes(key.localIdentity, key.remoteIdentity)
 
 		if _, ok := authTypes[key.authType]; !ok {
 			r.logger.Debug("Deleting entry because no policy requires authentication",
-				"key", key,
-				"auth_type", key.authType)
+				logfields.Key, key,
+				logfields.AuthType, key.authType,
+			)
 			return true
 		}
 		return false
@@ -363,10 +362,13 @@ func (r *authMapGarbageCollector) cleanupEntriesWithoutAuthPolicy(_ context.Cont
 
 func (r *authMapGarbageCollector) cleanupExpiredEntries(_ context.Context) error {
 	now := time.Now()
-	r.logger.Debug("Cleaning up expired entries", "gc_time", now)
+	r.logger.Debug("Cleaning up expired entries", logfields.GCTime, now)
 	err := r.authmap.DeleteIf(func(key authKey, info authInfo) bool {
 		if info.expiration.Before(now) {
-			r.logger.Debug("Deleting entry due to expiration", "gc_time", now, "expiration", info.expiration)
+			r.logger.Debug("Deleting entry due to expiration",
+				logfields.GCTime, now,
+				logfields.Expiration, info.expiration,
+			)
 			return true
 		}
 		return false

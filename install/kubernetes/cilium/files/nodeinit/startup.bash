@@ -116,6 +116,8 @@ else
   exec /home/kubernetes/bin/the-kubelet "${@}" --network-plugin=cni --cni-bin-dir={{ .Values.cni.binPath }}
 fi
 EOF
+    echo "Restarting the kubelet..."
+    systemctl restart kubelet
   else
     echo "Kubelet wrapper already exists, skipping..."
   fi
@@ -135,10 +137,10 @@ else
     echo "Changing kubelet configuration to --network-plugin=cni --cni-bin-dir={{ .Values.cni.binPath }}"
     mkdir -p {{ .Values.cni.binPath }}
     sed -i "s:--network-plugin=kubenet:--network-plugin=cni\ --cni-bin-dir={{ .Values.cni.binPath }}:g" "${KUBELET_DEFAULTS_FILE}"
+    echo "Restarting the kubelet..."
+    systemctl restart kubelet
   fi
 fi
-echo "Restarting the kubelet..."
-systemctl restart kubelet
 {{- end }}
 
 {{- if (and .Values.gke.enabled (or .Values.enableIPv4Masquerade .Values.gke.disableDefaultSnat))}}
@@ -152,6 +154,14 @@ systemctl restart kubelet
 # for the networking configuration on that node. So provide the same functionality
 # as the --disable-snat-flag for existing GKE clusters.
 iptables -w -t nat -D POSTROUTING -m comment --comment "ip-masq: ensure nat POSTROUTING directs all non-LOCAL destination traffic to our custom IP-MASQ chain" -m addrtype ! --dst-type LOCAL -j IP-MASQ || true
+{{- end }}
+
+{{- if .Values.nodeinit.waitForCloudInit }}
+echo "Waiting for cloud-init..."
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init status --wait
+  echo "cloud-init completed!"
+fi
 {{- end }}
 
 {{- if not (eq .Values.nodeinit.bootstrapFile "") }}

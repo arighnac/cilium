@@ -1,7 +1,8 @@
 metadata:
   creationTimestamp: null
+  annotations:
+    cec.cilium.io/use-original-source-address: "false"
   labels:
-    cilium.io/use-original-source-address: "false"
     gateway.networking.k8s.io/gateway-name: my-gateway
   name: cilium-gateway-my-gateway
   namespace: default
@@ -19,6 +20,15 @@ spec:
     - "8080"
   resources:
   - '@type': type.googleapis.com/envoy.config.listener.v3.Listener
+    additionalAddresses:
+    - address:
+        socketAddress:
+          address: '::'
+          portValue: 80
+    address:
+      socketAddress:
+        address: 0.0.0.0
+        portValue: 80
     filterChains:
     - filterChainMatch:
         transportProtocol: raw_buffer
@@ -55,6 +65,7 @@ spec:
           rds:
             routeConfigName: listener-insecure
           statPrefix: listener-insecure
+          streamIdleTimeout: 300s
           upgradeConfigs:
           - upgradeType: websocket
           useRemoteAddress: true
@@ -95,7 +106,6 @@ spec:
           maxStreamDuration:
             maxStreamDuration: 0s
   - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
-    connectTimeout: 5s
     edsClusterConfig:
       serviceName: default/my-service:8080
     name: default:my-service:8080

@@ -4,29 +4,48 @@
 package gc
 
 import (
+	"cmp"
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"os"
+	"slices"
+	"sync"
 	stdtime "time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
 	"github.com/cilium/stream"
-	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/endpointstate"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
+	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/time"
 )
 
-// initialGCInterval sets the time after which the agent will begin to warn
-// regarding a long ctmap gc duration.
-const initialGCInterval = 30 * time.Second
+const (
+
+	// initialGCInterval sets the time after which the agent will begin to warn
+	// regarding a long ctmap gc duration.
+	initialGCInterval = 30 * time.Second
+
+	// mapPressureSignalThreshold is the map pressure threshold above which the adaptive
+	// GC interval is re-evaluated.
+	mapPressureSignalThreshold = 0.75
+)
 
 // EndpointManager is any type which returns the list of Endpoints which are
 // globally exposed on the current node.
@@ -34,25 +53,48 @@ type EndpointManager interface {
 	GetEndpoints() []*endpoint.Endpoint
 }
 
-type PerClusterCTMapsRetriever func() []*ctmap.Map
+type AdditionalCTMapsFunc func() []ctmap.MapPair
+
+type AdditionalCTMapsOut struct {
+	cell.Out
+
+	AdditionalCTMaps AdditionalCTMapsFunc `group:"ct-additional-maps"`
+}
 
 type parameters struct {
 	cell.In
 
-	Lifecycle       cell.Lifecycle
-	Logger          logrus.FieldLogger
-	DB              *statedb.DB
-	NodeAddrs       statedb.Table[tables.NodeAddress]
-	DaemonConfig    *option.DaemonConfig
-	EndpointManager EndpointManager
-	NodeAddressing  types.NodeAddressing
-	SignalManager   SignalHandler
+	Lifecycle               cell.Lifecycle
+	JobGroup                job.Group
+	Logger                  *slog.Logger
+	Config                  config
+	DB                      *statedb.DB
+	NodeAddrs               statedb.Table[tables.NodeAddress]
+	DaemonConfig            *option.DaemonConfig
+	EndpointRestorerPromise promise.Promise[endpointstate.Restorer]
+	EndpointManager         EndpointManager
+	NodeAddressing          node.Addressing
+	SignalManager           SignalHandler
+	CTMaps                  ctmap.CTMaps
 
-	PerClusterCTMapsRetriever PerClusterCTMapsRetriever `optional:"true"`
+	// AdditionalCTMaps contains optional additional CT maps that should be garbage collected.
+	// Provide a AdditionalCTMapsOut struct to inject them.
+	AdditionalCTMaps []AdditionalCTMapsFunc `group:"ct-additional-maps"`
+}
+
+type config struct {
+	ConntrackGCInterval    time.Duration
+	ConntrackGCMaxInterval time.Duration
+}
+
+func (r config) Flags(flags *pflag.FlagSet) {
+	flags.Duration("conntrack-gc-interval", r.ConntrackGCInterval, "Overwrite the connection-tracking garbage collection interval")
+	flags.Duration("conntrack-gc-max-interval", r.ConntrackGCMaxInterval, "Set the maximum interval for the connection-tracking garbage collection")
 }
 
 type GC struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
+	config config
 
 	ipv4 bool
 	ipv6 bool
@@ -63,8 +105,10 @@ type GC struct {
 	endpointsManager EndpointManager
 	signalHandler    SignalHandler
 
-	perClusterCTMapsRetriever PerClusterCTMapsRetriever
-	controllerManager         *controller.Manager
+	additionalCTMapsFns []AdditionalCTMapsFunc
+	controllerManager   *controller.Manager
+
+	ctMaps ctmap.CTMaps
 
 	observable4 stream.Observable[ctmap.GCEvent]
 	next4       func(ctmap.GCEvent)
@@ -73,11 +117,19 @@ type GC struct {
 	observable6 stream.Observable[ctmap.GCEvent]
 	next6       func(ctmap.GCEvent)
 	complete6   func(error)
+
+	// stopGC is closed by the OnStop hook to signal the GC goroutine started
+	// by Enable() to stop. gcWG tracks that goroutine so that OnStop can wait
+	// for any in-flight GC pass to drain before the ct-map cell closes the
+	// global CT maps out from under it.
+	stopGC chan struct{}
+	gcWG   sync.WaitGroup
 }
 
-func New(params parameters) *GC {
+func newGC(params parameters) *GC {
 	gc := &GC{
 		logger: params.Logger,
+		config: params.Config,
 
 		ipv4: params.DaemonConfig.EnableIPv4,
 		ipv6: params.DaemonConfig.EnableIPv6,
@@ -87,8 +139,18 @@ func New(params parameters) *GC {
 
 		endpointsManager: params.EndpointManager,
 		signalHandler:    params.SignalManager,
+		ctMaps:           params.CTMaps,
 
 		controllerManager: controller.NewManager(),
+
+		additionalCTMapsFns: slices.DeleteFunc(
+			params.AdditionalCTMaps,
+			func(mapsFunc AdditionalCTMapsFunc) bool {
+				return mapsFunc == nil
+			},
+		),
+
+		stopGC: make(chan struct{}),
 	}
 
 	gc.observable4, gc.next4, gc.complete4 = stream.Multicast[ctmap.GCEvent]()
@@ -96,28 +158,97 @@ func New(params parameters) *GC {
 
 	params.Lifecycle.Append(cell.Hook{
 		// OnStart not yet defined pending further modularization of CT map GC.
-		OnStop: func(cell.HookContext) error {
+		OnStop: func(ctx cell.HookContext) error {
+			// Signal the GC goroutine (if started by Enable) to stop and wait
+			// for any in-flight GC pass to finish. This GC module depends on
+			// ctmap.CTMaps, so hive runs this OnStop before the ct-map cell
+			// closes the global CT maps; draining here guarantees no BatchLookup
+			// races that close and dereferences a nil map. See the goroutine in
+			// enableWithConfig.
+			close(gc.stopGC)
+			drained := make(chan struct{})
+			go func() {
+				gc.gcWG.Wait()
+				close(drained)
+			}()
+			select {
+			case <-drained:
+			case <-ctx.Done():
+				gc.logger.Warn("Timed out waiting for connection tracking garbage collector to stop")
+			}
+
 			gc.controllerManager.RemoveAllAndWait()
 			gc.complete4(nil)
 			gc.complete6(nil)
 			return nil
 		},
 	})
+
+	enableGCFunc := func(ctx context.Context, _ cell.Health) error {
+		params.Logger.Info("Starting connection tracking garbage collector")
+
+		restorer, err := params.EndpointRestorerPromise.Await(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to wait for endpoint restorer: %w", err)
+		}
+
+		if err := restorer.WaitForEndpointRestore(ctx); err != nil {
+			return fmt.Errorf("failed to wait for endpoint restoration: %w", err)
+		}
+
+		gc.Enable(ctx)
+
+		return nil
+	}
+
+	params.JobGroup.Add(
+		job.Observer("nat-map-next4", func(ctx context.Context, event ctmap.GCEvent) error { ctmap.NatMapNext4(event); return nil }, gc.Observe4()),
+		job.Observer("nat-map-next6", func(ctx context.Context, event ctmap.GCEvent) error { ctmap.NatMapNext6(event); return nil }, gc.Observe6()),
+		job.OneShot("enable-gc", enableGCFunc))
+
 	return gc
 }
 
-// Enable enables the connection tracking garbage collection.
-func (gc *GC) Enable() {
+// A full GC pass is when we perform GC on any and all
+// enabled IP families.
+// Partial passes can happen as a result of datapath
+// signals on particular families (i.e. ct or nat).
+func (gc *GC) isFullGC(ipv4, ipv6 bool) bool {
+	return ipv4 == gc.ipv4 && ipv6 == gc.ipv6
+}
+
+// Enable enables the periodic execution of the connection tracking garbage collection.
+func (gc *GC) Enable(ctx context.Context) {
+	gc.enableWithConfig(ctx, gc.runGC, true,
+		gc.config.ConntrackGCInterval, gc.config.ConntrackGCMaxInterval,
+		gcIntervalRounding, minGCInterval)
+}
+
+func (gc *GC) enableWithConfig(
+	ctx context.Context,
+	runGC func(ipv4, ipv6, triggeredBySignal bool, filter ctmap.GCFilter) (maxDeleteRatio float64, success bool),
+	runMapPressureDaemon bool,
+	conntrackGCInterval, conntrackGCMaxInterval, gcIntervalRounding, minGCInterval time.Duration,
+) {
 	var (
 		initialScan         = true
 		initialScanComplete = make(chan struct{})
+
+		mapPressureSignalCh chan struct{} = nil
 	)
 
-	go func() {
+	// Enable map pressure signal based interval recalculation when adaptive GC interval is enabled.
+	if val := conntrackGCInterval; val == time.Duration(0) {
+		mapPressureSignalCh = make(chan struct{})
+	}
+
+	gc.gcWG.Go(func() {
 		ipv4 := gc.ipv4
 		ipv6 := gc.ipv6
 		triggeredBySignal := false
 		var gcPrev time.Time
+		var forceFullGCTTL time.Time
+		var cachedGCInterval time.Duration
 		for {
 			var (
 				maxDeleteRatio float64
@@ -143,19 +274,26 @@ func (gc *GC) Enable() {
 				// alive during idle periods of upto ToFQDNsIdleConnectionGracePeriod.
 				aliveTime = gcStart.Add(option.Config.ToFQDNsIdleConnectionGracePeriod)
 
-				emitEntryCB = func(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, nextHdr, flags uint8, entry *ctmap.CtEntry) {
+				emitEntryCB = func(srcIP, dstIP ctmap.NetAddr, srcPort, dstPort uint16, nextHdr, flags uint8, entry *ctmap.CtEntry) {
 					// FQDN related connections can only be outbound
 					if flags != ctmap.TUPLE_F_OUT {
 						return
 					}
-					if ep, exists := epsMap[srcIP]; exists {
-						ep.MarkDNSCTEntry(dstIP, aliveTime)
+
+					// Only consider IP addresses in default network
+					if srcIP.NetID != 0 || dstIP.NetID != 0 {
+						return
+					}
+
+					if ep, exists := epsMap[srcIP.Addr]; exists {
+						ep.MarkDNSCTEntry(dstIP.Addr, aliveTime)
 					}
 				}
 
 				gcFilter = ctmap.GCFilter{
 					RemoveExpired: true,
-					EmitCTEntryCB: emitEntryCB}
+					EmitCTEntryCB: emitEntryCB,
+				}
 
 				success = false
 			)
@@ -173,68 +311,65 @@ func (gc *GC) Enable() {
 			}
 
 			if len(eps) > 0 || initialScan {
-				gc.logger.Info("Starting initial GC of connection tracking")
-				maxDeleteRatio, success = gc.runGC(nil, ipv4, ipv6, triggeredBySignal, gcFilter)
-			}
-			for _, e := range eps {
-				if !e.ConntrackLocal() {
-					// Skip because GC was handled above.
-					continue
-				}
-				_, epSuccess := gc.runGC(e, ipv4, ipv6, triggeredBySignal, gcFilter)
-				success = success && epSuccess
+				gc.logger.Info("Starting GC of connection tracking", logfields.First, initialScan)
+				maxDeleteRatio, success = runGC(ipv4, ipv6, triggeredBySignal, gcFilter)
 			}
 
-			// Mark the CT GC as over in each EP DNSZombies instance, if we did a *full* GC run
-			interval := ctmap.GetInterval(gcInterval, maxDeleteRatio)
-			if success && ipv4 == gc.ipv4 && ipv6 == gc.ipv6 {
+			interval := getIntervalWithConfig(gc.logger, gcInterval, cachedGCInterval, maxDeleteRatio,
+				conntrackGCInterval, conntrackGCMaxInterval, gcIntervalRounding, minGCInterval)
+			if success && gc.isFullGC(ipv4, ipv6) {
+				// Mark the CT GC as over in each EP DNSZombies instance, if we did a *full* GC run
+				nextGCTime := time.Now().Add(interval)
 				for _, e := range eps {
-					e.MarkCTGCTime(gcStart, time.Now().Add(interval))
+					e.MarkCTGCTime(gcStart, nextGCTime)
+				}
+
+				forceFullGCTTL = time.Now().Add(interval)
+				// full pass so we reset our cached GC interval.
+				cachedGCInterval = interval
+			} else if !initialScan {
+				// If we did not succeed, or it wasn't a full pass then we take the
+				// minimum of the new interval and any remaining time on the last interval
+				// clock - effectively running out the clock of the previous interval.
+				// This is because in a partial GC pass one of the IP families has not been
+				// tended to, so to avoid potentially starving GC on one of the IP families
+				// we do this to ensure it is eventually run.
+				forceInterval := max(0, time.Until(forceFullGCTTL))
+				if forceInterval < interval {
+					interval = forceInterval
+				} else {
+					// partial pass, but the new interval is less than any leftover ttl so
+					// we cache this as well.
+					cachedGCInterval = interval
 				}
 			}
 
 			if initialScan {
 				close(initialScanComplete)
 				initialScan = false
-				gc.logger.WithField("duration", time.Since(gcStart)).
-					Info("initial gc of ct and nat maps completed")
+				gc.logger.Info("initial gc of ct and nat maps completed",
+					logfields.Duration, time.Since(gcStart),
+				)
+			} else {
+				gc.logger.Debug("CT GC Run completed",
+					logfields.Success, success,
+					logfields.Duration, time.Since(gcStart),
+					logfields.NextRunIn, interval)
 			}
 
-			triggeredBySignal = false
-			gc.signalHandler.UnmuteSignals()
+			ipv4, ipv6, triggeredBySignal = gc.waitForGCTrigger(ctx, mapPressureSignalCh, interval)
 			select {
-			case x, ok := <-gc.signalHandler.Signals():
-				if !ok {
-					gc.logger.Info("Signal handler closed. Stopping conntrack garbage collector")
-					return
-				}
-				// mute before draining so that no more wakeups are queued just
-				// after we have drained
-				gc.signalHandler.MuteSignals()
-				triggeredBySignal = true
-				ipv4 = false
-				ipv6 = false
-				if x == SignalProtoV4 {
-					ipv4 = true
-				} else if x == SignalProtoV6 {
-					ipv6 = true
-				}
-				// Drain current queue since we just woke up anyway.
-				for len(gc.signalHandler.Signals()) > 0 {
-					x := <-gc.signalHandler.Signals()
-					if x == SignalProtoV4 {
-						ipv4 = true
-					} else if x == SignalProtoV6 {
-						ipv6 = true
-					}
-				}
-			case <-time.After(interval):
-				gc.signalHandler.MuteSignals()
-				ipv4 = gc.ipv4
-				ipv6 = gc.ipv6
+			case <-gc.stopGC:
+				gc.logger.Info("Stopping conntrack garbage collector")
+				return
+			default:
+			}
+			if ctx.Err() != nil {
+				gc.logger.Info("GC job context failed", logfields.Error, ctx.Err())
+				return
 			}
 		}
-	}()
+	})
 
 	// Start a background go routine that waits to see if either the initial scan completes before
 	// our expected time of 30 seconds.
@@ -249,17 +384,32 @@ func (gc *GC) Enable() {
 		}
 	}()
 
-	// Wait until after initial scan is complete prior to starting ctmap metrics controller.
-	go func() {
-		<-initialScanComplete
-		gc.logger.Info("Initial scan of connection tracking completed, starting ctmap pressure metrics controller")
-		// Not supporting BPF map pressure for local CT maps as of yet.
-		ctmap.CalculateCTMapPressure(gc.controllerManager, ctmap.GlobalMaps(gc.ipv4, gc.ipv6)...)
-	}()
+	if runMapPressureDaemon {
+		// Wait until after initial scan is complete prior to starting ctmap metrics controller.
+		go func() {
+			<-initialScanComplete
+			gc.logger.Info("Initial scan of connection tracking completed, starting ctmap pressure metrics controller")
+			// Not supporting BPF map pressure for per-cluster CT maps as of yet.
+			gc.calculateCTMapPressure(mapPressureSignalCh)
+		}()
+	}
 }
 
-func (gc *GC) Run(m *ctmap.Map, filter ctmap.GCFilter) (int, error) {
-	return ctmap.GC(m, filter, gc.next4, gc.next6)
+func (gc *GC) Run(filter ctmap.GCFilter) (int, error) {
+	totalDeleted := 0
+	for _, m := range gc.ctMaps.ActiveMaps() {
+		deleted, err := m.GC(filter, gc.next4, gc.next6)
+		if err != nil {
+			gc.logger.Error("failed to run GC on map",
+				logfields.BPFMapName, m.Name(),
+				logfields.Error, err,
+			)
+		}
+
+		totalDeleted += deleted
+	}
+
+	return totalDeleted, nil
 }
 
 func (gc *GC) Observe4() stream.Observable[ctmap.GCEvent] {
@@ -270,50 +420,63 @@ func (gc *GC) Observe6() stream.Observable[ctmap.GCEvent] {
 	return gc.observable6
 }
 
-// runGC run CT's garbage collector for the given endpoint. `isLocal` refers if
-// the CT map is set to local. If `isIPv6` is set specifies that is the IPv6
-// map. `filter` represents the filter type to be used while looping all CT
-// entries.
+type gcMap struct {
+	m                 *ctmap.Map
+	openCloseRequired bool
+}
+
+// runGC run CT's garbage collector for the global map.
 //
-// The provided endpoint is optional; if it is provided, then its map will be
-// garbage collected and any failures will be logged to the endpoint log.
-// Otherwise it will garbage-collect the global map and use the global log.
-func (gc *GC) runGC(e *endpoint.Endpoint, ipv4, ipv6, triggeredBySignal bool, filter ctmap.GCFilter) (maxDeleteRatio float64, success bool) {
-	var maps []*ctmap.Map
+// If `isIPv6` is set specifies that is the IPv6 map. `filter` represents the
+// filter type to be used while looping all CT entries.
+func (gc *GC) runGC(ipv4, ipv6, triggeredBySignal bool, filter ctmap.GCFilter) (maxDeleteRatio float64, success bool) {
 	success = true
 
-	if e == nil {
-		maps = ctmap.GlobalMaps(ipv4, ipv6)
+	// maps defines the maps that need garbage collection.
+	// The value defines whether the maps need to be opened and closed.
+	maps := []*gcMap{}
 
-		// We treat per-cluster CT Maps as global maps. When we don't enable
-		// cluster-aware addressing, perClusterCTMapsRetriever is nil (default).
-		if gc.perClusterCTMapsRetriever != nil {
-			maps = append(maps, gc.perClusterCTMapsRetriever()...)
-		}
-	} else {
-		maps = ctmap.LocalMaps(e, ipv4, ipv6)
+	for _, m := range gc.ctMaps.ActiveMaps() {
+		maps = append(maps, &gcMap{m: m, openCloseRequired: false})
 	}
-	for _, m := range maps {
-		path, err := ctmap.OpenCTMap(m)
-		if err != nil {
-			success = false
-			msg := "Skipping CT garbage collection"
-			scopedLog := gc.logger.WithError(err).WithField(logfields.Path, path)
-			if os.IsNotExist(err) {
-				scopedLog.Debug(msg)
-			} else {
-				scopedLog.Warn(msg)
-			}
-			if e != nil {
-				e.LogStatus(endpoint.BPF, endpoint.Warning, fmt.Sprintf("%s: %s", msg, err))
-			}
-			continue
-		}
-		defer m.Close()
 
-		deleted, err := ctmap.GC(m, filter, gc.next4, gc.next6)
+	// Inject additional maps (e.g. per cluster ID maps)
+	for _, getMapPairs := range gc.additionalCTMapsFns {
+		for _, mapPair := range getMapPairs() {
+			maps = append(maps,
+				&gcMap{m: mapPair.TCP, openCloseRequired: !mapPair.IsOpen},
+				&gcMap{m: mapPair.Any, openCloseRequired: !mapPair.IsOpen})
+		}
+	}
+
+	for _, gcMap := range maps {
+		m := gcMap.m
+		if gcMap.openCloseRequired {
+			path, err := ctmap.OpenCTMap(m)
+			if err != nil {
+				success = false
+				msg := "Skipping CT garbage collection"
+				if os.IsNotExist(err) {
+					gc.logger.Debug(msg,
+						logfields.Path, path,
+						logfields.Error, err,
+					)
+				} else {
+					gc.logger.Warn(msg,
+						logfields.Path, path,
+						logfields.Error, err,
+					)
+				}
+				continue
+			}
+			defer m.Close()
+		}
+
+		deleted, err := m.GC(filter, gc.next4, gc.next6)
 		if err != nil {
-			gc.logger.WithError(err).Error("failed to perform CT garbage collection")
+			gc.logger.Error("failed to perform CT garbage collection",
+				logfields.Error, err,
+			)
 			success = false
 		}
 
@@ -322,38 +485,211 @@ func (gc *GC) runGC(e *endpoint.Endpoint, ipv4, ipv6, triggeredBySignal bool, fi
 			if ratio > maxDeleteRatio {
 				maxDeleteRatio = ratio
 			}
-			gc.logger.WithFields(logrus.Fields{
-				logfields.Path: path,
-				"count":        deleted,
-			}).Debug("Deleted filtered entries from map")
+			gc.logger.Debug("Deleted filtered entries from map",
+				logfields.Path, m.Name(),
+				logfields.Count, deleted,
+			)
 		}
 	}
 
-	if e == nil && triggeredBySignal {
-		vsns := []ctmap.CTMapIPVersion{}
-		if ipv4 {
-			vsns = append(vsns, ctmap.CTMapIPv4)
-		}
-		if ipv6 {
-			vsns = append(vsns, ctmap.CTMapIPv6)
-		}
-
-		for _, vsn := range vsns {
+	if triggeredBySignal {
+		// This works under the assumption that [maps] contains consecutive pairs
+		// of CT maps, respectively of TCP and ANY type, which is enforced for
+		// additional maps injected above
+		for i := 0; i+1 < len(maps); i += 2 {
 			startTime := time.Now()
-			ctMapTCP, ctMapAny := ctmap.FilterMapsByProto(maps, vsn)
-			stats := ctmap.PurgeOrphanNATEntries(ctMapTCP, ctMapAny)
+			ctMapTCP, ctMapAny := maps[i], maps[i+1]
+			stats := ctmap.PurgeOrphanNATEntries(ctMapTCP.m, ctMapAny.m)
 			if stats != nil && (stats.EgressDeleted != 0 || stats.IngressDeleted != 0) {
-				gc.logger.WithFields(logrus.Fields{
-					"ingressDeleted": stats.IngressDeleted,
-					"egressDeleted":  stats.EgressDeleted,
-					"ingressAlive":   stats.IngressAlive,
-					"egressAlive":    stats.EgressAlive,
-					"ctMapIPVersion": vsn,
-					"duration":       time.Since(startTime),
-				}).Info("Deleted orphan SNAT entries from map")
+				gc.logger.Info(
+					"Deleted orphan SNAT entries from map",
+					logfields.IngressDeleted, stats.IngressDeleted,
+					logfields.EgressDeleted, stats.EgressDeleted,
+					logfields.IngressAlive, stats.IngressAlive,
+					logfields.EgressAlive, stats.EgressAlive,
+					logfields.Family, stats.Family,
+					logfields.ClusterID, cmp.Or(stats.ClusterID, option.Config.ClusterID),
+					logfields.Duration, time.Since(startTime),
+				)
 			}
 		}
 	}
 
 	return
+}
+
+const (
+	ctmapPressureInterval = 30 * time.Second
+
+	minGCInterval      = defaults.ConntrackGCMinInterval
+	gcIntervalRounding = time.Second
+)
+
+// calculateCTMapPressure is a controller that calculates the BPF CT map
+// pressure and pubishes it as part of the BPF map pressure metric.
+func (gc *GC) calculateCTMapPressure(mapPressureSignalCh chan<- struct{}) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	gc.controllerManager.UpdateController("ct-map-pressure", controller.ControllerParams{
+		Group: controller.Group{
+			Name: "ct-map-pressure",
+		},
+		DoFunc: func(context.Context) error {
+			var (
+				errs         error
+				signalGcWait bool
+			)
+
+			for _, m := range gc.ctMaps.ActiveMaps() {
+				ctx, cancelCtx := context.WithTimeout(ctx, ctmapPressureInterval)
+				defer cancelCtx()
+				count, err := m.Count(ctx)
+				if errors.Is(err, ebpf.ErrNotSupported) {
+					// We don't have batch ops, so cancel context to kill this
+					// controller.
+					cancel(err)
+					return err
+				}
+				if err != nil {
+					errs = errors.Join(errs, fmt.Errorf("failed to dump CT map %v: %w", m.Name(), err))
+				}
+
+				pValue := m.UpdatePressureMetricWithSize(int32(count))
+				if mapPressureSignalCh != nil && pValue > mapPressureSignalThreshold {
+					signalGcWait = true
+				}
+			}
+
+			if signalGcWait {
+				select {
+				case mapPressureSignalCh <- struct{}{}:
+				default:
+				}
+			}
+			return errs
+		},
+		RunInterval: 30 * time.Second,
+		Context:     ctx,
+	})
+}
+
+// waitForGCTrigger blocks until the next GC run.
+func (gc *GC) waitForGCTrigger(ctx context.Context, mapPressureSignalCh <-chan struct{}, interval time.Duration) (ipv4, ipv6, triggeredBySignal bool) {
+	gc.signalHandler.UnmuteSignals()
+	waitStart := time.Now()
+	waitDurationExpected := interval
+	for {
+		select {
+		case x := <-gc.signalHandler.Signals():
+			// mute before draining so that no more wakeups are queued just
+			// after we have drained
+			gc.signalHandler.MuteSignals()
+			triggeredBySignal = true
+			switch x {
+			case SignalProtoV4:
+				ipv4 = true
+			case SignalProtoV6:
+				ipv6 = true
+			}
+
+			// Drain current queue since we just woke up anyway.
+			for len(gc.signalHandler.Signals()) > 0 {
+				x := <-gc.signalHandler.Signals()
+				switch x {
+				case SignalProtoV4:
+					ipv4 = true
+				case SignalProtoV6:
+					ipv6 = true
+				}
+			}
+			return
+		case <-time.After(interval):
+			gc.signalHandler.MuteSignals()
+			ipv4 = gc.ipv4
+			ipv6 = gc.ipv6
+			return
+		case <-mapPressureSignalCh:
+			waitDuration := time.Since(waitStart)
+			interval = max(time.Duration(0), (interval - waitDuration))
+
+			// Reduce interval by half if we receive map pressure threshold signal.
+			// Ignore the signal if the elapsed interval has not yet reached the minimum GC interval.
+			if waitDuration > minGCInterval {
+				interval = (interval / 2).Round(gcIntervalRounding)
+			}
+
+			gc.logger.Info(
+				"CT Map pressure above threshold, re-evaluating adpative GC wait",
+				logfields.ExpectedDuration, waitDurationExpected,
+				logfields.ElapsedDuration, waitDuration,
+				logfields.NextRunIn, interval,
+			)
+		case <-ctx.Done():
+			return
+		case <-gc.stopGC:
+			return
+		}
+	}
+}
+
+// getIntervalWithConfig returns the interval adjusted based on the deletion ratio of the
+// last run.
+//   - actualPrevInterval 	= actual time elapsed since last GC.
+//   - expectedPrevInterval 	= Is the last computed interval, which we expected to
+//     wait *unless* a signal caused early pass. If this is set to zero then we use gc starting interval.
+func getIntervalWithConfig(logger *slog.Logger, actualPrevInterval, expectedPrevInterval time.Duration, maxDeleteRatio float64,
+	conntrackGCInterval, conntrackGCMaxInterval, gcIntervalRounding, minGCInterval time.Duration,
+) time.Duration {
+	if val := conntrackGCInterval; val != time.Duration(0) {
+		return val
+	}
+
+	adjustedDeleteRatio := maxDeleteRatio
+	if expectedPrevInterval == time.Duration(0) {
+		expectedPrevInterval = defaults.ConntrackGCStartingInterval
+	} else if actualPrevInterval < expectedPrevInterval && actualPrevInterval > 0 {
+		adjustedDeleteRatio *= float64(expectedPrevInterval) / float64(actualPrevInterval)
+	}
+
+	newInterval := calculateIntervalWithConfig(expectedPrevInterval, adjustedDeleteRatio, gcIntervalRounding, minGCInterval)
+	if val := conntrackGCMaxInterval; val != time.Duration(0) && newInterval > val {
+		newInterval = val
+	}
+
+	if newInterval != expectedPrevInterval {
+		logger.Info(
+			"Conntrack garbage collector interval recalculated",
+			logfields.ExpectedPrevInterval, expectedPrevInterval,
+			logfields.ActualPrevInterval, actualPrevInterval,
+			logfields.NewInterval, newInterval,
+			logfields.DeleteRatio, maxDeleteRatio,
+			logfields.AdjustedDeleteRatio, adjustedDeleteRatio,
+		)
+	}
+
+	metrics.ConntrackInterval.WithLabelValues("global").Set(newInterval.Seconds())
+
+	return newInterval
+}
+
+func calculateIntervalWithConfig(prevInterval time.Duration, maxDeleteRatio float64, gcIntervalRounding, minGCInterval time.Duration) time.Duration {
+	if maxDeleteRatio == 0.0 {
+		return prevInterval
+	}
+
+	switch {
+	case maxDeleteRatio > 0.25:
+		if maxDeleteRatio > 0.9 {
+			maxDeleteRatio = 0.9
+		}
+		// 25%..90% => 1.3x..10x shorter
+		return max(time.Duration(float64(prevInterval)*(1.0-maxDeleteRatio)).Round(gcIntervalRounding), minGCInterval)
+	case maxDeleteRatio < 0.05:
+		// When less than 5% of entries were deleted, increase the
+		// interval. Use a simple 1.5x multiplier to start growing slowly
+		// as a new node may not be seeing workloads yet and thus the
+		// scan will return a low deletion ratio at first.
+		return min(time.Duration(float64(prevInterval)*1.5).Round(gcIntervalRounding), defaults.ConntrackGCMaxLRUInterval)
+	}
+
+	return prevInterval
 }

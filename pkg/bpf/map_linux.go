@@ -11,21 +11,22 @@ import (
 	"fmt"
 	"io/fs"
 	"iter"
+	"log/slog"
 	"math"
 	"os"
 	"path"
 	"reflect"
 	"strings"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/cilium/ebpf"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/registry"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/spanstat"
@@ -54,6 +55,15 @@ type MapValue interface {
 	New() MapValue
 }
 
+// MapPerCPUValue is the same as MapValue, but for per-CPU maps. Implement to be
+// able to fetch map values from all CPUs.
+type MapPerCPUValue interface {
+	MapValue
+
+	// NewSlice must return a pointer to a slice of structs that implement MapValue.
+	NewSlice() any
+}
+
 type cacheEntry struct {
 	Key   MapKey
 	Value MapValue
@@ -63,7 +73,8 @@ type cacheEntry struct {
 }
 
 type Map struct {
-	m *ebpf.Map
+	Logger *slog.Logger
+	m      *ebpf.Map
 	// spec will be nil after the map has been created
 	spec *ebpf.MapSpec
 
@@ -123,6 +134,63 @@ func (m *Map) Type() ebpf.MapType {
 	return ebpf.UnspecifiedMap
 }
 
+type nopDecoder []struct{}
+
+func (nopDecoder) UnmarshalBinary(data []byte) error {
+	return nil
+}
+
+// BatchCount the number of elements in the map using a batch lookup.
+// Only usable for hash, lru-hash and lpm-trie maps.
+func (m *Map) BatchCount() (count int, err error) {
+	switch m.Type() {
+	case ebpf.Hash, ebpf.LRUHash, ebpf.LPMTrie:
+		break
+	default:
+		return 0, fmt.Errorf("unsupported map type %s, must be one either hash or lru-hash types", m.Type())
+	}
+	chunkSize := startingChunkSize(int(m.MaxEntries()))
+
+	// Since we don't care about the actual data we just use a no-op binary
+	// decoder.
+	keys := make(nopDecoder, chunkSize)
+	vals := make(nopDecoder, chunkSize)
+	maxRetries := defaultBatchedRetries
+
+	var cursor ebpf.MapBatchCursor
+	for {
+		for retry := range maxRetries {
+			// Attempt to read batch into buffer.
+			c, batchErr := m.BatchLookup(&cursor, keys, vals, nil)
+			count += c
+
+			switch {
+			// Lookup batch on LRU hash map may fail if the buffer passed is not big enough to
+			// accommodate the largest bucket size in the LRU map. See full comment in
+			// [BatchIterator.IterateAll]
+			case errors.Is(batchErr, unix.ENOSPC):
+				if retry == maxRetries-1 {
+					err = batchErr
+				} else {
+					chunkSize *= 2
+				}
+				keys = make(nopDecoder, chunkSize)
+				vals = make(nopDecoder, chunkSize)
+				continue
+			case errors.Is(batchErr, ebpf.ErrKeyNotExist):
+				return
+			case batchErr != nil:
+				// If we're not done, and we didn't hit a ENOSPC then stop iteration and record
+				// the error.
+				err = fmt.Errorf("failed to iterate map: %w", batchErr)
+				return
+			}
+			// Do the next batch
+			break
+		}
+	}
+}
+
 func (m *Map) KeySize() uint32 {
 	if m.m != nil {
 		return m.m.KeySize()
@@ -163,6 +231,11 @@ func (m *Map) Flags() uint32 {
 	return 0
 }
 
+func (m *Map) hasPerCPUValue() bool {
+	mt := m.Type()
+	return mt == ebpf.PerCPUHash || mt == ebpf.PerCPUArray || mt == ebpf.LRUCPUHash || mt == ebpf.PerCPUCGroupStorage
+}
+
 func (m *Map) updateMetrics() {
 	if m.group == "" {
 		return
@@ -174,10 +247,16 @@ func (m *Map) updateMetrics() {
 func NewMap(name string, mapType ebpf.MapType, mapKey MapKey, mapValue MapValue,
 	maxEntries int, flags uint32) *Map {
 
+	// slogloggercheck: it's safe to use the default logger here as it has been initialized by the program up to this point.
+	defaultSlogLogger := logging.DefaultSlogLogger
 	keySize := reflect.TypeOf(mapKey).Elem().Size()
 	valueSize := reflect.TypeOf(mapValue).Elem().Size()
 
 	return &Map{
+		Logger: defaultSlogLogger.With(
+			logfields.BPFMapPath, name,
+			logfields.BPFMapName, name,
+		),
 		spec: &ebpf.MapSpec{
 			Type:       mapType,
 			Name:       path.Base(name),
@@ -193,14 +272,43 @@ func NewMap(name string, mapType ebpf.MapType, mapKey MapKey, mapValue MapValue,
 	}
 }
 
-// NewMap creates a new Map instance - object representing a BPF map
+// NewMapFromRegistry pulls an [ebpf.MapSpec] from the given registry and
+// returns a new [Map] based on the resulting spec.
+func NewMapFromRegistry(reg *registry.MapRegistry, name string, mapKey MapKey, mapValue MapValue) (*Map, error) {
+	// slogloggercheck: it's safe to use the default logger here as it has been initialized by the program up to this point.
+	defaultSlogLogger := logging.DefaultSlogLogger
+
+	spec, err := reg.Get(name)
+	if err != nil {
+		return nil, fmt.Errorf("get map from registry: %w", err)
+	}
+
+	return &Map{
+		Logger: defaultSlogLogger.With(
+			logfields.BPFMapName, spec.Name,
+		),
+		spec:  spec,
+		name:  spec.Name,
+		key:   mapKey,
+		value: mapValue,
+		group: spec.Name,
+	}, nil
+}
+
+// NewMapWithInnerSpec creates a new Map instance - object representing a BPF map with an inner map specification
 func NewMapWithInnerSpec(name string, mapType ebpf.MapType, mapKey MapKey, mapValue MapValue,
 	maxEntries int, flags uint32, innerSpec *ebpf.MapSpec) *Map {
 
+	// slogloggercheck: it's safe to use the default logger here as it has been initialized by the program up to this point.
+	defaultSlogLogger := logging.DefaultSlogLogger
 	keySize := reflect.TypeOf(mapKey).Elem().Size()
 	valueSize := reflect.TypeOf(mapValue).Elem().Size()
 
 	return &Map{
+		Logger: defaultSlogLogger.With(
+			logfields.BPFMapPath, name,
+			logfields.BPFMapName, name,
+		),
 		spec: &ebpf.MapSpec{
 			Type:       mapType,
 			Name:       path.Base(name),
@@ -271,9 +379,9 @@ func (m *Map) WithCache() *Map {
 
 // WithEvents enables use of the event buffer, if the buffer is enabled.
 // This stores all map events (i.e. add/update/delete) in a bounded event buffer.
-// If eventTTL is not zero, than events that are older than the TTL
+// If eventTTL is not zero, then events that are older than the TTL
 // will periodically be removed from the buffer.
-// Enabling events will use aprox proportional to 100MB for every million capacity
+// Enabling events will use approx proportional to 100MB for every million capacity
 // in maxSize.
 //
 // TODO: The IPCache map have many periodic update events added by a controller for entries such as the 0.0.0.0/0 range.
@@ -283,10 +391,11 @@ func (m *Map) WithEvents(c option.BPFEventBufferConfig) *Map {
 	if !c.Enabled {
 		return m
 	}
-	m.scopedLogger().WithFields(logrus.Fields{
-		"size": c.MaxSize,
-		"ttl":  c.TTL,
-	}).Debug("enabling events buffer")
+	m.Logger.Debug(
+		"enabling events buffer",
+		logfields.Size, c.MaxSize,
+		logfields.TTL, c.TTL,
+	)
 	m.eventsBufferEnabled = true
 	m.initEventsBuffer(c.MaxSize, c.TTL)
 	return m
@@ -300,25 +409,30 @@ func (m *Map) WithGroupName(group string) *Map {
 // WithPressureMetricThreshold enables the tracking of a metric that measures
 // the pressure of this map. This metric is only reported if over the
 // threshold.
-func (m *Map) WithPressureMetricThreshold(threshold float64) *Map {
+func (m *Map) WithPressureMetricThreshold(registry *metrics.Registry, threshold float64) *Map {
+	if registry == nil {
+		return m
+	}
+
 	// When pressure metric is enabled, we keep track of map keys in cache
 	if m.cache == nil {
 		m.cache = map[string]*cacheEntry{}
 	}
 
-	m.pressureGauge = metrics.NewBPFMapPressureGauge(m.NonPrefixedName(), threshold)
+	m.pressureGauge = registry.NewBPFMapPressureGauge(m.NonPrefixedName(), threshold)
 
 	return m
 }
 
 // WithPressureMetric enables tracking and reporting of this map pressure with
 // threshold 0.
-func (m *Map) WithPressureMetric() *Map {
-	return m.WithPressureMetricThreshold(0.0)
+func (m *Map) WithPressureMetric(registry *metrics.Registry) *Map {
+	return m.WithPressureMetricThreshold(registry, 0.0)
 }
 
-// UpdatePressureMetricWithSize updates map pressure metric using the given map size.
-func (m *Map) UpdatePressureMetricWithSize(size int32) {
+// UpdatePressureMetricWithSize updates map pressure metric using the given map size
+// and returns the calculated pressure value.
+func (m *Map) UpdatePressureMetricWithSize(size int32) (pvalue float64) {
 	if m.pressureGauge == nil {
 		return
 	}
@@ -333,17 +447,18 @@ func (m *Map) UpdatePressureMetricWithSize(size int32) {
 		return
 	}
 
-	pvalue := float64(size) / float64(m.MaxEntries())
+	pvalue = float64(size) / float64(m.MaxEntries())
 	m.pressureGauge.Set(pvalue)
+	return
 }
 
 func (m *Map) updatePressureMetric() {
 	// Skipping pressure metric gauge updates for LRU map as the cache size
-	// does not accurately represent the actual map sie.
+	// does not accurately represent the actual map size.
 	if m.spec != nil && m.spec.Type == ebpf.LRUHash {
 		return
 	}
-	m.UpdatePressureMetricWithSize(int32(len(m.cache)))
+	_ = m.UpdatePressureMetricWithSize(int32(len(m.cache)))
 }
 
 func (m *Map) FD() int {
@@ -403,16 +518,24 @@ func OpenMap(pinPath string, key MapKey, value MapValue) (*Map, error) {
 		return nil, err
 	}
 
+	// slogloggercheck: it's safe to use the default logger here as it has been initialized by the program up to this point.
+	defaultSlogLogger := logging.DefaultSlogLogger
+
+	logger := defaultSlogLogger.With(
+		logfields.BPFMapPath, pinPath,
+		logfields.BPFMapName, path.Base(pinPath),
+	)
 	m := &Map{
-		m:     em,
-		name:  path.Base(pinPath),
-		path:  pinPath,
-		key:   key,
-		value: value,
+		Logger: logger,
+		m:      em,
+		name:   path.Base(pinPath),
+		path:   pinPath,
+		key:    key,
+		value:  value,
 	}
 
 	m.updateMetrics()
-	registerMap(pinPath, m)
+	registerMap(logger, pinPath, m)
 
 	return m, nil
 }
@@ -423,7 +546,7 @@ func (m *Map) setPathIfUnset() error {
 			return fmt.Errorf("either path or name must be set")
 		}
 
-		m.path = MapPath(m.name)
+		m.path = MapPath(m.Logger, m.name)
 	}
 
 	return nil
@@ -446,7 +569,9 @@ func (m *Map) Recreate() error {
 		return fmt.Errorf("removing pinned map %s: %w", m.name, err)
 	}
 
-	m.scopedLogger().Infof("Removed map pin at %s, recreating and re-pinning map %s", m.path, m.name)
+	m.Logger.Info(
+		"Removed map pin, recreating and re-pinning map",
+	)
 
 	return m.openOrCreate(true)
 }
@@ -504,29 +629,29 @@ func (m *Map) openOrCreate(pin bool) error {
 		return err
 	}
 
-	m.spec.Flags |= GetPreAllocateMapFlags(m.spec.Type)
+	m.spec.Flags |= GetMapMemoryFlags(m.spec.Type)
 
 	if m.spec.InnerMap != nil {
-		m.spec.InnerMap.Flags |= GetPreAllocateMapFlags(m.spec.InnerMap.Type)
+		m.spec.InnerMap.Flags |= GetMapMemoryFlags(m.spec.InnerMap.Type)
 	}
 
 	if pin {
 		m.spec.Pinning = ebpf.PinByName
 	}
 
-	em, err := OpenOrCreateMap(m.spec, path.Dir(m.path))
+	em, err := OpenOrCreateMap(m.Logger, m.spec, path.Dir(m.path))
 	if err != nil {
 		return err
 	}
-
-	m.updateMetrics()
-	registerMap(m.path, m)
 
 	// Consume the MapSpec.
 	m.spec = nil
 
 	// Retain the Map.
 	m.m = em
+
+	m.updateMetrics()
+	registerMap(m.Logger, m.path, m)
 
 	return nil
 }
@@ -557,10 +682,10 @@ func (m *Map) open() error {
 		return fmt.Errorf("loading pinned map %s: %w", m.path, err)
 	}
 
-	m.updateMetrics()
-	registerMap(m.path, m)
-
 	m.m = em
+
+	m.updateMetrics()
+	registerMap(m.Logger, m.path, m)
 
 	return nil
 }
@@ -578,12 +703,12 @@ func (m *Map) Close() error {
 		m.m = nil
 	}
 
-	unregisterMap(m.path, m)
+	unregisterMap(m.Logger, m.path, m)
 
 	return nil
 }
 
-func (m *Map) NextKey(key, nextKeyOut interface{}) error {
+func (m *Map) NextKey(key, nextKeyOut any) error {
 	var duration *spanstat.SpanStat
 	if metrics.BPFSyscallDuration.IsEnabled() {
 		duration = spanstat.Start()
@@ -604,8 +729,7 @@ type DumpCallback func(key MapKey, value MapValue)
 // each map entry. With the current implementation, it is safe for callbacks to
 // retain the values received, as they are guaranteed to be new instances.
 //
-// TODO(tb): This package currently doesn't support dumping per-cpu maps, as
-// ReadValueSize is always set to the size of a single value.
+// To dump per-cpu maps, use DumpPerCPUWithCallback.
 func (m *Map) DumpWithCallback(cb DumpCallback) error {
 	if cb == nil {
 		return errors.New("empty callback")
@@ -628,6 +752,50 @@ func (m *Map) DumpWithCallback(cb DumpCallback) error {
 
 		mk = m.key.New()
 		mv = m.value.New()
+	}
+
+	return i.Err()
+}
+
+// DumpPerCPUCallback is called by DumpPerCPUWithCallback with the map key and
+// the slice of all values from all CPUs.
+type DumpPerCPUCallback func(key MapKey, values any)
+
+// DumpPerCPUWithCallback iterates over the Map and calls the given
+// DumpPerCPUCallback for each map entry, passing the slice with all values
+// from all CPUs. With the current implementation, it is safe for callbacks
+// to retain the values received, as they are guaranteed to be new instances.
+func (m *Map) DumpPerCPUWithCallback(cb DumpPerCPUCallback) error {
+	if cb == nil {
+		return errors.New("empty callback")
+	}
+
+	if !m.hasPerCPUValue() {
+		return fmt.Errorf("map %s is not a per-CPU map", m.name)
+	}
+
+	v, ok := m.value.(MapPerCPUValue)
+	if !ok {
+		return fmt.Errorf("map %s value type does not implement MapPerCPUValue", m.name)
+	}
+
+	if err := m.Open(); err != nil {
+		return err
+	}
+
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	// Don't need deep copies here, only fresh pointers.
+	mk := m.key.New()
+	mv := v.NewSlice()
+
+	i := m.m.Iterate()
+	for i.Next(mk, mv) {
+		cb(mk, mv)
+
+		mk = m.key.New()
+		mv = v.NewSlice()
 	}
 
 	return i.Err()
@@ -656,7 +824,8 @@ func (m *Map) DumpWithCallbackIfExists(cb DumpCallback) error {
 // the maximum map size. If this limit is reached, ErrMaxLookup is returned.
 //
 // The caller must provide a callback for handling each entry, and a stats
-// object initialized via a call to NewDumpStats().
+// object initialized via a call to NewDumpStats(). The callback function must
+// not invoke any map operations that acquire the Map.lock.
 func (m *Map) DumpReliablyWithCallback(cb DumpCallback, stats *DumpStats) error {
 	if cb == nil {
 		return errors.New("empty callback")
@@ -675,11 +844,22 @@ func (m *Map) DumpReliablyWithCallback(cb DumpCallback, stats *DumpStats) error 
 		prevKeyValid = false
 	)
 
-	stats.start()
-	defer stats.finish()
+	stats.Start()
+	defer stats.Finish()
 
 	if err := m.Open(); err != nil {
 		return err
+	}
+
+	// Acquire a (write) lock here as callers can invoke map operations in the
+	// DumpCallback that need a (write) lock.
+	// See PR for more details. - https://github.com/cilium/cilium/pull/38590.
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.m == nil {
+		// We currently don't prevent open maps from being closed.
+		// See GH issue - https://github.com/cilium/cilium/issues/39287.
+		return errors.New("map is closed")
 	}
 
 	// Get the first map key.
@@ -755,10 +935,17 @@ func (m *Map) DumpReliablyWithCallback(cb DumpCallback, stats *DumpStats) error 
 	return ErrMaxLookup
 }
 
+// IterableMap is a map that can be iterated through [BatchIterator].
+type IterableMap interface {
+	BatchLookup(cursor *ebpf.MapBatchCursor, keysOut, valuesOut any, opts *ebpf.BatchOptions) (int, error)
+	MaxEntries() uint32
+	Type() ebpf.MapType
+}
+
 // BatchIterator provides a typed wrapper *Map that allows for batched iteration
 // of bpf maps.
 type BatchIterator[KT, VT any, KP KeyPointer[KT], VP ValuePointer[VT]] struct {
-	m    *Map
+	m    IterableMap
 	err  error
 	keys []KT
 	vals []VT
@@ -772,17 +959,15 @@ type BatchIterator[KT, VT any, KP KeyPointer[KT], VP ValuePointer[VT]] struct {
 	opts *ebpf.BatchOptions
 }
 
-// NewBatchIterator returns a typed wrapper for *Map that allows for
-// iterating (i.e. "dumping") the map using the bpf batch api.
+// NewBatchIterator that allows for iterating a map using the bpf batch api.
+// This automatically handles concerns such as batch sizing and handling errors
+// when end of map is reached.
+// Following iteration, any unresolved errors encountered when iterating
+// the bpf map can be accessed via the Err() function.
+// The pointer type of KT & VT must implement Map{Key,Value}, respectively.
 //
-// Unlike the general *Map dump functions, this must read into slices of
-// a concrete type (such as struct, or other scalar type), rather than into
-// pointers. This is because there is currently no safe way to allocate a
-// contiguous slice of key/value elements from either the underlying generic
-// pointer types or from MapKey/MapValue interface types.
-//
-// This means that attempting to use the pointer types that implement
-// MapKey/MapValue will fail upon iteration (via the Err() function).
+// Subsequent iterations via IterateAll reset all internal state and begin
+// iteration over.
 //
 // Example usage:
 //
@@ -794,15 +979,11 @@ type BatchIterator[KT, VT any, KP KeyPointer[KT], VP ValuePointer[VT]] struct {
 //		BPF_F_NO_PREALLOC,
 //	)
 //
-//	// Note: TestKey & TestValue are not pointer types!
 //	iter := NewBatchIterator[TestKey, TestValue](m)
-//	for k, v := range iter {
+//	for k, v := range iter.IterateAll(context.TODO()) {
 //		// ...
 //	}
-//
-// Following iteration, any unresolved errors encountered when iterating
-// the bpf map can be accessed via the Err() function.
-func NewBatchIterator[KT any, VT any, KP KeyPointer[KT], VP ValuePointer[VT]](m *Map) *BatchIterator[KT, VT, KP, VP] {
+func NewBatchIterator[KT any, VT any, KP KeyPointer[KT], VP ValuePointer[VT]](m IterableMap) *BatchIterator[KT, VT, KP, VP] {
 	return &BatchIterator[KT, VT, KP, VP]{
 		m: m,
 	}
@@ -907,11 +1088,11 @@ func startingChunkSize(maxEntries int) int {
 // If the iteration fails, then the Err() function will return the error that caused the failure.
 func (bi *BatchIterator[KT, VT, KP, VP]) IterateAll(ctx context.Context, opts ...BatchIteratorOpt[KT, VT, KP, VP]) iter.Seq2[KP, VP] {
 	switch bi.m.Type() {
-	case ebpf.Hash, ebpf.LRUHash:
+	case ebpf.Hash, ebpf.LRUHash, ebpf.LPMTrie:
 		break
 	default:
 		bi.err = fmt.Errorf("unsupported map type %s, must be one either hash or lru-hash types", bi.m.Type())
-		return nil
+		return func(yield func(KP, VP) bool) {}
 	}
 
 	bi.chunkSize = startingChunkSize(int(bi.m.MaxEntries()))
@@ -1011,7 +1192,17 @@ func (m *Map) Dump(hash map[string][]string) error {
 
 // BatchLookup returns the count of elements in the map by dumping the map
 // using batch lookup.
-func (m *Map) BatchLookup(cursor *ebpf.MapBatchCursor, keysOut, valuesOut interface{}, opts *ebpf.BatchOptions) (int, error) {
+func (m *Map) BatchLookup(cursor *ebpf.MapBatchCursor, keysOut, valuesOut any, opts *ebpf.BatchOptions) (int, error) {
+	// Hold the read lock for the duration of the batch lookup so that a
+	// concurrent Close() (which takes the write lock and sets m.m to nil)
+	// cannot yank the underlying map out from under us mid-iteration.
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	if m.m == nil {
+		return 0, fmt.Errorf("%s: %w", m.name, ErrMapNotOpened)
+	}
+
 	return m.m.BatchLookup(cursor, keysOut, valuesOut, opts)
 }
 
@@ -1226,9 +1417,14 @@ func (m *Map) Delete(key MapKey) error {
 	return err
 }
 
-// scopedLogger returns a logger scoped for the map. m.lock must be held.
-func (m *Map) scopedLogger() *logrus.Entry {
-	return log.WithFields(logrus.Fields{logfields.Path: m.path, "name": m.name})
+// DeleteLocked deletes the map entry for the given key.
+//
+// This method must be called from within a DumpCallback to avoid deadlocks,
+// as it assumes the m.lock is already acquired.
+func (m *Map) DeleteLocked(key MapKey) error {
+	_, err := m.delete(key, false)
+
+	return err
 }
 
 // DeleteAll deletes all entries of a map by traversing the map and deleting individual
@@ -1238,8 +1434,7 @@ func (m *Map) DeleteAll() error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	defer m.updatePressureMetric()
-	scopedLog := m.scopedLogger()
-	scopedLog.Debug("deleting all entries in map")
+	m.Logger.Debug("deleting all entries in map")
 
 	if m.withValueCache {
 		// Mark all entries for deletion, upon successful deletion,
@@ -1272,10 +1467,52 @@ func (m *Map) DeleteAll() error {
 
 	err := i.Err()
 	if err != nil {
-		scopedLog.WithError(err).Warningf("Unable to correlate iteration key %v with cache entry. Inconsistent cache.", mk)
+		m.Logger.Warn(
+			"Unable to correlate iteration key with cache entry. Inconsistent cache.",
+			logfields.Error, err,
+			logfields.Key, mk,
+		)
 	}
 
 	return err
+}
+
+func (m *Map) ClearAll() error {
+	if m.eventsBufferEnabled || m.withValueCache {
+		return fmt.Errorf("clear map: events buffer and value cache are not supported")
+	}
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	defer m.updatePressureMetric()
+
+	if err := m.open(); err != nil {
+		return err
+	}
+
+	mk := m.key.New()
+	var mv any
+	if m.hasPerCPUValue() {
+		mv = m.value.(MapPerCPUValue).NewSlice()
+	} else {
+		mv = m.value.New()
+	}
+	empty := reflect.Indirect(reflect.ValueOf(mv)).Interface()
+
+	i := m.m.Iterate()
+	for i.Next(mk, mv) {
+		err := m.m.Update(mk, empty, ebpf.UpdateAny)
+
+		if metrics.BPFMapOps.IsEnabled() {
+			metrics.BPFMapOps.WithLabelValues(m.commonName(), metricOpUpdate, metrics.Error2Outcome(err)).Inc()
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return i.Err()
 }
 
 // GetModel returns a BPF map in the representation served via the API
@@ -1366,9 +1603,10 @@ func (m *Map) resolveErrors(ctx context.Context) error {
 		return err
 	}
 
-	scopedLogger := m.scopedLogger()
-	scopedLogger.WithField("remaining", outstanding).
-		Debug("Starting periodic BPF map error resolver")
+	m.Logger.Debug(
+		"Starting periodic BPF map error resolver",
+		logfields.Remaining, outstanding,
+	)
 
 	resolved := 0
 	scanned := 0
@@ -1422,12 +1660,13 @@ func (m *Map) resolveErrors(ctx context.Context) error {
 
 	m.updatePressureMetric()
 
-	scopedLogger.WithFields(logrus.Fields{
-		"remaining": outstanding,
-		"resolved":  resolved,
-		"scanned":   scanned,
-		"duration":  time.Since(started),
-	}).Debug("BPF map error resolver completed")
+	m.Logger.Debug(
+		"BPF map error resolver completed",
+		logfields.Remaining, outstanding,
+		logfields.Resolved, resolved,
+		logfields.Scanned, scanned,
+		logfields.Duration, time.Since(started),
+	)
 
 	m.outstandingErrors = outstanding > 0
 	if m.outstandingErrors {
@@ -1435,25 +1674,6 @@ func (m *Map) resolveErrors(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// CheckAndUpgrade checks the received map's properties (for the map currently
-// loaded into the kernel) against the desired properties, and if they do not
-// match, deletes the map.
-//
-// Returns true if the map was upgraded.
-func (m *Map) CheckAndUpgrade(desired *Map) bool {
-	flags := desired.Flags() | GetPreAllocateMapFlags(desired.Type())
-
-	return objCheck(
-		m.m,
-		m.path,
-		desired.Type(),
-		desired.KeySize(),
-		desired.ValueSize(),
-		desired.MaxEntries(),
-		flags,
-	)
 }
 
 func (m *Map) exist() (bool, error) {

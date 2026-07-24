@@ -5,47 +5,60 @@ package k8s
 
 import (
 	"context"
+	"log/slog"
 	"net/netip"
 	"sync/atomic"
 
-	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/cilium/statedb"
+	"github.com/cilium/stream"
+
+	policyv1alpha2 "sigs.k8s.io/network-policy-api/apis/v1alpha2"
+
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
-	"github.com/cilium/cilium/pkg/k8s"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_networking_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/k8s/types"
+	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	policycell "github.com/cilium/cilium/pkg/policy/cell"
 )
 
 type policyWatcher struct {
-	log    logrus.FieldLogger
-	config *option.DaemonConfig
+	log                     *slog.Logger
+	config                  *option.DaemonConfig
+	clusterMeshPolicyConfig cmtypes.PolicyConfig
 
 	k8sResourceSynced *k8sSynced.Resources
 	k8sAPIGroups      *k8sSynced.APIGroups
 
-	policyImporter        policycell.PolicyImporter
-	svcCache              serviceCache
-	svcCacheNotifications <-chan k8s.ServiceNotification
-	ipCache               ipc
+	policyImporter policycell.PolicyImporter
+
+	db       *statedb.DB
+	services statedb.Table[*loadbalancer.Service]
+	backends statedb.Table[*loadbalancer.Backend]
+
+	serviceEvents stream.Observable[serviceEvent]
+
+	ipCache policycell.IPCacher
 
 	// Number of outstanding requests still pending in the PolicyImporter
 	// This is only used during initial sync; we will increment these
 	// as new work is learned and decrement them as the importer makes progress.
-	knpSyncPending, cnpSyncPending, ccnpSyncPending atomic.Int64
+	knpSyncPending, kcnpSyncPending, cnpSyncPending, ccnpSyncPending atomic.Int64
 
 	cidrGroupSynced atomic.Bool
 
 	ciliumNetworkPolicies            resource.Resource[*cilium_v2.CiliumNetworkPolicy]
 	ciliumClusterwideNetworkPolicies resource.Resource[*cilium_v2.CiliumClusterwideNetworkPolicy]
-	ciliumCIDRGroups                 resource.Resource[*cilium_api_v2alpha1.CiliumCIDRGroup]
+	ciliumCIDRGroups                 resource.Resource[*cilium_v2.CiliumCIDRGroup]
 	networkPolicies                  resource.Resource[*slim_networking_v1.NetworkPolicy]
+	clusterNetworkPolicies           resource.Resource[*policyv1alpha2.ClusterNetworkPolicy]
 
 	// cnpCache contains both CNPs and CCNPs, stored using a common intermediate
 	// representation (*types.SlimCNP). The cache is indexed on resource.Key,
@@ -55,7 +68,7 @@ type policyWatcher struct {
 	// (i.e: pre-translation of each CIDRGroupRef to a CIDRSet).
 	cnpCache map[resource.Key]*types.SlimCNP
 
-	cidrGroupCache map[string]*cilium_api_v2alpha1.CiliumCIDRGroup
+	cidrGroupCache map[string]*cilium_v2.CiliumCIDRGroup
 
 	// cidrGroupCIDRs is the set of CIDRs upserted in to the ipcache
 	// for a given cidrgroup
@@ -63,7 +76,7 @@ type policyWatcher struct {
 
 	// toServicesPolicies is the set of policies that contain ToServices references
 	toServicesPolicies map[resource.Key]struct{}
-	cnpByServiceID     map[k8s.ServiceID]map[resource.Key]struct{}
+	cnpByServiceID     map[loadbalancer.ServiceName]map[resource.Key]struct{}
 
 	metricsManager CNPMetrics
 }
@@ -71,20 +84,24 @@ type policyWatcher struct {
 func (p *policyWatcher) watchResources(ctx context.Context) {
 	// Channels to receive results from the PolicyImporter
 	// Only used during initialization
-	var knpDone, cnpDone, ccnpDone chan uint64
+	var knpDone, kcnpDone, cnpDone, ccnpDone chan uint64
 	if p.config.EnableK8sNetworkPolicy {
-		knpDone = make(chan uint64, 100)
+		knpDone = make(chan uint64, 1024)
+	}
+	if p.config.EnableK8sClusterNetworkPolicy {
+		kcnpDone = make(chan uint64, 1024)
 	}
 	if p.config.EnableCiliumNetworkPolicy {
-		cnpDone = make(chan uint64, 100)
+		cnpDone = make(chan uint64, 1024)
 	}
 	if p.config.EnableCiliumClusterwideNetworkPolicy {
-		ccnpDone = make(chan uint64, 100)
+		ccnpDone = make(chan uint64, 1024)
 	}
 
 	// Consume result channels, decrement outstanding work counter.
 	go func() {
 		knpDone := knpDone
+		kcnpDone := kcnpDone
 		cnpDone := cnpDone
 		ccnpDone := ccnpDone
 		for {
@@ -92,6 +109,10 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 			case <-knpDone:
 				if p.knpSyncPending.Add(-1) <= 0 {
 					knpDone = nil
+				}
+			case <-kcnpDone:
+				if p.kcnpSyncPending.Add(-1) <= 0 {
+					kcnpDone = nil
 				}
 			case <-cnpDone:
 				if p.cnpSyncPending.Add(-1) <= 0 {
@@ -102,7 +123,7 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 					ccnpDone = nil
 				}
 			}
-			if knpDone == nil && cnpDone == nil && ccnpDone == nil {
+			if knpDone == nil && kcnpDone == nil && cnpDone == nil && ccnpDone == nil {
 				break
 			}
 		}
@@ -111,19 +132,24 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 	go func() {
 		var (
 			knpEvents       <-chan resource.Event[*slim_networking_v1.NetworkPolicy]
+			kcnpEvents      <-chan resource.Event[*policyv1alpha2.ClusterNetworkPolicy]
 			cnpEvents       <-chan resource.Event[*cilium_v2.CiliumNetworkPolicy]
 			ccnpEvents      <-chan resource.Event[*cilium_v2.CiliumClusterwideNetworkPolicy]
-			cidrGroupEvents <-chan resource.Event[*cilium_api_v2alpha1.CiliumCIDRGroup]
-			serviceEvents   <-chan k8s.ServiceNotification
+			cidrGroupEvents <-chan resource.Event[*cilium_v2.CiliumCIDRGroup]
+			serviceEvents   <-chan serviceEvent
 		)
 		// copy the done-channels so we can nil them here and stop sending, without
 		// affecting the reader above
 		knpDone := knpDone
+		kcnpDone := kcnpDone
 		cnpDone := cnpDone
 		ccnpDone := ccnpDone
 
 		if p.config.EnableK8sNetworkPolicy {
 			knpEvents = p.networkPolicies.Events(ctx)
+		}
+		if p.config.EnableK8sClusterNetworkPolicy {
+			kcnpEvents = p.clusterNetworkPolicies.Events(ctx)
 		}
 		if p.config.EnableCiliumNetworkPolicy {
 			cnpEvents = p.ciliumNetworkPolicies.Events(ctx)
@@ -135,8 +161,10 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 			// Cilium CDR Group CRD is only used with CNP/CCNP.
 			// https://docs.cilium.io/en/latest/network/kubernetes/ciliumcidrgroup/
 			cidrGroupEvents = p.ciliumCIDRGroups.Events(ctx)
-			// Service Cache Notifications are only used with CNP/CCNP.
-			serviceEvents = p.svcCacheNotifications
+		}
+
+		if p.serviceEvents != nil {
+			serviceEvents = stream.ToChannel(ctx, p.serviceEvents)
 		}
 
 		for {
@@ -157,9 +185,36 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 				var err error
 				switch event.Kind {
 				case resource.Upsert:
-					err = p.addK8sNetworkPolicyV1(event.Object, k8sAPIGroupNetworkingV1Core, knpDone)
+					err = p.addK8sNetworkPolicyV1(
+						event.Object, k8sAPIGroupNetworkingV1Core, knpDone,
+						cmtypes.LocalClusterNameForPolicies(p.clusterMeshPolicyConfig, p.config.ClusterName),
+					)
 				case resource.Delete:
 					err = p.deleteK8sNetworkPolicyV1(event.Object, k8sAPIGroupNetworkingV1Core, knpDone)
+				}
+				event.Done(err)
+			case event, ok := <-kcnpEvents:
+				if !ok {
+					kcnpEvents = nil
+					break
+				}
+
+				if event.Kind == resource.Sync {
+					kcnpDone <- 0
+					kcnpDone = nil // stop tracking pending work
+					event.Done(nil)
+					continue
+				}
+
+				var err error
+				switch event.Kind {
+				case resource.Upsert:
+					err = p.addK8sClusterNetworkPolicy(
+						event.Object, k8sAPIGroupPolicyNetworkingV1Alpha2, kcnpDone,
+						cmtypes.LocalClusterNameForPolicies(p.clusterMeshPolicyConfig, p.config.ClusterName),
+					)
+				case resource.Delete:
+					err = p.deleteK8sClusterNetworkPolicy(event.Object, k8sAPIGroupPolicyNetworkingV1Alpha2, kcnpDone)
 				}
 				event.Done(err)
 			case event, ok := <-cnpEvents:
@@ -193,10 +248,11 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 				switch event.Kind {
 				case resource.Upsert:
 					err = p.onUpsert(slimCNP, event.Key, k8sAPIGroupCiliumNetworkPolicyV2, resourceID, cnpDone)
+					reportCNPChangeMetrics(metrics.LabelValueUpdateOperation, err)
 				case resource.Delete:
 					p.onDelete(slimCNP, event.Key, k8sAPIGroupCiliumNetworkPolicyV2, resourceID, cnpDone)
+					reportCNPChangeMetrics(metrics.LabelValueDeleteOperation, err)
 				}
-				reportCNPChangeMetrics(err)
 				event.Done(err)
 			case event, ok := <-ccnpEvents:
 				if !ok {
@@ -229,10 +285,11 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 				switch event.Kind {
 				case resource.Upsert:
 					err = p.onUpsert(slimCNP, event.Key, k8sAPIGroupCiliumClusterwideNetworkPolicyV2, resourceID, ccnpDone)
+					reportCNPChangeMetrics(metrics.LabelValueUpdateOperation, err)
 				case resource.Delete:
 					p.onDelete(slimCNP, event.Key, k8sAPIGroupCiliumClusterwideNetworkPolicyV2, resourceID, ccnpDone)
+					reportCNPChangeMetrics(metrics.LabelValueDeleteOperation, nil)
 				}
-				reportCNPChangeMetrics(err)
 				event.Done(err)
 			case event, ok := <-cidrGroupEvents:
 				if !ok {
@@ -248,23 +305,21 @@ func (p *policyWatcher) watchResources(ctx context.Context) {
 
 				switch event.Kind {
 				case resource.Upsert:
-					p.onUpsertCIDRGroup(event.Object, k8sAPIGroupCiliumCIDRGroupV2Alpha1)
+					p.onUpsertCIDRGroup(event.Object, k8sAPIGroupCiliumCIDRGroupV2)
 				case resource.Delete:
-					p.onDeleteCIDRGroup(event.Object.Name, k8sAPIGroupCiliumCIDRGroupV2Alpha1)
+					p.onDeleteCIDRGroup(event.Object.Name, k8sAPIGroupCiliumCIDRGroupV2)
 				}
 				event.Done(nil)
+
 			case event, ok := <-serviceEvents:
 				if !ok {
 					serviceEvents = nil
 					break
 				}
-
-				switch event.Action {
-				case k8s.UpdateService, k8s.DeleteService:
-					p.onServiceEvent(event)
-				}
+				p.onServiceEvent(event)
 			}
-			if knpEvents == nil && cnpEvents == nil && ccnpEvents == nil && cidrGroupEvents == nil && serviceEvents == nil {
+
+			if knpEvents == nil && kcnpEvents == nil && cnpEvents == nil && ccnpEvents == nil && cidrGroupEvents == nil && serviceEvents == nil {
 				return
 			}
 		}

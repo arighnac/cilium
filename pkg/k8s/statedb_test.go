@@ -7,11 +7,14 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"slices"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
 	"github.com/stretchr/testify/assert"
@@ -39,14 +42,17 @@ var nodeNameIndex = statedb.Index[*corev1.Node, string]{
 }
 
 func newNodeTable(db *statedb.DB) (statedb.RWTable[*corev1.Node], error) {
-	tbl, err := statedb.NewTable(
+	return statedb.NewTableAny(
+		db,
 		"nodes",
+		func() []string {
+			return []string{"Name"}
+		},
+		func(node *corev1.Node) []string {
+			return []string{node.Name}
+		},
 		nodeNameIndex,
 	)
-	if err != nil {
-		return nil, err
-	}
-	return tbl, db.RegisterTable(tbl)
 }
 
 func ExampleRegisterReflector() {
@@ -113,6 +119,18 @@ type testObject struct {
 	Transform string
 }
 
+// TableHeader implements statedb.TableWritable.
+func (t *testObject) TableHeader() []string {
+	return []string{"Name", "Status"}
+}
+
+// TableRow implements statedb.TableWritable.
+func (t *testObject) TableRow() []string {
+	return []string{t.Name, t.Status}
+}
+
+var _ statedb.TableWritable = &testObject{}
+
 func (t *testObject) DeepCopy() *testObject {
 	t2 := *t
 	return &t2
@@ -130,14 +148,52 @@ var (
 )
 
 func newTestTable(db *statedb.DB) (statedb.RWTable[*testObject], error) {
-	tbl, err := statedb.NewTable(
+	return statedb.NewTable(
+		db,
 		"test",
 		testNameIndex,
 	)
-	if err != nil {
-		return nil, err
+}
+
+type slimTestObject struct {
+	Name   string
+	Status string
+}
+
+// TableHeader implements statedb.TableWritable.
+func (s *slimTestObject) TableHeader() []string {
+	return []string{"Name", "Status"}
+}
+
+// TableRow implements statedb.TableWritable.
+func (s *slimTestObject) TableRow() []string {
+	return []string{s.Name, s.Status}
+}
+
+var _ statedb.TableWritable = &slimTestObject{}
+
+func (s *slimTestObject) DeepCopy() *slimTestObject {
+	s2 := *s
+	return &s2
+}
+
+var (
+	slimTestNameIndex = statedb.Index[*slimTestObject, string]{
+		Name: "name",
+		FromObject: func(obj *slimTestObject) index.KeySet {
+			return index.NewKeySet(index.String(obj.Name))
+		},
+		FromKey: index.String,
+		Unique:  true,
 	}
-	return tbl, db.RegisterTable(tbl)
+)
+
+func newSlimTestTable(db *statedb.DB) (statedb.RWTable[*slimTestObject], error) {
+	return statedb.NewTable(
+		db,
+		"slim",
+		slimTestNameIndex,
+	)
 }
 
 type reflectorTestParams struct {
@@ -220,11 +276,14 @@ func testStateDBReflector(t *testing.T, p reflectorTestParams) {
 	}
 	var transformManyFunc k8s.TransformManyFunc[*testObject]
 	if p.doTransformMany {
-		transformManyFunc = func(_ statedb.ReadTxn, a any) (objs []*testObject) {
+		transformManyFunc = func(_ statedb.ReadTxn, deleted bool, a any) (toInsert, toDelete iter.Seq[*testObject]) {
 			transformCalled.Store(true)
 			obj := a.(*testObject).DeepCopy()
 			obj.Transform = "transform-many"
-			return []*testObject{obj}
+			if deleted {
+				return nil, slices.Values([]*testObject{obj})
+			}
+			return slices.Values([]*testObject{obj}), nil
 		}
 	}
 
@@ -254,41 +313,39 @@ func testStateDBReflector(t *testing.T, p reflectorTestParams) {
 	}
 
 	hive := hive.New(
-		cell.Module("test", "test",
-			cell.ProvidePrivate(
-				func(tbl statedb.RWTable[*testObject]) k8s.ReflectorConfig[*testObject] {
-					return k8s.ReflectorConfig[*testObject]{
-						Name:           "test",
-						Table:          tbl,
-						BufferSize:     10,
-						BufferWaitTime: time.Millisecond,
-						ListerWatcher:  lw,
-						Transform:      transformFunc,
-						TransformMany:  transformManyFunc,
-						QueryAll:       queryAllFunc,
-						Merge:          mergeFunc,
-						CRDSync:        crdSyncPromise,
-					}
-				},
-				newTestTable,
-			),
-			cell.Invoke(
-				k8s.RegisterReflector[*testObject],
-				func(db_ *statedb.DB, tbl statedb.RWTable[*testObject]) {
-					// Insert a dummy node into the table to verify that the initial synchronization
-					// cleans things up.
-					// BTW, if you don't want everything cleaned up you can specify the QueryAll
-					// function to "namespace" what the reflector is managing.
-					wtxn := db_.WriteTxn(tbl)
-					var garbageNode testObject
-					garbageNode.Name = "garbage"
-					tbl.Insert(wtxn, &garbageNode)
-					wtxn.Commit()
-
-					db = db_
-					table = tbl
-				}),
+		cell.ProvidePrivate(
+			func(tbl statedb.RWTable[*testObject]) k8s.ReflectorConfig[*testObject] {
+				return k8s.ReflectorConfig[*testObject]{
+					Name:           "test",
+					Table:          tbl,
+					BufferSize:     10,
+					BufferWaitTime: 10 * time.Millisecond,
+					ListerWatcher:  lw,
+					Transform:      transformFunc,
+					TransformMany:  transformManyFunc,
+					QueryAll:       queryAllFunc,
+					Merge:          mergeFunc,
+					CRDSync:        crdSyncPromise,
+				}
+			},
+			newTestTable,
 		),
+		cell.Invoke(
+			k8s.RegisterReflector[*testObject],
+			func(db_ *statedb.DB, tbl statedb.RWTable[*testObject]) {
+				// Insert a dummy node into the table to verify that the initial synchronization
+				// cleans things up.
+				// BTW, if you don't want everything cleaned up you can specify the QueryAll
+				// function to "namespace" what the reflector is managing.
+				wtxn := db_.WriteTxn(tbl)
+				var garbageNode testObject
+				garbageNode.Name = "garbage"
+				tbl.Insert(wtxn, &garbageNode)
+				wtxn.Commit()
+
+				db = db_
+				table = tbl
+			}),
 	)
 
 	tlog := hivetest.Logger(t)
@@ -353,6 +410,30 @@ func testStateDBReflector(t *testing.T, p reflectorTestParams) {
 	require.Equal(t, obj1Name, objs[0].Name)
 	require.Equal(t, obj2Name, objs[1].Name)
 
+	// Update the nodes back to back. The ordering must be retained even when
+	// the changes land in the same buffer.
+	for i := range 10 {
+		fst := i%2 == 0
+		if fst {
+			lw.Upsert(obj.DeepCopy())
+			lw.Upsert(node2.DeepCopy())
+		} else {
+			lw.Upsert(node2.DeepCopy())
+			lw.Upsert(obj.DeepCopy())
+		}
+		<-watch
+		iter, watch = table.LowerBoundWatch(db.ReadTxn(), statedb.ByRevision[*testObject](0))
+		objs = statedb.Collect(iter)
+		require.Len(t, objs, 2)
+		if fst {
+			require.Equal(t, obj1Name, objs[0].Name)
+			require.Equal(t, obj2Name, objs[1].Name)
+		} else {
+			require.Equal(t, obj2Name, objs[0].Name)
+			require.Equal(t, obj1Name, objs[1].Name)
+		}
+	}
+
 	// Finally delete the nodes
 	lw.Delete(obj)
 
@@ -360,7 +441,7 @@ func testStateDBReflector(t *testing.T, p reflectorTestParams) {
 	iter, watch = table.AllWatch(db.ReadTxn())
 	objs = statedb.Collect(iter)
 	require.Len(t, objs, 1)
-	require.EqualValues(t, obj2Name, objs[0].Name)
+	require.Equal(t, obj2Name, objs[0].Name)
 
 	lw.Delete(node2)
 
@@ -383,8 +464,157 @@ func testStateDBReflector(t *testing.T, p reflectorTestParams) {
 	}
 }
 
+func TestStateDBReflectorShared(t *testing.T) {
+	var (
+		db      *statedb.DB
+		testTbl statedb.RWTable[*testObject]
+		slimTbl statedb.RWTable[*slimTestObject]
+
+		obj = func(no int, status string) *testObject {
+			return &testObject{
+				PartialObjectMetadata: metav1.PartialObjectMetadata{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            fmt.Sprintf("obj-%d", no),
+						ResourceVersion: fmt.Sprintf("%d", no),
+					},
+				},
+				Status: status,
+			}
+		}
+
+		lw = testutils.NewFakeListerWatcher(obj(0, "init"))
+	)
+
+	hive := hive.New(
+		cell.ProvidePrivate(
+			// reflector 1
+			func(tbl statedb.RWTable[*testObject], slw k8s.SharedListerWatcher) k8s.ReflectorConfig[*testObject] {
+				return k8s.ReflectorConfig[*testObject]{
+					Name:                "shared-1",
+					Table:               tbl,
+					BufferSize:          10,
+					BufferWaitTime:      10 * time.Millisecond,
+					SharedListerWatcher: slw,
+					Transform: func(txn statedb.ReadTxn, a any) (obj *testObject, ok bool) {
+						obj = a.(*testObject).DeepCopy()
+						obj.Status = "shared-1"
+						version, _ := strconv.Atoi(obj.ResourceVersion)
+						return obj, version%2 == 0 // every second object
+					},
+				}
+			},
+			newTestTable,
+			// reflector 2
+			func(tbl statedb.RWTable[*slimTestObject], slw k8s.SharedListerWatcher) k8s.ReflectorConfig[*slimTestObject] {
+				return k8s.ReflectorConfig[*slimTestObject]{
+					Name:                "shared-2",
+					Table:               tbl,
+					BufferSize:          3,
+					BufferWaitTime:      3 * time.Millisecond,
+					SharedListerWatcher: slw,
+					Transform: func(txn statedb.ReadTxn, a any) (s *slimTestObject, ok bool) {
+						obj := a.(*testObject)
+						s = &slimTestObject{
+							Name:   obj.Name,
+							Status: "shared-2",
+						}
+						version, _ := strconv.Atoi(obj.ResourceVersion)
+						return s, version%3 == 0 // every third object
+					},
+				}
+			},
+			newSlimTestTable,
+			// shared lister watcher
+			func(jg job.Group) k8s.SharedListerWatcher {
+				return k8s.NewSharedListerWatcher("testobjs", jg, lw)
+			},
+		),
+		cell.Invoke(
+			k8s.RegisterReflector[*testObject],
+			k8s.RegisterReflector[*slimTestObject],
+			func(db_ *statedb.DB, testTbl_ statedb.RWTable[*testObject], slimTbl_ statedb.RWTable[*slimTestObject]) {
+				db = db_
+				testTbl = testTbl_
+				slimTbl = slimTbl_
+			},
+		),
+	)
+
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, t.Context()); err != nil {
+		t.Fatalf("hive.Start failed: %s", err)
+	}
+
+	// Wait until the tables has been initialized.
+	_, initWatch := testTbl.Initialized(db.ReadTxn())
+	<-initWatch
+	_, initWatch = slimTbl.Initialized(db.ReadTxn())
+	<-initWatch
+
+	// Check that both tables observed the initial object
+	testIter, testWatch := testTbl.AllWatch(db.ReadTxn())
+	testObjs := statedb.Collect(testIter)
+	require.Len(t, testObjs, 1)
+	require.Equal(t, "obj-0", testObjs[0].Name)
+	require.Equal(t, "shared-1", testObjs[0].Status)
+
+	slimIter, slimWatch := slimTbl.AllWatch(db.ReadTxn())
+	slimObjs := statedb.Collect(slimIter)
+	require.Len(t, slimObjs, 1)
+	require.Equal(t, "obj-0", slimObjs[0].Name)
+	require.Equal(t, "shared-2", slimObjs[0].Status)
+
+	// Insert obj-1, this should be ignored by both reflectors
+	lw.Upsert(obj(1, "upsert"))
+	select {
+	case <-testWatch:
+		t.Fatal("shared-1 should not have been updated")
+	case <-slimWatch:
+		t.Fatal("shared-2 should not have been updated")
+	default:
+	}
+
+	// Insert obj-2, this should be visible only to shared-1
+	lw.Upsert(obj(2, "upsert"))
+	select {
+	case <-testWatch:
+	case <-slimWatch:
+		t.Fatal("shared-2 should not have been updated")
+	}
+	testIter, testWatch = testTbl.AllWatch(db.ReadTxn())
+	testObjs = statedb.Collect(testIter)
+	require.Len(t, testObjs, 2)
+	require.Equal(t, "obj-0", testObjs[0].Name)
+	require.Equal(t, "shared-1", testObjs[0].Status)
+	require.Equal(t, "obj-2", testObjs[1].Name)
+	require.Equal(t, "shared-1", testObjs[1].Status)
+
+	// Insert obj-6, both reflectors should handle this
+	lw.Upsert(obj(6, "upsert"))
+	<-testWatch
+	testIter, _ = testTbl.AllWatch(db.ReadTxn())
+	testObjs = statedb.Collect(testIter)
+	require.Len(t, testObjs, 3)
+	require.Equal(t, "obj-0", testObjs[0].Name)
+	require.Equal(t, "shared-1", testObjs[0].Status)
+	require.Equal(t, "obj-2", testObjs[1].Name)
+	require.Equal(t, "shared-1", testObjs[1].Status)
+	require.Equal(t, "obj-6", testObjs[2].Name)
+	require.Equal(t, "shared-1", testObjs[2].Status)
+	<-slimWatch
+	slimIter, _ = slimTbl.AllWatch(db.ReadTxn())
+	slimObjs = statedb.Collect(slimIter)
+	require.Len(t, slimObjs, 2)
+	require.Equal(t, "obj-0", slimObjs[0].Name)
+	require.Equal(t, "shared-2", slimObjs[0].Status)
+	require.Equal(t, "obj-6", slimObjs[1].Name)
+	require.Equal(t, "shared-2", slimObjs[1].Status)
+}
+
 func TestStateDBReflector_jobName(t *testing.T) {
+	db := statedb.New()
 	tbl, _ := statedb.NewTable(
+		db,
 		"node",
 		testNameIndex,
 	)
@@ -417,28 +647,26 @@ func TestOnDemandTable(t *testing.T) {
 	)
 
 	hive := hive.New(
-		cell.Module("test", "test",
-			cell.ProvidePrivate(
-				func(tbl statedb.RWTable[*testObject]) k8s.ReflectorConfig[*testObject] {
-					wtbl = tbl
-					return k8s.ReflectorConfig[*testObject]{
-						Name:             "test",
-						Table:            tbl,
-						BufferSize:       10,
-						BufferWaitTime:   time.Millisecond,
-						ListerWatcher:    lw,
-						ClearTableOnStop: true,
-					}
-				},
-				newTestTable,
-				k8s.OnDemandTable[*testObject],
-			),
-			cell.Invoke(
-				func(db_ *statedb.DB, tbl hive.OnDemand[statedb.Table[*testObject]]) {
-					db = db_
-					otable = tbl
-				},
-			),
+		cell.ProvidePrivate(
+			func(tbl statedb.RWTable[*testObject]) k8s.ReflectorConfig[*testObject] {
+				wtbl = tbl
+				return k8s.ReflectorConfig[*testObject]{
+					Name:             "test",
+					Table:            tbl,
+					BufferSize:       10,
+					BufferWaitTime:   time.Millisecond,
+					ListerWatcher:    lw,
+					ClearTableOnStop: true,
+				}
+			},
+			newTestTable,
+			k8s.OnDemandTable[*testObject],
+		),
+		cell.Invoke(
+			func(db_ *statedb.DB, tbl hive.OnDemand[statedb.Table[*testObject]]) {
+				db = db_
+				otable = tbl
+			},
 		),
 	)
 
@@ -515,26 +743,24 @@ func BenchmarkStateDBReflector(b *testing.B) {
 	lw := testutils.NewFakeListerWatcher()
 
 	hive := hive.New(
-		cell.Module("test", "test",
-			cell.ProvidePrivate(
-				func(tbl statedb.RWTable[*testObject]) k8s.ReflectorConfig[*testObject] {
-					return k8s.ReflectorConfig[*testObject]{
-						Name:           "test",
-						Table:          tbl,
-						ListerWatcher:  lw,
-						BufferSize:     1024,
-						BufferWaitTime: time.Millisecond,
-					}
-				},
-				newTestTable,
-			),
-			cell.Invoke(
-				k8s.RegisterReflector[*testObject],
-				func(db_ *statedb.DB, tbl statedb.RWTable[*testObject]) {
-					db = db_
-					table = tbl
-				}),
+		cell.ProvidePrivate(
+			func(tbl statedb.RWTable[*testObject]) k8s.ReflectorConfig[*testObject] {
+				return k8s.ReflectorConfig[*testObject]{
+					Name:           "test",
+					Table:          tbl,
+					ListerWatcher:  lw,
+					BufferSize:     1024,
+					BufferWaitTime: time.Millisecond,
+				}
+			},
+			newTestTable,
 		),
+		cell.Invoke(
+			k8s.RegisterReflector[*testObject],
+			func(db_ *statedb.DB, tbl statedb.RWTable[*testObject]) {
+				db = db_
+				table = tbl
+			}),
 	)
 
 	tlog := hivetest.Logger(b)
@@ -555,10 +781,8 @@ func BenchmarkStateDBReflector(b *testing.B) {
 		objs[i] = obj
 	}
 
-	b.ResetTimer()
-
 	// Do n rounds of upserting and deleting [numObjects] to benchmark the throughput
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		for _, obj := range objs {
 			lw.Upsert(obj.DeepCopy())
 		}

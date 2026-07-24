@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
-	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -200,9 +199,7 @@ func TestDescendants(t *testing.T) {
 				gotRes = append(gotRes, v)
 				return true
 			})
-			if !reflect.DeepEqual(expectedRes, gotRes) {
-				t.Fatalf("Descendants prefix %s, expected to get %v, but got: %v", pref.String(), expectedRes, gotRes)
-			}
+			assert.Equal(t, expectedRes, gotRes, "Descendants prefix %s", pref.String())
 		}
 	}
 }
@@ -322,9 +319,7 @@ func TestDescendantsShortestPrefixFirst(t *testing.T) {
 				gotRes = append(gotRes, v)
 				return true
 			})
-			if !reflect.DeepEqual(expectedRes, gotRes) {
-				t.Fatalf("LPM Descendants prefix %s, expected to get %v, but got: %v", pref.String(), expectedRes, gotRes)
-			}
+			assert.Equal(t, expectedRes, gotRes, "LPM Descendants prefix %s", pref.String())
 		}
 	}
 }
@@ -465,7 +460,7 @@ func generatePrefix(b *testing.B, r *rand.Rand) netip.Prefix {
 
 func generateCIDRs(b *testing.B, r *rand.Rand, n int) *CIDRTrie[struct{}] {
 	t := NewCIDRTrie[struct{}]()
-	for i := 0; i < n; i++ {
+	for range n {
 		if !t.Upsert(generatePrefix(b, r), struct{}{}) {
 			n++
 		}
@@ -493,7 +488,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			n = 0
 			t.Ancestors(prefix, func(k netip.Prefix, _ struct{}) bool {
 				n++
@@ -507,7 +502,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			iter := t.AncestorIterator(prefix)
 			n = 0
 			for ok, _, _ := iter.Next(); ok; ok, _, _ = iter.Next() {
@@ -522,7 +517,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			n = 0
 			lastLen = prefixLen
 			t.AncestorsLongestPrefixFirst(prefix, func(k netip.Prefix, _ struct{}) bool {
@@ -541,7 +536,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			iter := t.AncestorLongestPrefixFirstIterator(prefix)
 			n = 0
 			lastLen = prefixLen
@@ -559,7 +554,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			n = 0
 			t.Descendants(prefix, func(k netip.Prefix, _ struct{}) bool {
 				n++
@@ -573,7 +568,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			iter := t.DescendantIterator(prefix)
 			n = 0
 			for ok, _, _ := iter.Next(); ok; ok, _, _ = iter.Next() {
@@ -588,7 +583,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			n = 0
 			lastLen = 0
 			t.DescendantsShortestPrefixFirst(prefix, func(k netip.Prefix, _ struct{}) bool {
@@ -607,7 +602,7 @@ func BenchmarkTraversal(b *testing.B) {
 
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			iter := t.DescendantShortestPrefixFirstIterator(prefix)
 			n = 0
 			lastLen = 0

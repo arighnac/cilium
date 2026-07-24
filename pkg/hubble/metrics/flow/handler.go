@@ -7,9 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
@@ -82,8 +82,6 @@ func (h *flowHandler) ProcessFlow(ctx context.Context, flow *flowpb.Flow) error 
 				subType = "DNS"
 			case l7.GetHttp() != nil:
 				subType = "HTTP"
-			case l7.GetKafka() != nil:
-				subType = "Kafka"
 			}
 		}
 	case monitorAPI.MessageTypeDrop:
@@ -121,11 +119,11 @@ func (h *flowHandler) HandleConfigurationUpdate(cfg *api.MetricConfig) error {
 
 func (h *flowHandler) SetFilters(cfg *api.MetricConfig) error {
 	var err error
-	h.AllowList, err = filters.BuildFilterList(context.Background(), cfg.IncludeFilters, filters.DefaultFilters(logrus.New()))
+	h.AllowList, err = filters.BuildFilterList(context.Background(), cfg.IncludeFilters, filters.DefaultFilters(slog.Default()))
 	if err != nil {
 		return err
 	}
-	h.DenyList, err = filters.BuildFilterList(context.Background(), cfg.ExcludeFilters, filters.DefaultFilters(logrus.New()))
+	h.DenyList, err = filters.BuildFilterList(context.Background(), cfg.ExcludeFilters, filters.DefaultFilters(slog.Default()))
 	if err != nil {
 		return err
 	}

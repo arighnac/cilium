@@ -1,5 +1,3 @@
-//go:build unparallel
-
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
@@ -17,27 +15,34 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
+	"github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
-	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/testutils"
+	tnl "github.com/cilium/cilium/pkg/testutils/netlink"
+	"github.com/cilium/cilium/pkg/testutils/netns"
 )
 
-func setupIPSecSuitePrivileged(tb testing.TB) *slog.Logger {
-	testutils.PrivilegedTest(tb)
-	node.SetTestLocalNodeStore()
-	err := rlimit.RemoveMemlock()
+func mustParseCIDR(tb testing.TB, s string) *net.IPNet {
+	_, ipNet, err := net.ParseCIDR(s)
 	require.NoError(tb, err)
-	log := hivetest.Logger(tb)
+	return ipNet
+}
 
-	tb.Cleanup(func() {
-		UnsetTestIPSecKey()
-		node.UnsetTestLocalNodeStore()
-		err := DeleteXFRM(log, AllReqID)
-		if err != nil {
-			tb.Errorf("Failed cleaning XFRM state: %v", err)
-		}
-	})
-	return log
+func setup(tb testing.TB, family string) (local, remote *net.IPNet) {
+	testutils.PrivilegedTest(tb)
+
+	require.NoError(tb, rlimit.RemoveMemlock())
+	log = hivetest.Logger(tb)
+
+	switch family {
+	case "ipv4":
+		return mustParseCIDR(tb, "1.1.3.4/16"), mustParseCIDR(tb, "1.2.3.4/16")
+	case "ipv6":
+		return mustParseCIDR(tb, "2001:0:0:1134::/64"), mustParseCIDR(tb, "2001:0:0:1234::/64")
+	}
+
+	tb.Fatalf("unknown family: %s", family)
+	return
 }
 
 const (
@@ -48,33 +53,77 @@ const (
 )
 
 var (
-	keysDat        = []byte("1 hmac(sha256) 0123456789abcdef0123456789abcdef cbc(aes) 0123456789abcdef0123456789abcdef\n2 hmac(sha256) 0123456789abcdef0123456789abcdef cbc(aes) 0123456789abcdef0123456789abcdef\n3 digest_null \"\" cipher_null \"\"\n")
+	keysDat        = []byte("1 hmac(sha256) 0123456789abcdef0123456789abcdef cbc(aes) 0123456789abcdef0123456789abcdef\n2 hmac(sha256) 0123456789abcdef0123456789abcdef cbc(aes) 0123456789abcdef0123456789abcdef\n")
+	keysNullDat    = []byte("3 digest_null \"\" cipher_null \"\"\n")
 	keysAeadDat    = []byte("4 rfc4106(gcm(aes)) 44434241343332312423222114131211f4f3f2f1 128\n")
 	keysAeadDat256 = []byte("5 rfc4106(gcm(aes)) 44434241343332312423222114131211f4f3f2f144434241343332312423222114131211 128\n")
 	invalidKeysDat = []byte("6 test abcdefghijklmnopqrstuvwzyzABCDEF test abcdefghijklmnopqrstuvwzyzABCDEF\n")
 	keysSameSpiDat = []byte("7 hmac(sha256) 0123456789abcdef0123456789abcdef cbc(aes) 0123456789abcdef0123456789abcdef\n7 digest_null \"\" cipher_null \"\"\n")
+
+	log *slog.Logger
 )
 
-func TestLoadKeysNoFile(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
+var families = []string{"ipv4", "ipv6"}
 
-	_, _, err := LoadIPSecKeysFile(log, path)
+func testWithFamilies(t *testing.T, f func(t *testing.T, family string)) {
+	t.Helper()
+
+	for _, family := range families {
+		t.Run(family, func(t *testing.T) {
+			f(t, family)
+		})
+	}
+}
+
+func mustUpsertIPSecEndpoint(tb testing.TB, ns *netns.NetNS, a *agent, params *types.Parameters) {
+	tb.Helper()
+
+	require.NoError(tb, ns.Do(func() error {
+		_, err := a.UpsertIPsecEndpoint(params)
+		return err
+	}))
+}
+
+func TestLoadKeysNoFile(t *testing.T) {
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	_, err = a.loadIPSecKeysFile(path)
 	require.True(t, os.IsNotExist(err))
 }
 
-func TestInvalidLoadKeys(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
+func TestPrivilegedInvalidLoadKeys(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testInvalidLoadKeys(t, family)
+	})
+}
 
-	keys := bytes.NewReader(invalidKeysDat)
-	_, _, err := LoadIPSecKeys(log, keys)
-	require.Error(t, err)
+func testInvalidLoadKeys(t *testing.T, family string) {
+	local, remote := setup(t, family)
 
-	_, local, err := net.ParseCIDR("1.1.3.4/16")
+	testCases := []struct {
+		name     string
+		input    []byte
+		expError string
+	}{
+		{"invalid keys", invalidKeysDat, "unable to decode authentication key string"},
+		{"empty line", []byte(" \n"), "missing IPSec key or invalid format"},
+		{"blank second line", []byte("4 rfc4106(gcm(aes)) 44434241343332312423222114131211f4f3f2f1 128\n   \n"), "missing IPSec key or invalid format"},
+		{"leading space", []byte(" rfc4106(gcm(aes)) 44434241343332312423222114131211f4f3f2f1 128\n"), "the first argument of the IPsec secret is not a number"},
+		{"spi plus only", []byte("+ rfc4106(gcm(aes)) 44434241343332312423222114131211f4f3f2f1 128\n"), "the first argument of the IPsec secret is not a number"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := NewTestIPsecAgent(t, nil)
+			require.NoError(t, err)
+			keys := bytes.NewReader(tc.input)
+			_, err = a.loadIPSecKeys(keys)
+			require.ErrorContains(t, err, tc.expError)
+		})
+	}
+
+	a, err := NewTestIPsecAgent(t, nil)
 	require.NoError(t, err)
-	_, remote, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
-
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   remoteNodeID,
@@ -88,34 +137,44 @@ func TestInvalidLoadKeys(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
+	_, err = a.UpsertIPsecEndpoint(params)
 	require.Error(t, err)
 }
 
 func TestLoadKeys(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
-
-	testCases := [][]byte{keysDat, keysAeadDat, keysAeadDat256}
+	testCases := [][]byte{keysDat, keysNullDat, keysAeadDat, keysAeadDat256}
 	for _, testCase := range testCases {
 		keys := bytes.NewReader(testCase)
-		_, spi, err := LoadIPSecKeys(log, keys)
+		a, err := NewTestIPsecAgent(t, nil)
 		require.NoError(t, err)
-		err = SetIPSecSPI(log, spi)
+		spi, err := a.loadIPSecKeys(keys)
 		require.NoError(t, err)
+		require.Equal(t, a.key.Spi, spi)
+		err = a.setActiveSPI(spi)
+		require.NoError(t, err)
+		activeSPI, err := a.getActiveSPI()
+		require.NoError(t, err)
+		require.Equal(t, a.key.Spi, activeSPI)
 	}
 }
 
-func TestLoadKeysSameSPI(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
+func TestLoadKeysLenChange(t *testing.T) {
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	keys := bytes.NewReader(append(keysDat, keysNullDat...))
+	_, err = a.loadIPSecKeys(keys)
+	require.ErrorContains(t, err, "invalid key rotation: key length must not change")
+}
 
+func TestLoadKeysSameSPI(t *testing.T) {
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
 	keys := bytes.NewReader(keysSameSpiDat)
-	_, _, err := LoadIPSecKeys(log, keys)
+	_, err = a.loadIPSecKeys(keys)
 	require.ErrorContains(t, err, "invalid SPI: changing IPSec keys requires incrementing the key id")
 }
 
 func TestParseSPI(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
-
 	testCases := []struct {
 		input    string
 		expSPI   uint8
@@ -127,9 +186,10 @@ func TestParseSPI(t *testing.T) {
 		{"3+", 3, 0, false},
 		{"abc", 0, 0, true},
 		{"0", 0, 0, true},
+		{"+", 0, 0, true},
 	}
 	for _, tc := range testCases {
-		spi, off, err := parseSPI(log, tc.input)
+		spi, off, err := parseSPI(tc.input)
 		if spi != tc.expSPI {
 			t.Fatalf("For input %q, expected SPI %d, but got %d", tc.input, tc.expSPI, spi)
 		}
@@ -144,13 +204,17 @@ func TestParseSPI(t *testing.T) {
 	}
 }
 
-func TestUpsertIPSecEquals(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
+func TestPrivilegedUpsertIPSecEquals(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testUpsertIPSecEquals(t, family)
+	})
+}
 
-	_, local, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
-	_, remote, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
+func testUpsertIPSecEquals(t *testing.T, family string) {
+	_, remote := setup(t, family)
+
+	// Set source and destination to same IP.
+	local := remote
 
 	_, authKey, err := decodeIPSecKey("0123456789abcdef0123456789abcdef")
 	require.NoError(t, err)
@@ -163,10 +227,11 @@ func TestUpsertIPSecEquals(t *testing.T) {
 		Crypt: &netlink.XfrmStateAlgo{Name: "cbc(aes)", Key: cryptKey},
 	}
 
-	ipSecKeysGlobal["1.2.3.4"] = key
-	ipSecKeysGlobal[""] = key
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	a.key = key
 
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   remoteNodeID,
@@ -180,37 +245,24 @@ func TestUpsertIPSecEquals(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	ns := netns.NewNetNS(t)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
 
 	// Let's check that state was not added as source and destination are the same
-	result, err := netlink.XfrmStateList(netlink.FAMILY_ALL)
-	require.NoError(t, err)
+	result := tnl.MustXfrmStateList(t, ns, netlink.FAMILY_ALL)
 	require.Empty(t, result)
 
-	err = DeleteXFRM(log, AllReqID)
-	require.NoError(t, err)
-
-	_, aeadKey, err := decodeIPSecKey("44434241343332312423222114131211f4f3f2f1")
-	require.NoError(t, err)
-	key = &ipSecKey{
-		Spi:   1,
-		ReqID: 1,
-		Aead:  &netlink.XfrmStateAlgo{Name: "rfc4106(gcm(aes))", Key: aeadKey, ICVLen: 128},
-		Crypt: nil,
-		Auth:  nil,
-	}
-
-	ipSecKeysGlobal["1.2.3.4"] = key
-	ipSecKeysGlobal[""] = key
-
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
 
 	// Let's check that state was not added as source and destination are the same
-	result, err = netlink.XfrmStateList(netlink.FAMILY_ALL)
-	require.NoError(t, err)
+	result = tnl.MustXfrmStateList(t, ns, netlink.FAMILY_ALL)
 	require.Empty(t, result)
+}
+
+func TestPrivilegedUpsertIPSecEndpointOut(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testUpsertIPSecEndpointOut(t, family)
+	})
 }
 
 // TestUpsertIPSecEndpointOut ensure we insert the correct XFRM policy when
@@ -227,13 +279,8 @@ func TestUpsertIPSecEquals(t *testing.T) {
 //     the well-defined Encryption mark.
 //
 // 2. A state should be created with similar properties as above.
-func TestUpsertIPSecEndpointOut(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
-
-	_, local, err := net.ParseCIDR("1.1.3.4/16")
-	require.NoError(t, err)
-	_, remote, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
+func testUpsertIPSecEndpointOut(t *testing.T, family string) {
+	local, remote := setup(t, family)
 
 	_, authKey, err := decodeIPSecKey("0123456789abcdef0123456789abcdef")
 	require.NoError(t, err)
@@ -246,11 +293,11 @@ func TestUpsertIPSecEndpointOut(t *testing.T) {
 		Crypt: &netlink.XfrmStateAlgo{Name: "cbc(aes)", Key: cryptKey},
 	}
 
-	ipSecKeysGlobal["1.1.3.4"] = key
-	ipSecKeysGlobal["1.2.3.4"] = key
-	ipSecKeysGlobal[""] = key
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	a.key = key
 
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   0xBEEF,
@@ -264,8 +311,8 @@ func TestUpsertIPSecEndpointOut(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	ns := netns.NewNetNS(t)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
 
 	encryptionMark := generateEncryptMark(key.Spi, params.RemoteNodeID)
 
@@ -277,9 +324,9 @@ func TestUpsertIPSecEndpointOut(t *testing.T) {
 		Spi:   int(key.Spi),
 		Mark:  encryptionMark}
 
-	state, err := netlink.XfrmStateGet(getState)
-	require.NoError(t, err)
+	state := tnl.MustXfrmStateGet(t, ns, getState)
 	require.NotNil(t, state)
+
 	require.Nil(t, state.Aead)
 	require.NotNil(t, state.Auth)
 	require.Equal(t, "hmac(sha256)", state.Auth.Name)
@@ -302,14 +349,13 @@ func TestUpsertIPSecEndpointOut(t *testing.T) {
 			Mode:  netlink.XFRM_MODE_TUNNEL,
 		},
 	}
-	policy, err := netlink.XfrmPolicyGet(&netlink.XfrmPolicy{
+	policy := tnl.MustXfrmPolicyGet(t, ns, &netlink.XfrmPolicy{
 		Src:   local,
 		Dst:   remote,
 		Dir:   netlink.XFRM_DIR_OUT,
 		Mark:  generateEncryptMark(key.Spi, params.RemoteNodeID),
 		Tmpls: tmpls,
 	})
-	require.NoError(t, err)
 	require.NotNil(t, policy)
 
 	// ensure XFRM policy is as we want it...
@@ -336,6 +382,12 @@ func TestUpsertIPSecEndpointOut(t *testing.T) {
 	require.Equal(t, netlink.XFRM_MODE_TUNNEL, policyTmpl.Mode)
 }
 
+func TestPrivilegedUpsertIPSecEndpointFwd(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testUpsertIPSecEndpointFwd(t, family)
+	})
+}
+
 // TestUpsertIPSecEndpointFwd ensure we insert the correct XFRM policy when
 // specifying the FWD direction.
 //
@@ -348,11 +400,8 @@ func TestUpsertIPSecEndpointOut(t *testing.T) {
 //   - Template destination is the ESP tunnel IP of the local node forwarding
 //     the traffic.
 //   - A ReqID of 1
-func TestUpsertIPSecEndpointFwd(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
-
-	_, local, err := net.ParseCIDR("1.1.3.4/16")
-	require.NoError(t, err)
+func testUpsertIPSecEndpointFwd(t *testing.T, family string) {
+	local, _ := setup(t, family)
 
 	_, authKey, err := decodeIPSecKey("0123456789abcdef0123456789abcdef")
 	require.NoError(t, err)
@@ -365,11 +414,11 @@ func TestUpsertIPSecEndpointFwd(t *testing.T) {
 		Crypt: &netlink.XfrmStateAlgo{Name: "cbc(aes)", Key: cryptKey},
 	}
 
-	ipSecKeysGlobal["1.1.3.4"] = key
-	ipSecKeysGlobal["1.2.3.4"] = key
-	ipSecKeysGlobal[""] = key
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	a.key = key
 
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   0xBEEF,
@@ -383,8 +432,8 @@ func TestUpsertIPSecEndpointFwd(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	ns := netns.NewNetNS(t)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
 
 	tmpls := []netlink.XfrmPolicyTmpl{
 		{
@@ -396,13 +445,13 @@ func TestUpsertIPSecEndpointFwd(t *testing.T) {
 			Optional: 1,
 		},
 	}
-	policy, err := netlink.XfrmPolicyGet(&netlink.XfrmPolicy{
+
+	policy := tnl.MustXfrmPolicyGet(t, ns, &netlink.XfrmPolicy{
 		Src:   wildcardCIDRv4,
 		Dst:   wildcardCIDRv4,
 		Dir:   netlink.XFRM_DIR_FWD,
 		Tmpls: tmpls,
 	})
-	require.NoError(t, err)
 	require.NotNil(t, policy)
 
 	// ensure XFRM policy is as we want it...
@@ -430,6 +479,12 @@ func TestUpsertIPSecEndpointFwd(t *testing.T) {
 	require.Equal(t, 1, policyTmpl.Optional)
 }
 
+func TestPrivilegedUpsertIPSecEndpointIn(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testUpsertIPSecEndpointIn(t, family)
+	})
+}
+
 // TestUpsertIPSecEndpointIn ensures we insert the correct XFRM state and
 // policy when specifying the IN direction.
 //
@@ -446,13 +501,8 @@ func TestUpsertIPSecEndpointFwd(t *testing.T) {
 //     the exception that the mark match should be the TO_PROXY mark.
 //
 // 2. A state should be created with similar properties as above.
-func TestUpsertIPSecEndpointIn(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
-
-	_, local, err := net.ParseCIDR("1.1.3.4/16")
-	require.NoError(t, err)
-	_, remote, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
+func testUpsertIPSecEndpointIn(t *testing.T, family string) {
+	local, remote := setup(t, family)
 
 	_, authKey, err := decodeIPSecKey("0123456789abcdef0123456789abcdef")
 	require.NoError(t, err)
@@ -465,11 +515,11 @@ func TestUpsertIPSecEndpointIn(t *testing.T) {
 		Crypt: &netlink.XfrmStateAlgo{Name: "cbc(aes)", Key: cryptKey},
 	}
 
-	ipSecKeysGlobal["1.1.3.4"] = key
-	ipSecKeysGlobal["1.2.3.4"] = key
-	ipSecKeysGlobal[""] = key
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	a.key = key
 
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   0xBEEF,
@@ -483,8 +533,8 @@ func TestUpsertIPSecEndpointIn(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	ns := netns.NewNetNS(t)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
 
 	// Confirm state was created with correct marks.
 	getState := &netlink.XfrmState{
@@ -494,9 +544,9 @@ func TestUpsertIPSecEndpointIn(t *testing.T) {
 		Spi:   int(key.Spi),
 		Mark:  generateDecryptMark(linux_defaults.RouteMarkDecrypt, params.RemoteNodeID)}
 
-	state, err := netlink.XfrmStateGet(getState)
-	require.NoError(t, err)
+	state := tnl.MustXfrmStateGet(t, ns, getState)
 	require.NotNil(t, state)
+
 	require.Nil(t, state.Aead)
 	require.NotNil(t, state.Auth)
 	require.Equal(t, "hmac(sha256)", state.Auth.Name)
@@ -518,13 +568,12 @@ func TestUpsertIPSecEndpointIn(t *testing.T) {
 			Mode:  netlink.XFRM_MODE_TUNNEL,
 		},
 	}
-	policy, err := netlink.XfrmPolicyGet(&netlink.XfrmPolicy{
+	policy := tnl.MustXfrmPolicyGet(t, ns, &netlink.XfrmPolicy{
 		Src:   wildcardCIDRv4,
 		Dst:   wildcardCIDRv4,
 		Dir:   netlink.XFRM_DIR_IN,
 		Tmpls: tmpls,
 	})
-	require.NoError(t, err)
 	require.NotNil(t, policy)
 
 	// ensure XFRM policy is as we want it...
@@ -551,15 +600,16 @@ func TestUpsertIPSecEndpointIn(t *testing.T) {
 	require.Equal(t, netlink.XFRM_MODE_TUNNEL, policyTmpl.Mode)
 }
 
-func TestUpsertIPSecKeyMissing(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
+func TestPrivilegedUpsertIPSecKeyMissing(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testUpsertIPSecKeyMissing(t, family)
+	})
+}
 
-	_, local, err := net.ParseCIDR("1.1.3.4/16")
-	require.NoError(t, err)
-	_, remote, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
+func testUpsertIPSecKeyMissing(t *testing.T, family string) {
+	local, remote := setup(t, family)
 
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   remoteNodeID,
@@ -573,17 +623,24 @@ func TestUpsertIPSecKeyMissing(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.ErrorContains(t, err, "unable to replace local state: IPSec key missing")
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	ns := netns.NewNetNS(t)
+	err = ns.Do(func() error {
+		_, err := a.UpsertIPsecEndpoint(params)
+		return err
+	})
+	require.ErrorContains(t, err, "unable to replace local state: global IPsec key missing")
 }
 
-func TestUpdateExistingIPSecEndpoint(t *testing.T) {
-	log := setupIPSecSuitePrivileged(t)
+func TestPrivilegedUpdateExistingIPSecEndpoint(t *testing.T) {
+	testWithFamilies(t, func(t *testing.T, family string) {
+		testUpdateExistingIPSecEndpoint(t, family)
+	})
+}
 
-	_, local, err := net.ParseCIDR("1.1.3.4/16")
-	require.NoError(t, err)
-	_, remote, err := net.ParseCIDR("1.2.3.4/16")
-	require.NoError(t, err)
+func testUpdateExistingIPSecEndpoint(t *testing.T, family string) {
+	local, remote := setup(t, family)
 
 	_, authKey, err := decodeIPSecKey("0123456789abcdef0123456789abcdef")
 	require.NoError(t, err)
@@ -596,11 +653,11 @@ func TestUpdateExistingIPSecEndpoint(t *testing.T) {
 		Crypt: &netlink.XfrmStateAlgo{Name: "cbc(aes)", Key: cryptKey},
 	}
 
-	ipSecKeysGlobal["1.1.3.4"] = key
-	ipSecKeysGlobal["1.2.3.4"] = key
-	ipSecKeysGlobal[""] = key
+	a, err := NewTestIPsecAgent(t, nil)
+	require.NoError(t, err)
+	a.key = key
 
-	params := &IPSecParameters{
+	params := &types.Parameters{
 		LocalBootID:    localBootID,
 		RemoteBootID:   remoteBootID,
 		RemoteNodeID:   0xBEEF,
@@ -614,10 +671,49 @@ func TestUpdateExistingIPSecEndpoint(t *testing.T) {
 		ReqID:          DefaultReqID,
 	}
 
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	ns := netns.NewNetNS(t)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
 
 	// test updateExisting (xfrm delete + add)
-	_, err = UpsertIPsecEndpoint(log, params)
-	require.NoError(t, err)
+	mustUpsertIPSecEndpoint(t, ns, a, params)
+}
+
+func TestGetDirFromXfrmMark(t *testing.T) {
+	tests := []struct {
+		name string
+		mark *netlink.XfrmMark
+		want dir
+	}{
+		{
+			name: "Should return ingress for decrypt mark",
+			mark: &netlink.XfrmMark{
+				Value: 0xcb200d00,
+			},
+			want: dirIngress,
+		},
+		{
+			name: "Should return egress for encrypt mark",
+			mark: &netlink.XfrmMark{
+				Value: 0xcb200e00,
+			},
+			want: dirEgress,
+		},
+		{
+			name: "Should return unspec for nil mark",
+			mark: nil,
+			want: dirUnspec,
+		},
+		{
+			name: "Should return unspec for invalid mark",
+			mark: &netlink.XfrmMark{
+				Value: 0xcb200a1b,
+			},
+			want: dirUnspec,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, getDirFromXfrmMark(tt.mark))
+		})
+	}
 }

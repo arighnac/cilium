@@ -4,19 +4,25 @@
 package testpolicy
 
 import (
-	"github.com/cilium/cilium/pkg/container/versioned"
+	"log/slog"
+
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy/types"
 )
 
 type DummySelectorCacheUser struct{}
 
-func (d *DummySelectorCacheUser) IdentitySelectionUpdated(selector types.CachedSelector, added, deleted []identity.NumericIdentity) {
+func (d *DummySelectorCacheUser) IdentitySelectionUpdated(logger *slog.Logger, selector types.CachedSelector, added, deleted []identity.NumericIdentity) {
 }
 
-func (d *DummySelectorCacheUser) IdentitySelectionCommit(*versioned.Tx) {
+func (d *DummySelectorCacheUser) IdentitySelectionCommit(logger *slog.Logger, txn types.SelectorSnapshot) {
 }
 
 func (d *DummySelectorCacheUser) IsPeerSelector() bool {
 	return true
+}
+
+func (d *DummySelectorCacheUser) GetRuleLabels(cs types.CachedSelector) labels.LabelArrayList {
+	return nil
 }

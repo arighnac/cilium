@@ -11,6 +11,8 @@ import (
 	"github.com/cilium/workerpool"
 
 	"github.com/cilium/cilium/operator/auth/identity"
+	"github.com/cilium/cilium/operator/auth/spire"
+	ztunnel "github.com/cilium/cilium/operator/pkg/ztunnel/config"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -26,7 +28,8 @@ type params struct {
 	IdentityClient identity.Provider
 	Identity       resource.Resource[*ciliumv2.CiliumIdentity]
 
-	Cfg Config
+	Cfg           spire.MutualAuthConfig
+	ZtunnelConfig ztunnel.Config
 }
 
 // IdentityWatcher represents the Cilium identities watcher.
@@ -37,11 +40,11 @@ type IdentityWatcher struct {
 	identityClient identity.Provider
 	identity       resource.Resource[*ciliumv2.CiliumIdentity]
 	wg             *workerpool.WorkerPool
-	cfg            Config
+	cfg            spire.MutualAuthConfig
 }
 
 func registerIdentityWatcher(p params) {
-	if !p.Cfg.Enabled {
+	if !p.Cfg.Enabled || p.ZtunnelConfig.EnableZTunnel {
 		return
 	}
 	iw := &IdentityWatcher{
@@ -69,10 +72,16 @@ func (iw *IdentityWatcher) run(ctx context.Context) error {
 		switch e.Kind {
 		case resource.Upsert:
 			err = iw.identityClient.Upsert(ctx, e.Object.GetName())
-			iw.logger.Info("Upsert identity", "identity", e.Object.GetName(), logfields.Error, err)
+			iw.logger.InfoContext(ctx,
+				"Upsert identity",
+				logfields.Identity, e.Object.GetName(),
+				logfields.Error, err)
 		case resource.Delete:
 			err = iw.identityClient.Delete(ctx, e.Object.GetName())
-			iw.logger.Info("Delete identity", "identity", e.Object.GetName(), logfields.Error, err)
+			iw.logger.InfoContext(ctx,
+				"Delete identity",
+				logfields.Identity, e.Object.GetName(),
+				logfields.Error, err)
 		}
 		e.Done(err)
 	}

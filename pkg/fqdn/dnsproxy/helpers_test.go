@@ -9,8 +9,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/container/versioned"
-	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/fqdn/dns"
 	"github.com/cilium/cilium/pkg/fqdn/re"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
@@ -18,11 +16,11 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 func TestSetPortRulesForID(t *testing.T) {
-	re.InitRegexCompileLRU(1)
 	rules := policy.L7DataMap{}
 	epID := uint64(1)
 	pea := perEPAllow{}
@@ -30,6 +28,7 @@ func TestSetPortRulesForID(t *testing.T) {
 	udpProtoPort8053 := restore.MakeV2PortProto(8053, u8proto.UDP)
 
 	rules[new(MockCachedSelector)] = &policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{
 			DNS: []api.PortRuleDNS{
 				{MatchName: "cilium.io."},
@@ -44,6 +43,7 @@ func TestSetPortRulesForID(t *testing.T) {
 
 	selector2 := new(MockCachedSelector)
 	rules[selector2] = &policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{
 			DNS: []api.PortRuleDNS{
 				{MatchName: "cilium2.io."},
@@ -67,6 +67,7 @@ func TestSetPortRulesForID(t *testing.T) {
 	require.Empty(t, cache)
 
 	rules[selector2] = &policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{
 			DNS: []api.PortRuleDNS{
 				{MatchName: "cilium2.io."},
@@ -83,7 +84,6 @@ func TestSetPortRulesForID(t *testing.T) {
 }
 
 func TestSetPortRulesForIDFromUnifiedFormat(t *testing.T) {
-	re.InitRegexCompileLRU(1)
 	rules := make(CachedSelectorREEntry)
 	epID := uint64(1)
 	pea := perEPAllow{}
@@ -117,6 +117,7 @@ func TestSetPortRulesForIDFromUnifiedFormat(t *testing.T) {
 
 func TestGeneratePattern(t *testing.T) {
 	l7 := &policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{DNS: []api.PortRuleDNS{
 			{MatchName: "example.name."},
 			{MatchName: "example.com."},
@@ -129,7 +130,6 @@ func TestGeneratePattern(t *testing.T) {
 	matching := []string{"example.name.", "example.com.", "demo.io.", "demoo.tld.", "testpattern.com.", "pattern.com.", "a.b.cmiddle.io."}
 	notMatching := []string{"eexample.name.", "eexample.com.", "vdemo.io.", "demo.ioo.", "emoo.tld.", "test.ppattern.com.", "b.cmiddle.io."}
 
-	re.InitRegexCompileLRU(defaults.FQDNRegexCompileLRUSize)
 	pattern := GeneratePattern(l7)
 
 	regex, err := re.CompileRegex(pattern)
@@ -144,6 +144,7 @@ func TestGeneratePattern(t *testing.T) {
 
 	pattern = GeneratePattern(
 		&policy.PerSelectorPolicy{
+			Verdict: types.Allow,
 			L7Rules: api.L7Rules{DNS: []api.PortRuleDNS{
 				{MatchPattern: "domo.io."},
 				{MatchPattern: "*"},
@@ -159,6 +160,7 @@ func TestGeneratePattern(t *testing.T) {
 	}
 
 	pattern = GeneratePattern(&policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{},
 	})
 
@@ -171,6 +173,7 @@ func TestGeneratePattern(t *testing.T) {
 	}
 
 	pattern = GeneratePattern(&policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{DNS: []api.PortRuleDNS{}},
 	})
 	regex, err = re.CompileRegex(pattern)
@@ -187,6 +190,7 @@ func TestGeneratePatternTrailingDot(t *testing.T) {
 	dnsPattern := "*.example.name"
 	generatePattern := func(name, pattern string) string {
 		l7 := &policy.PerSelectorPolicy{
+			Verdict: types.Allow,
 			L7Rules: api.L7Rules{DNS: []api.PortRuleDNS{
 				{MatchName: name},
 				{MatchPattern: pattern},
@@ -195,7 +199,7 @@ func TestGeneratePatternTrailingDot(t *testing.T) {
 		return GeneratePattern(l7)
 
 	}
-	require.EqualValues(t, generatePattern(dns.FQDN(dnsPattern), dns.FQDN(dnsName)), generatePattern(dnsPattern, dnsName))
+	require.Equal(t, generatePattern(dns.FQDN(dnsPattern), dns.FQDN(dnsName)), generatePattern(dnsPattern, dnsName))
 
 }
 
@@ -203,15 +207,19 @@ type MockCachedSelector struct {
 	key string
 }
 
-func (m MockCachedSelector) GetSelections(*versioned.VersionHandle) identity.NumericIdentitySlice {
+func (m MockCachedSelector) GetSelections() identity.NumericIdentitySlice {
 	return nil
 }
 
-func (m MockCachedSelector) GetMetadataLabels() labels.LabelArray {
+func (m MockCachedSelector) GetSelectionsAt(types.SelectorSnapshot) identity.NumericIdentitySlice {
+	return nil
+}
+
+func (m MockCachedSelector) GetMetadataLabels() labels.LabelArrayList {
 	panic("implement me")
 }
 
-func (m MockCachedSelector) Selects(*versioned.VersionHandle, identity.NumericIdentity) bool {
+func (m MockCachedSelector) Selects(identity.NumericIdentity) bool {
 	return false
 }
 

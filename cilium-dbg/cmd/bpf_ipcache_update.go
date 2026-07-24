@@ -5,7 +5,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
 	"os"
 
@@ -13,7 +12,6 @@ import (
 
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/maps/ipcache"
-	"github.com/cilium/cilium/pkg/types"
 )
 
 func init() {
@@ -46,14 +44,10 @@ var bpfIPCacheUpdateCmd = &cobra.Command{
 		if err != nil {
 			Usagef(cmd, "Invalid tunnel endpoint. "+usage)
 		}
-		tunnelEndpoint := net.ParseIP(tunnelEndpointString)
-		if tunnelEndpoint == nil {
+		tunnelEndpoint, err := netip.ParseAddr(tunnelEndpointString)
+		if err != nil {
 			Usagef(cmd, "Invalid tunnel endpoint. "+usage)
 		}
-		if tunnelEndpoint.To4() == nil {
-			Usagef(cmd, "Invalid tunnel endpoint, must be an IPv4. "+usage)
-		}
-		tunnelEndpoint = tunnelEndpoint.To4()
 
 		identity, err := cmd.Flags().GetUint32("identity")
 		if err != nil {
@@ -78,16 +72,9 @@ var bpfIPCacheUpdateCmd = &cobra.Command{
 			Usagef(cmd, "Invalid cluster ID. "+usage)
 		}
 
-		ip := net.IP(prefix.Addr().AsSlice())
-		mask := net.CIDRMask(prefix.Bits(), 32)
-		key := ipcache.NewKey(ip, mask, clusterID)
-		value := ipcache.RemoteEndpointInfo{
-			SecurityIdentity: identity,
-			TunnelEndpoint:   types.IPv4(tunnelEndpoint),
-			Key:              encryptKey,
-			Flags:            flags,
-		}
-		if err := ipcache.IPCacheMap().Update(&key, &value); err != nil {
+		key := ipcache.NewKey(prefix, clusterID)
+		value := ipcache.NewValue(identity, tunnelEndpoint, encryptKey, flags)
+		if err := ipcache.IPCacheMap(nil).Update(&key, &value); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating entry %s: %v\n", key, err)
 			os.Exit(1)
 		}

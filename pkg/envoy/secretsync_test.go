@@ -6,11 +6,9 @@ package envoy
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 
-	cilium "github.com/cilium/proxy/go/cilium/api"
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -21,10 +19,11 @@ import (
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy/endpoint"
+	"github.com/cilium/cilium/pkg/revert"
 )
 
 func Test_k8sSecretToEnvoySecretTlsCertificate(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -42,7 +41,7 @@ func Test_k8sSecretToEnvoySecretTlsCertificate(t *testing.T) {
 }
 
 func Test_k8sSecretToEnvoySecretValidationContext(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -65,7 +64,7 @@ func testSessionKey(i byte) []byte {
 }
 
 func Test_k8sSecretToEnvoySecretTlsSessionKeys(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -94,7 +93,7 @@ func Test_k8sSecretToEnvoySecretTlsSessionKeys(t *testing.T) {
 }
 
 func Test_k8sSecretToEnvoySecretTlsSessionKeys_FirstKeyMandatory(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -112,7 +111,7 @@ func Test_k8sSecretToEnvoySecretTlsSessionKeys_FirstKeyMandatory(t *testing.T) {
 }
 
 func Test_k8sSecretToEnvoySecretTlsSessionKeys_Max10Keys(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -153,7 +152,7 @@ func Test_k8sSecretToEnvoySecretTlsSessionKeys_Max10Keys(t *testing.T) {
 }
 
 func Test_k8sSecretToEnvoySecretTlsSessionKeys_SkipAdditionalKeysOnMainKeySizeIssue(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -177,7 +176,7 @@ func Test_k8sSecretToEnvoySecretTlsSessionKeys_SkipAdditionalKeysOnMainKeySizeIs
 }
 
 func Test_k8sSecretToEnvoySecretTlsSessionKeys_SkipAdditionalKeyOnSizeIssue(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -216,7 +215,7 @@ func Test_k8sSecretToEnvoySecretTlsSessionKeys_SkipAdditionalKeyOnSizeIssue(t *t
 }
 
 func Test_k8sSecretToEnvoySecretGeneric(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -235,7 +234,7 @@ func Test_k8sSecretToEnvoySecretGeneric(t *testing.T) {
 }
 
 func Test_k8sSecretToEnvoySecretOtherValue(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -254,7 +253,7 @@ func Test_k8sSecretToEnvoySecretOtherValue(t *testing.T) {
 }
 
 func Test_k8sSecretToEnvoySecretOtherMultiValues(t *testing.T) {
-	envoySecret := k8sToEnvoySecret(&slim_corev1.Secret{
+	envoySecret := testSecretSyncer(t).k8sToEnvoySecret(&slim_corev1.Secret{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "dummy-secret",
 			Namespace: "dummy-namespace",
@@ -342,14 +341,11 @@ func TestHandleSecretEvent(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			logger := logrus.New()
-			logger.SetOutput(io.Discard)
-
 			xdsServer := &fakeXdsServer{
 				returnError: tc.xdsShouldReturnError,
 			}
 
-			syncer := newSecretSyncer(logger, xdsServer)
+			syncer := newSecretSyncer(hivetest.Logger(t), xdsServer)
 
 			doneCalled := false
 			var doneError error
@@ -412,7 +408,7 @@ func (r *fakeXdsServer) Reset() {
 	r.nrOfDeletions = 0
 }
 
-func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old Resources, new Resources) error {
+func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old xds.Resources, new xds.Resources, wg *completion.WaitGroup) error {
 	if r.returnError {
 		return errors.New("failed to update envoy resources")
 	}
@@ -421,7 +417,7 @@ func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old Resources,
 	return nil
 }
 
-func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources Resources) error {
+func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources xds.Resources, wg *completion.WaitGroup) error {
 	if r.returnError {
 		return errors.New("failed to delete envoy resources")
 	}
@@ -430,7 +426,7 @@ func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources Reso
 	return nil
 }
 
-func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources Resources) error {
+func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources xds.Resources, wg *completion.WaitGroup) error {
 	if r.returnError {
 		return errors.New("failed to upsert envoy resources")
 	}
@@ -439,19 +435,15 @@ func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources Reso
 	return nil
 }
 
-func (*fakeXdsServer) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
+func (*fakeXdsServer) AddListener(ctx context.Context, name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) AddAdminListener(port uint16, wg *completion.WaitGroup) {
+func (*fakeXdsServer) AddAdminListener(ctx context.Context, port uint16, wg *completion.WaitGroup) {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) AddMetricsListener(port uint16, wg *completion.WaitGroup) {
-	panic("unimplemented")
-}
-
-func (*fakeXdsServer) GetNetworkPolicies(resourceNames []string) (map[string]*cilium.NetworkPolicy, error) {
+func (*fakeXdsServer) AddMetricsListener(ctx context.Context, port uint16, wg *completion.WaitGroup) {
 	panic("unimplemented")
 }
 
@@ -459,19 +451,15 @@ func (*fakeXdsServer) RemoveAllNetworkPolicies() {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) RemoveListener(name string, wg *completion.WaitGroup) xds.AckingResourceMutatorRevertFunc {
+func (*fakeXdsServer) RemoveListener(ctx context.Context, name string, wg *completion.WaitGroup) xds.AckingResourceMutatorRevertFunc {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) RemoveNetworkPolicy(ep endpoint.EndpointInfoSource) {
+func (*fakeXdsServer) RemoveNetworkPolicy(ctx context.Context, ep endpoint.EndpointInfoSource) {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) UpdateNetworkPolicy(ep endpoint.EndpointUpdater, policy *policy.L4Policy, ingressPolicyEnforced bool, egressPolicyEnforced bool, wg *completion.WaitGroup) (error, func() error) {
-	panic("unimplemented")
-}
-
-func (*fakeXdsServer) UseCurrentNetworkPolicy(ep endpoint.EndpointUpdater, policy *policy.L4Policy, wg *completion.WaitGroup) {
+func (*fakeXdsServer) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc) {
 	panic("unimplemented")
 }
 
@@ -481,4 +469,8 @@ func (*fakeXdsServer) GetPolicySecretSyncNamespace() string {
 
 func (*fakeXdsServer) SetPolicySecretSyncNamespace(string) {
 	panic("unimplemented")
+}
+
+func testSecretSyncer(t *testing.T) *secretSyncer {
+	return &secretSyncer{logger: hivetest.Logger(t)}
 }

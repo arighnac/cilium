@@ -4,6 +4,7 @@
 package ip
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -22,41 +23,92 @@ func TestIPToNetPrefix(t *testing.T) {
 	assert.Equal(t, netip.Prefix{}, IPToNetPrefix(nil))
 }
 
-func mustParseCIDR(t *testing.T, s string) *net.IPNet {
-	_, n, err := net.ParseCIDR(s)
-	assert.NoError(t, err)
-	return n
-}
-
-func TestNetsContainsAny(t *testing.T) {
+func TestPrefixesContains(t *testing.T) {
 	tests := []struct {
-		name string
-		a    []*net.IPNet
-		b    []*net.IPNet
-		ret  bool
+		prefixes []netip.Prefix
+		addr     netip.Addr
+		ret      bool
 	}{
 		{
-			name: "a contains b",
-			a:    []*net.IPNet{mustParseCIDR(t, "0.0.0.0/0")},
-			b:    []*net.IPNet{mustParseCIDR(t, "192.0.0.1/32")},
-			ret:  true,
+			prefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			addr:     netip.MustParseAddr("192.0.0.1"),
+			ret:      true,
 		},
 		{
-			name: "b contains a",
-			a:    []*net.IPNet{mustParseCIDR(t, "192.0.0.1/32")},
-			b:    []*net.IPNet{mustParseCIDR(t, "0.0.0.0/0")},
+			prefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			addr:     netip.MustParseAddr("192.0.0.1"),
+			ret:      true,
 		},
 		{
-			name: "a equals b",
-			a:    []*net.IPNet{mustParseCIDR(t, "192.0.0.1/32")},
-			b:    []*net.IPNet{mustParseCIDR(t, "192.0.0.1/32")},
-			ret:  true,
+			prefixes: []netip.Prefix{netip.MustParsePrefix("192.0.0.1/32"), netip.MustParsePrefix("f00d::/118")},
+			addr:     netip.MustParseAddr("f00d::1"),
+			ret:      true,
+		},
+		{
+			prefixes: []netip.Prefix{netip.MustParsePrefix("192.0.0.1/32")},
+			addr:     netip.MustParseAddr("0.0.0.0"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("contains(%v, %s)", tt.prefixes, tt.addr), func(t *testing.T) {
+			assert.Equal(t, tt.ret, PrefixesContains(tt.prefixes, tt.addr))
+		})
+	}
+}
+
+func TestLaminarCIDRsOverlap(t *testing.T) {
+	tests := []struct {
+		name string
+		c1   string
+		c2   string
+		want bool
+	}{
+		{
+			name: "c1 is a subnet of c2",
+			c1:   "192.168.64.0/19",
+			c2:   "192.168.0.0/16",
+			want: true,
+		},
+		{
+			name: "c1 is a supernet of c2",
+			c1:   "10.0.0.0/8",
+			c2:   "10.0.0.0/16",
+			want: true,
+		},
+		{
+			name: "c1 equals c2",
+			c1:   "10.0.0.0/16",
+			c2:   "10.0.0.0/16",
+			want: true,
+		},
+		{
+			name: "disjoint and far apart",
+			c1:   "10.0.0.0/8",
+			c2:   "192.168.0.0/16",
+			want: false,
+		},
+		{
+			name: "same-size adjacent siblings",
+			c1:   "192.168.0.0/17",
+			c2:   "192.168.128.0/17",
+			want: false,
+		},
+		{
+			name: "same-size and non-adjacent",
+			c1:   "192.168.0.0/19",
+			c2:   "192.168.96.0/19",
+			want: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.ret, NetsContainsAny(tt.a, tt.b))
+			c1 := netip.MustParsePrefix(tt.c1).Masked()
+			c2 := netip.MustParsePrefix(tt.c2).Masked()
+			// The check must be symmetric.
+			assert.Equal(t, tt.want, LaminarCIDRsOverlap(c1, c2))
+			assert.Equal(t, tt.want, LaminarCIDRsOverlap(c2, c1))
 		})
 	}
 }

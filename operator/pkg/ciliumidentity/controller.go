@@ -24,6 +24,7 @@ import (
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 const (
@@ -60,6 +61,7 @@ type params struct {
 	CiliumIdentity      resource.Resource[*cilium_api_v2.CiliumIdentity]
 	CiliumEndpoint      resource.Resource[*cilium_api_v2.CiliumEndpoint]
 	CiliumEndpointSlice resource.Resource[*v2alpha1.CiliumEndpointSlice]
+	MetricsProvider     workqueue.MetricsProvider
 }
 
 type Controller struct {
@@ -78,7 +80,7 @@ type Controller struct {
 	// requests going to api-server. Ensures a single resource key will not be
 	// processed multiple times concurrently, and if a resource key is added
 	// multiple times before it can be processed, this will only be processed once.
-	resourceQueue workqueue.RateLimitingInterface
+	resourceQueue workqueue.TypedRateLimitingInterface[QueuedItem]
 
 	cesEnabled bool
 
@@ -87,30 +89,38 @@ type Controller struct {
 	oldNSSecurityLabels map[string]labels.Labels
 
 	enqueueTimeTracker *EnqueueTimeTracker
+
+	workqueueMetricsProvider workqueue.MetricsProvider
 }
 
 func registerController(p params) {
+	isOperatorManageCIDsEnabled := cmp.Or(
+		p.Config.IdentityManagementMode == option.IdentityManagementModeOperator,
+		p.Config.IdentityManagementMode == option.IdentityManagementModeBoth,
+	)
+
 	if cmp.Or(
 		!p.Clientset.IsEnabled(),
-		!p.Config.EnableOperatorManageCIDs,
+		!isOperatorManageCIDsEnabled,
 		p.SharedCfg.DisableNetworkPolicy,
 	) {
 		return
 	}
 
 	cidController := &Controller{
-		logger:              p.Logger,
-		clientset:           p.Clientset,
-		namespace:           p.Namespace,
-		pod:                 p.Pod,
-		jobGroup:            p.JobGroup,
-		metrics:             p.Metrics,
-		ciliumIdentity:      p.CiliumIdentity,
-		ciliumEndpoint:      p.CiliumEndpoint,
-		ciliumEndpointSlice: p.CiliumEndpointSlice,
-		oldNSSecurityLabels: make(map[string]labels.Labels),
-		cesEnabled:          p.SharedCfg.EnableCiliumEndpointSlice,
-		enqueueTimeTracker:  &EnqueueTimeTracker{clock: clock.RealClock{}, enqueuedAt: make(map[string]time.Time)},
+		logger:                   p.Logger,
+		clientset:                p.Clientset,
+		namespace:                p.Namespace,
+		pod:                      p.Pod,
+		jobGroup:                 p.JobGroup,
+		metrics:                  p.Metrics,
+		ciliumIdentity:           p.CiliumIdentity,
+		ciliumEndpoint:           p.CiliumEndpoint,
+		ciliumEndpointSlice:      p.CiliumEndpointSlice,
+		oldNSSecurityLabels:      make(map[string]labels.Labels),
+		cesEnabled:               p.SharedCfg.EnableCiliumEndpointSlice,
+		enqueueTimeTracker:       &EnqueueTimeTracker{clock: clock.RealClock{}, enqueuedAt: make(map[string]time.Time)},
+		workqueueMetricsProvider: p.MetricsProvider,
 	}
 
 	cidController.initializeQueues()
@@ -118,8 +128,9 @@ func registerController(p params) {
 	p.Lifecycle.Append(cidController)
 }
 
-func (c *Controller) Start(_ cell.HookContext) error {
-	c.logger.Info("Starting CID controller Operator")
+func (c *Controller) Start(ctx cell.HookContext) error {
+	c.logger.InfoContext(ctx, "Starting CID controller Operator",
+		logfields.CESFeatureEnabled, c.cesEnabled)
 	defer utilruntime.HandleCrash()
 
 	// The Cilium Identity (CID) controller running in cilium-operator is
@@ -149,8 +160,6 @@ func (c *Controller) Start(_ cell.HookContext) error {
 }
 
 func (c *Controller) Stop(_ cell.HookContext) error {
-	c.resourceQueue.ShutDown()
-
 	return nil
 }
 
@@ -160,9 +169,12 @@ func (c *Controller) initializeQueues() {
 		logfields.WorkQueueSyncBackOff, defaultSyncBackOff,
 		logfields.WorkQueueMaxSyncBackOff, maxSyncBackOff)
 
-	c.resourceQueue = workqueue.NewRateLimitingQueueWithConfig(
-		workqueue.NewItemExponentialFailureRateLimiter(defaultSyncBackOff, maxSyncBackOff),
-		workqueue.RateLimitingQueueConfig{Name: "ciliumidentity_resource"})
+	c.resourceQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[QueuedItem](defaultSyncBackOff, maxSyncBackOff),
+		workqueue.TypedRateLimitingQueueConfig[QueuedItem]{
+			Name:            "ciliumidentity_resource",
+			MetricsProvider: c.workqueueMetricsProvider,
+		})
 }
 
 // startEventProcessing starts the event processing loop for the Controller.
@@ -208,17 +220,22 @@ func (c *Controller) initReconciler(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("cid reconciler failed to init: %w", err)
 	}
-	c.logger.Info("Starting CID controller reconciler")
+	c.logger.InfoContext(ctx, "Starting CID controller reconciler")
 	return nil
 }
 
-func (c *Controller) runResourceWorker(context context.Context) error {
-	c.logger.Info("Starting resource worker")
-	defer c.logger.Info("Stopping resource worker")
+func (c *Controller) runResourceWorker(ctx context.Context) error {
+	c.logger.InfoContext(ctx, "Starting resource worker")
+	defer c.logger.InfoContext(ctx, "Stopping resource worker")
+
+	go func() {
+		<-ctx.Done()
+		c.resourceQueue.ShutDown()
+	}()
 
 	for c.processNextItem() {
 		select {
-		case <-context.Done():
+		case <-ctx.Done():
 			return nil
 		default:
 		}
@@ -237,32 +254,40 @@ func (c *Controller) processNextItem() bool {
 	if quit {
 		return false
 	}
-	qItem := item.(QueuedItem)
 	defer c.resourceQueue.Done(item)
 	processingStartTime := time.Now()
-	enqueueTime, exists := c.enqueueTimeTracker.GetAndReset(qItem.Key().String())
+	enqueueTime, exists := c.enqueueTimeTracker.GetAndReset(item.Key().String())
 
-	err := qItem.Reconcile(c.reconciler)
+	err := item.Reconcile(c.reconciler)
 	if err != nil {
 		retries := c.resourceQueue.NumRequeues(item)
-		c.logger.Warn("Failed to process resource item", logfields.Key, qItem.Key().String(), "retries", retries, "maxRetries", maxProcessRetries, logfields.Error, err)
+		c.logger.Warn("Failed to process resource item",
+			logfields.Key, item.Key(),
+			logfields.Retries, retries,
+			logfields.MaxRetries, maxProcessRetries,
+			logfields.Error, err,
+		)
 
 		if retries < maxProcessRetries {
-			c.enqueueTimeTracker.Track(qItem.Key().String())
+			c.enqueueTimeTracker.Track(item.Key().String())
 			c.resourceQueue.AddRateLimited(item)
 			return true
 		}
 
 		// Drop the pod from queue, exceeded max retries
-		c.logger.Error("Dropping item from resource queue, exceeded maxRetries", logfields.Key, qItem.Key().String(), "maxRetries", maxProcessRetries, logfields.Error, err)
+		c.logger.Error("Dropping item from resource queue, exceeded maxRetries",
+			logfields.Key, item.Key(),
+			logfields.MaxRetries, maxProcessRetries,
+			logfields.Error, err,
+		)
 	}
 
 	if exists {
 		enqueuedLatency := processingStartTime.Sub(enqueueTime).Seconds()
 		processingLatency := time.Since(processingStartTime).Seconds()
-		qItem.Meter(enqueuedLatency, processingLatency, err != nil, c.metrics)
+		item.Meter(enqueuedLatency, processingLatency, err != nil, c.metrics)
 	} else {
-		c.logger.Warn("Enqueue time not found for queue item", logfields.Key, qItem.Key().String())
+		c.logger.Warn("Enqueue time not found for queue item", logfields.Key, item.Key)
 	}
 
 	c.resourceQueue.Forget(item)

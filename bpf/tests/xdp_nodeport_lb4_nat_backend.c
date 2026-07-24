@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/xdp.h>
+#include "common.h"
 #include "pktgen.h"
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
 #define ENABLE_NODEPORT_ACCELERATION
-
-#define DISABLE_LOOPBACK_LB
-
-/* Skip ingress policy checks */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -28,7 +22,9 @@
 #define BACKEND_IP		v4_pod_one
 #define BACKEND_PORT		__bpf_htons(8080)
 
-#include <bpf_xdp.c>
+#include "lib/bpf_xdp.h"
+
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
@@ -36,19 +32,6 @@
 
 static volatile const __u8 *client_mac = mac_one;
 static volatile const __u8 *lb_mac = mac_two;
-
-#define FROM_XDP	0
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(max_entries, 1);
-	__array(values, int());
-} entry_call_map __section(".maps") = {
-	.values = {
-		[FROM_XDP] = &cil_xdp_entry,
-	},
-};
 
 /* Test that a remote LB
  * - doesn't touch a NATed request,
@@ -84,7 +67,7 @@ int nodeport_nat_backend_pktgen(struct __ctx_buff *ctx)
 SETUP("xdp", "xdp_nodeport_nat_backend")
 int nodeport_nat_backend_setup(struct __ctx_buff *ctx)
 {
-	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, 1, 1);
+	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP, 1, 1);
 	lb_v4_add_backend(FRONTEND_IP, FRONTEND_PORT, 1, 124,
 			  BACKEND_IP, BACKEND_PORT, IPPROTO_TCP, 0);
 
@@ -93,10 +76,7 @@ int nodeport_nat_backend_setup(struct __ctx_buff *ctx)
 
 	ipcache_v4_add_entry(BACKEND_IP, 0, 112233, 0, 0);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_XDP);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return xdp_receive_packet(ctx);
 }
 
 CHECK("xdp", "xdp_nodeport_nat_backend")
@@ -110,6 +90,8 @@ int nodeport_nat_backend_check(__maybe_unused const struct __ctx_buff *ctx)
 	__u32 *meta;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -158,8 +140,8 @@ int nodeport_nat_backend_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x3c62))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x9c02))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_ntohs(0x9c02));
 
 	test_finish();
 }

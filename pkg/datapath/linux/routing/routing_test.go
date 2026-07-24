@@ -8,11 +8,13 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/node"
@@ -25,12 +27,12 @@ func setupLinuxRoutingSuite(tb testing.TB) {
 	testutils.PrivilegedTest(tb)
 }
 
-func TestConfigure(t *testing.T) {
+func TestPrivilegedConfigure(t *testing.T) {
 	setupLinuxRoutingSuite(t)
 
 	ns1 := netns.NewNetNS(t)
 	ns1.Do(func() error {
-		ip, ri := getFakes(t, true, false)
+		ip, ri := getFakes(t, ipamOption.IPAMENI, true, false)
 		masterMAC := ri.MasterIfMAC
 		ifaceCleanup := createDummyDevice(t, masterMAC)
 		defer ifaceCleanup()
@@ -41,7 +43,7 @@ func TestConfigure(t *testing.T) {
 
 	ns2 := netns.NewNetNS(t)
 	ns2.Do(func() error {
-		ip, ri := getFakes(t, false, false)
+		ip, ri := getFakes(t, ipamOption.IPAMAzure, false, false)
 		masterMAC := ri.MasterIfMAC
 		ifaceCleanup := createDummyDevice(t, masterMAC)
 		defer ifaceCleanup()
@@ -51,12 +53,27 @@ func TestConfigure(t *testing.T) {
 	})
 }
 
-func TestConfigureZeros(t *testing.T) {
+func TestPrivilegedConfigureAzureMasquerade(t *testing.T) {
+	setupLinuxRoutingSuite(t)
+
+	ns := netns.NewNetNS(t)
+	ns.Do(func() error {
+		ip, ri := getFakes(t, ipamOption.IPAMAzure, true, false)
+		masterMAC := ri.MasterIfMAC
+		ifaceCleanup := createDummyDevice(t, masterMAC)
+		defer ifaceCleanup()
+
+		runConfigureThenDelete(t, ri, ip, 1500)
+		return nil
+	})
+}
+
+func TestPrivilegedConfigureZeros(t *testing.T) {
 	setupLinuxRoutingSuite(t)
 
 	ns1 := netns.NewNetNS(t)
 	ns1.Do(func() error {
-		ip, ri := getFakes(t, true, true)
+		ip, ri := getFakes(t, ipamOption.IPAMENI, true, true)
 		masterMAC := ri.MasterIfMAC
 		ifaceCleanup := createDummyDevice(t, masterMAC)
 		defer ifaceCleanup()
@@ -66,29 +83,28 @@ func TestConfigureZeros(t *testing.T) {
 	})
 }
 
-func TestConfigureRouteWithIncompatibleIP(t *testing.T) {
+func TestPrivilegedConfigureRouteWithIncompatibleIP(t *testing.T) {
 	setupLinuxRoutingSuite(t)
 
-	_, ri := getFakes(t, true, false)
-	ipv6 := netip.MustParseAddr("fd00::2").AsSlice()
-	err := ri.Configure(ipv6, 1500, false, false)
+	_, ri := getFakes(t, ipamOption.IPAMENI, true, false)
+	err := ri.Configure(netip.Addr{}, 1500, false)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "IP not compatible")
 }
 
-func TestDeleteRouteWithIncompatibleIP(t *testing.T) {
+func TestPrivilegedDeleteRouteWithIncompatibleIP(t *testing.T) {
 	setupLinuxRoutingSuite(t)
 
-	ipv6 := netip.MustParseAddr("fd00::2")
-	err := Delete(ipv6, false)
+	ip := netip.Addr{}
+	err := Delete(hivetest.Logger(t), ip)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "IP not compatible")
 }
 
-func TestDelete(t *testing.T) {
+func TestPrivilegedDelete(t *testing.T) {
 	setupLinuxRoutingSuite(t)
 
-	fakeIP, fakeRoutingInfo := getFakes(t, true, false)
+	fakeIP, fakeRoutingInfo := getFakes(t, ipamOption.IPAMENI, true, false)
 	masterMAC := fakeRoutingInfo.MasterIfMAC
 
 	tests := []struct {
@@ -97,7 +113,7 @@ func TestDelete(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid IP addr matching rules",
+			name: "valid IP addr matching a single rule",
 			preRun: func() netip.Addr {
 				runConfigure(t, fakeRoutingInfo, fakeIP, 1500)
 				return fakeIP
@@ -105,7 +121,7 @@ func TestDelete(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "IP addr doesn't match rules",
+			name: "IP addr doesn't match any rule",
 			preRun: func() netip.Addr {
 				ip := netip.MustParseAddr("192.168.2.233")
 
@@ -115,7 +131,7 @@ func TestDelete(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "IP addr matches more than number expected",
+			name: "IP addr matches multiple rules",
 			preRun: func() netip.Addr {
 				ip := netip.MustParseAddr("192.168.2.233")
 
@@ -130,7 +146,7 @@ func TestDelete(t *testing.T) {
 				require.NotEmpty(t, rules)
 
 				// Insert almost duplicate rule; the reason for this is to
-				// trigger an error while trying to delete the ingress rule. We
+				// trigger the deletion of all the matching rules. We
 				// are setting the Src because ingress rules don't have
 				// one (only Dst), thus we set Src to create a near-duplicate.
 				r := rules[0]
@@ -139,30 +155,31 @@ func TestDelete(t *testing.T) {
 
 				return ip
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
-			name: "fails to delete rules due to masquerade misconfiguration",
+			name: "delete rules with dest CIDR after masquerade is disabled",
 			preRun: func() netip.Addr {
 				runConfigure(t, fakeRoutingInfo, fakeIP, 1500)
-				// inconsistency with fakeRoutingInfo.Masquerade should lead to failure
 				option.Config.EnableIPv4Masquerade = false
 				return fakeIP
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
-		t.Log("Test: " + tt.name)
-		ns := netns.NewNetNS(t)
-		ns.Do(func() error {
-			ifaceCleanup := createDummyDevice(t, masterMAC)
-			defer ifaceCleanup()
+		t.Run(tt.name, func(t *testing.T) {
+			ns := netns.NewNetNS(t)
+			ns.Do(func() error {
+				ifaceCleanup := createDummyDevice(t, masterMAC)
+				defer ifaceCleanup()
 
-			ip := tt.preRun()
-			err := Delete(ip, false)
-			require.Equal(t, tt.wantErr, (err != nil))
-			return nil
+				ip := tt.preRun()
+				err := Delete(hivetest.Logger(t), ip)
+				require.Equalf(t, tt.wantErr, (err != nil), "got error: %v", err)
+
+				return nil
+			})
 		})
 	}
 }
@@ -178,6 +195,8 @@ func runConfigureThenDelete(t *testing.T, ri RoutingInfo, ip netip.Addr, mtu int
 	require.NotEqual(t, len(afterCreationRules), len(beforeCreationRules))
 	require.NotEqual(t, len(afterCreationRoutes), len(beforeCreationRoutes))
 
+	verifyMasqueradeRules(t, afterCreationRules, ri, ip)
+
 	// Delete rules and routes
 	beforeDeletionRules, beforeDeletionRoutes := listRulesAndRoutes(t, netlink.FAMILY_V4)
 	runDelete(t, ip)
@@ -185,17 +204,40 @@ func runConfigureThenDelete(t *testing.T, ri RoutingInfo, ip netip.Addr, mtu int
 
 	require.NotEqual(t, len(afterDeletionRules), len(beforeDeletionRules))
 	require.NotEqual(t, len(afterDeletionRoutes), len(beforeDeletionRoutes))
-	require.Equal(t, len(beforeCreationRules), len(afterDeletionRules))
-	require.Equal(t, len(beforeCreationRoutes), len(afterDeletionRoutes))
+	require.Len(t, afterDeletionRules, len(beforeCreationRules))
+	require.Len(t, afterDeletionRoutes, len(beforeCreationRoutes))
 }
 
 func runConfigure(t *testing.T, ri RoutingInfo, ip netip.Addr, mtu int) {
-	err := ri.Configure(ip.AsSlice(), mtu, false, false)
+	err := ri.Configure(ip, mtu, false)
 	require.NoError(t, err)
 }
 
+// verifyMasqueradeRules checks that rules are consistent with the masquerading configuration:
+//   - An unconditional rule (from <IP> lookup <table>) must always be present for correct ENI routing.
+//   - No CIDR-specific rules (with 'to' field) should be present.
+func verifyMasqueradeRules(t *testing.T, rules []netlink.Rule, ri RoutingInfo, ip netip.Addr) {
+	t.Helper()
+
+	var hasUnconditionalRule bool
+	for _, rule := range rules {
+		if rule.Src != nil && rule.Src.IP.Equal(ip.AsSlice()) {
+			// Should not have CIDR-specific rules
+			if rule.Dst != nil {
+				require.Fail(t, "unexpected CIDR-specific rule found; only unconditional rule should be present")
+			}
+			if rule.Dst == nil {
+				hasUnconditionalRule = true
+			}
+		}
+	}
+
+	// The unconditional rule must always be present for correct ENI routing.
+	require.True(t, hasUnconditionalRule, "unconditional egress rule (from <IP> lookup <table>) must be present")
+}
+
 func runDelete(t *testing.T, ip netip.Addr) {
-	err := Delete(ip, false)
+	err := Delete(hivetest.Logger(t), ip)
 	require.NoError(t, err)
 }
 
@@ -210,7 +252,7 @@ func listRulesAndRoutes(t *testing.T, family int) ([]netlink.Rule, []netlink.Rou
 	// those tables.
 	var routes []netlink.Route
 	for _, r := range rules {
-		rr, err := netlink.RouteListFiltered(family, &netlink.Route{
+		rr, err := safenetlink.RouteListFiltered(family, &netlink.Route{
 			Table: r.Table,
 		}, netlink.RT_FILTER_TABLE)
 		require.NoError(t, err)
@@ -249,40 +291,36 @@ func createDummyDevice(t *testing.T, macAddr mac.MAC) func() {
 }
 
 // getFakes returns a fake IP simulating an Endpoint IP and RoutingInfo as test harnesses.
-// To create routing info with a list of CIDRs which the interface has access to, set withCIDR parameter to true
+// To create routing info with a list of CIDRs which the interface has access to, set masquerade parameter to true
 // If withZeroCIDR is also set to true, the function will use the "0.0.0.0/0" CIDR block instead of other CIDR blocks.
-func getFakes(t *testing.T, withCIDR bool, withZeroCIDR bool) (netip.Addr, RoutingInfo) {
-	fakeGateway := netip.MustParseAddr("192.168.2.1")
-	fakeSubnet1CIDR := netip.MustParsePrefix("192.168.0.0/16")
-	fakeSubnet2CIDR := netip.MustParsePrefix("192.170.0.0/16")
-	fakeMAC, err := mac.ParseMAC("00:11:22:33:44:55")
-	require.NoError(t, err)
-	require.NotNil(t, fakeMAC)
+func getFakes(t *testing.T, ipamMode string, masquerade bool, withZeroCIDR bool) (netip.Addr, RoutingInfo) {
+	t.Helper()
 
-	var fakeRoutingInfo *RoutingInfo
-	if withCIDR {
-		cidrs := []string{fakeSubnet1CIDR.String(), fakeSubnet2CIDR.String()}
+	logger := hivetest.Logger(t)
+
+	fakeGateway := "192.168.2.1"
+	fakeSubnet1CIDR := "192.168.0.0/16"
+	fakeSubnet2CIDR := "192.170.0.0/16"
+	fakeMAC := "00:11:22:33:44:55"
+
+	var cidrs []string
+	if masquerade {
+		cidrs = []string{fakeSubnet1CIDR, fakeSubnet2CIDR}
 		if withZeroCIDR {
 			cidrs = []string{"0.0.0.0/0"}
 		}
-		fakeRoutingInfo, err = parse(
-			fakeGateway.String(),
-			cidrs,
-			fakeMAC.String(),
-			"1",
-			ipamOption.IPAMENI,
-			true,
-		)
-	} else {
-		fakeRoutingInfo, err = parse(
-			fakeGateway.String(),
-			nil,
-			fakeMAC.String(),
-			"1",
-			ipamOption.IPAMAzure,
-			false,
-		)
 	}
+
+	fakeRoutingInfo, err := NewRoutingInfo(
+		logger,
+		fakeGateway,
+		cidrs,
+		fakeMAC,
+		"1",
+		ipamMode,
+		masquerade,
+	)
+
 	require.NoError(t, err)
 	require.NotNil(t, fakeRoutingInfo)
 
@@ -290,12 +328,11 @@ func getFakes(t *testing.T, withCIDR bool, withZeroCIDR bool) (netip.Addr, Routi
 	option.Config.IPAM = fakeRoutingInfo.IpamMode
 	option.Config.EnableIPv4Masquerade = fakeRoutingInfo.Masquerade
 
-	fakeIP := netip.MustParseAddr("192.168.2.123")
-	return fakeIP, *fakeRoutingInfo
+	return netip.MustParseAddr("192.168.2.123"), *fakeRoutingInfo
 }
 
 func linkExistsWithMAC(t *testing.T, macAddr mac.MAC) bool {
-	links, err := netlink.LinkList()
+	links, err := safenetlink.LinkList()
 	require.NoError(t, err)
 
 	for _, link := range links {

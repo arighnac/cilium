@@ -29,8 +29,6 @@ _testmain.go
 
 *.swn
 *.swp
-.vagrant
-vagrant.kubeconfig
 coverage.out
 coverage-all.out
 coverage-all.html
@@ -80,9 +78,6 @@ old-charts/
 # generated test files
 test/k8s/manifests/cnp-second-namespaces.yaml
 test/cilium.conf.ginkgo
-external-workload-ca.crt
-external-workload-tls.crt
-external-workload-tls.key
 
 # Emacs backup files
 *~
@@ -105,6 +100,7 @@ GIT_VERSION
 
 # Generated dockerignore files
 images/*/Dockerfile.dockerignore
+examples/*/Dockerfile.dockerignore
 
 # Local Emacs files
 .dir-locals.el
@@ -114,7 +110,7 @@ bpf/.cache
 .cache
 
 # Include dummy bpf object necessary for XDP_TX
-!test/l4lb/bpf_xdp_veth_host.o
+!test/bpf/xdp.o
 
 # Files used for direnv
 .direnv

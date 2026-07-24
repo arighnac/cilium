@@ -24,13 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
-	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-)
-
-var (
-	nodeSvcLBClass                 = annotation.Prefix + "/node"
-	nodeSvcLBMatchLabelsAnnotation = annotation.Prefix + ".nodeipam" + "/match-node-labels"
+	"github.com/cilium/cilium/pkg/nodeipamconfig"
 )
 
 type nodeSvcLBReconciler struct {
@@ -63,14 +58,16 @@ func (r *nodeSvcLBReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&discoveryv1.EndpointSlice{}, r.enqueueRequestForEndpointSlice()).
 		// Watch for changes to Nodes
 		Watches(&corev1.Node{}, r.enqueueRequestForNode()).
+		Named("service-nodeipam").
 		Complete(r)
 }
 
 // enqueueRequestForEndpointSlice enqueue the service if a corresponding Enndpoint Slice is updated
 func (r *nodeSvcLBReconciler) enqueueRequestForEndpointSlice() handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-		scopedLog := r.Logger.With(logfields.Controller, "node-service-lb").
-			With(logfields.Resource, client.ObjectKeyFromObject(o))
+		scopedLog := r.Logger.With(
+			logfields.Resource, client.ObjectKeyFromObject(o),
+		)
 		epSlice, ok := o.(*discoveryv1.EndpointSlice)
 		if !ok {
 			return []ctrl.Request{}
@@ -83,7 +80,7 @@ func (r *nodeSvcLBReconciler) enqueueRequestForEndpointSlice() handler.EventHand
 			Namespace: epSlice.GetNamespace(),
 			Name:      svcName,
 		}
-		scopedLog.Info("Enqueued Service", "service", svc)
+		scopedLog.InfoContext(ctx, "Enqueued Service", logfields.Service, svc)
 		return []ctrl.Request{{NamespacedName: svc}}
 	})
 }
@@ -92,8 +89,9 @@ func (r *nodeSvcLBReconciler) enqueueRequestForEndpointSlice() handler.EventHand
 // by nodeipam (see shouldIncludeNode)
 func (r *nodeSvcLBReconciler) enqueueRequestForNode() handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-		scopedLog := r.Logger.With(logfields.Controller, "node-service-lb",
-			logfields.Resource, client.ObjectKeyFromObject(o))
+		scopedLog := r.Logger.With(
+			logfields.Resource, client.ObjectKeyFromObject(o),
+		)
 		node, ok := o.(*corev1.Node)
 		if !ok {
 			return []ctrl.Request{}
@@ -104,7 +102,7 @@ func (r *nodeSvcLBReconciler) enqueueRequestForNode() handler.EventHandler {
 
 		svcList := &corev1.ServiceList{}
 		if err := r.Client.List(ctx, svcList, &client.ListOptions{}); err != nil {
-			scopedLog.Error("Failed to get Services", logfields.Error, err)
+			scopedLog.ErrorContext(ctx, "Failed to get Services", logfields.Error, err)
 			return []reconcile.Request{}
 		}
 		requests := []reconcile.Request{}
@@ -117,15 +115,17 @@ func (r *nodeSvcLBReconciler) enqueueRequestForNode() handler.EventHandler {
 				Name:      item.GetName(),
 			}
 			requests = append(requests, reconcile.Request{NamespacedName: svc})
-			scopedLog.Info("Enqueued Service", "service", svc)
+			scopedLog.InfoContext(ctx, "Enqueued Service", logfields.Service, svc)
 		}
 		return requests
 	})
 }
 
 func (r *nodeSvcLBReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	scopedLog := r.Logger.With(logfields.Controller, "node-service-lb", logfields.Resource, req.NamespacedName)
-	scopedLog.Info("Reconciling Service")
+	scopedLog := r.Logger.With(
+		logfields.Resource, req.NamespacedName,
+	)
+	scopedLog.InfoContext(ctx, "Reconciling Service")
 
 	svc := corev1.Service{}
 	err := r.Get(ctx, req.NamespacedName, &svc)
@@ -159,7 +159,7 @@ func (r nodeSvcLBReconciler) isServiceSupported(svc *corev1.Service) bool {
 	if svc.Spec.LoadBalancerClass == nil {
 		return r.DefaultIPAM
 	}
-	return *svc.Spec.LoadBalancerClass == nodeSvcLBClass
+	return *svc.Spec.LoadBalancerClass == nodeipamconfig.NodeSvcLBClass
 }
 
 // getEndpointSliceNodes returns the set of node names if eTP=Local. If eTP=Cluster
@@ -197,9 +197,9 @@ func (r *nodeSvcLBReconciler) getEndpointSliceNodeNames(ctx context.Context, svc
 	return selectedNodes, nil
 }
 
-// getRelevantNodes gets all the nodes candidates for seletion by nodeipam
+// getRelevantNodes gets all the nodes candidates for selection by nodeipam
 func (r *nodeSvcLBReconciler) getRelevantNodes(ctx context.Context, svc *corev1.Service) ([]corev1.Node, error) {
-	scopedLog := r.Logger.With(logfields.Controller, "node-service-lb",
+	scopedLog := r.Logger.With(
 		logfields.Resource, client.ObjectKeyFromObject(svc))
 
 	endpointSliceNames, err := r.getEndpointSliceNodeNames(ctx, svc)
@@ -207,9 +207,14 @@ func (r *nodeSvcLBReconciler) getRelevantNodes(ctx context.Context, svc *corev1.
 		return []corev1.Node{}, err
 	}
 	nodeListOptions := &client.ListOptions{}
-	if val, ok := svc.Annotations[nodeSvcLBMatchLabelsAnnotation]; ok {
+	if val, ok := svc.Annotations[nodeipamconfig.NodeSvcLBMatchLabelsAnnotation]; ok {
 		parsedLabels, err := labels.Parse(val)
 		if err != nil {
+			scopedLog.ErrorContext(
+				ctx, "Failed to parse match-node-labels annotation",
+				logfields.Value, val,
+				logfields.Error, err,
+			)
 			return []corev1.Node{}, err
 		}
 		nodeListOptions.LabelSelector = parsedLabels
@@ -220,19 +225,39 @@ func (r *nodeSvcLBReconciler) getRelevantNodes(ctx context.Context, svc *corev1.
 		return []corev1.Node{}, err
 	}
 	if len(nodes.Items) == 0 {
-		scopedLog.Warn("No Nodes found with configured label selector", logfields.Labels, nodeListOptions.LabelSelector)
+		scopedLog.WarnContext(
+			ctx, "No Nodes found with configured label selector",
+			logfields.Labels, nodeListOptions.LabelSelector,
+		)
 	}
 
+	var excludedNodes []string
 	relevantNodes := []corev1.Node{}
 	for _, node := range nodes.Items {
 		if !shouldIncludeNode(&node) {
+			excludedNodes = append(excludedNodes, node.Name)
 			continue
 		}
 		if endpointSliceNames != nil && !endpointSliceNames.Has(node.Name) {
+			scopedLog.DebugContext(
+				ctx, "Skipping Node with no pods running on and local externalTrafficPolicy",
+				logfields.NodeName, node.Name,
+			)
 			continue
 		}
 
 		relevantNodes = append(relevantNodes, node)
+	}
+
+	if len(excludedNodes) > 0 {
+		scopedLog.InfoContext(
+			ctx, "Skipping Nodes that are being deleted or are excluded from load balancers",
+			logfields.Nodes, excludedNodes,
+		)
+	}
+
+	if len(nodes.Items) > 0 && len(relevantNodes) == 0 {
+		scopedLog.WarnContext(ctx, "No Nodes found after filtering out deleted or excluded nodes")
 	}
 	return relevantNodes, nil
 }

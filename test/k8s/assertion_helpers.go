@@ -4,7 +4,7 @@
 package k8sTest
 
 import (
-	"fmt"
+	"maps"
 	"time"
 
 	. "github.com/onsi/gomega"
@@ -14,18 +14,6 @@ import (
 )
 
 var longTimeout = 10 * time.Minute
-
-// ExpectKubeDNSReady is a wrapper around helpers/WaitKubeDNS. It asserts that
-// the error returned by that function is nil.
-func ExpectKubeDNSReady(vm *helpers.Kubectl) {
-	By("Waiting for kube-dns to be ready")
-	err := vm.WaitKubeDNS()
-	ExpectWithOffset(1, err).Should(BeNil(), "kube-dns was not able to get into ready state")
-
-	By("Running kube-dns preflight check")
-	err = vm.KubeDNSPreFlightCheck()
-	ExpectWithOffset(1, err).Should(BeNil(), "kube-dns service not ready")
-}
 
 // ExpectCiliumReady is a wrapper around helpers/WaitForPods. It asserts that
 // the error returned by that function is nil.
@@ -49,14 +37,6 @@ func ExpectCiliumOperatorReady(vm *helpers.Kubectl) {
 	ExpectWithOffset(1, err).Should(BeNil(), "Cilium operator was not able to get into ready state")
 }
 
-// ExpectHubbleCLIReady is a wrapper around helpers/WaitForPods. It asserts
-// that the error returned by that function is nil.
-func ExpectHubbleCLIReady(vm *helpers.Kubectl, ns string) {
-	By("Waiting for hubble-cli to be ready")
-	err := vm.WaitforPods(ns, "-l k8s-app=hubble-cli", longTimeout)
-	ExpectWithOffset(1, err).Should(BeNil(), "hubble-cli was not able to get into ready state")
-}
-
 // ExpectHubbleRelayReady is a wrapper around helpers/WaitForPods. It asserts
 // that the error returned by that function is nil.
 func ExpectHubbleRelayReady(vm *helpers.Kubectl, ns string) {
@@ -70,29 +50,6 @@ func ExpectHubbleRelayReady(vm *helpers.Kubectl, ns string) {
 func ExpectAllPodsTerminated(vm *helpers.Kubectl) {
 	err := vm.WaitTerminatingPods(helpers.HelperTimeout)
 	ExpectWithOffset(1, err).To(BeNil(), "terminating containers are not deleted after timeout")
-}
-
-// ExpectAllPodsInNsTerminated is a wrapper around helpers/WaitTerminatingPods.
-// It asserts that the error returned by that function is nil.
-func ExpectAllPodsInNsTerminated(vm *helpers.Kubectl, ns string) {
-	err := vm.WaitTerminatingPodsInNs(ns, helpers.HelperTimeout)
-	ExpectWithOffset(1, err).To(BeNil(), "terminating containers are not deleted after timeout")
-}
-
-// ExpectCiliumPreFlightInstallReady is a wrapper around helpers/WaitForNPods.
-// It asserts the error returned by that function is nil.
-func ExpectCiliumPreFlightInstallReady(vm *helpers.Kubectl) {
-	By("Waiting for all cilium pre-flight pods to be ready")
-
-	err := vm.WaitforPods(helpers.CiliumNamespace, "-l k8s-app=cilium-pre-flight-check", longTimeout)
-	warningMessage := ""
-	if err != nil {
-		res := vm.Exec(fmt.Sprintf(
-			"%s -n %s get pods -l k8s-app=cilium-pre-flight-check",
-			helpers.KubectlCmd, helpers.CiliumNamespace))
-		warningMessage = res.Stdout()
-	}
-	Expect(err).To(BeNil(), "cilium pre-flight check is not ready after timeout, pods status:\n %s", warningMessage)
 }
 
 // DeployCiliumAndDNS deploys DNS and cilium into the kubernetes cluster
@@ -140,12 +97,8 @@ func RedeployCiliumWithMerge(vm *helpers.Kubectl,
 
 	// Merge configuration
 	newOpts := make(map[string]string, len(options))
-	for k, v := range from {
-		newOpts[k] = v
-	}
-	for k, v := range options {
-		newOpts[k] = v
-	}
+	maps.Copy(newOpts, from)
+	maps.Copy(newOpts, options)
 
 	RedeployCilium(vm, ciliumFilename, newOpts)
 }
@@ -203,30 +156,7 @@ func DeployCiliumOptionsAndDNS(vm *helpers.Kubectl, ciliumFilename string, optio
 	forceDNSRedeploy := optionChangeRequiresPodRedeploy(prevOptions, options)
 	vm.RedeployKubernetesDnsIfNecessary(forceDNSRedeploy)
 
-	switch helpers.GetCurrentIntegration() {
-	case helpers.CIIntegrationGKE:
-		if helpers.LogGathererNamespace != helpers.KubeSystemNamespace {
-			vm.RestartUnmanagedPodsInNamespace(helpers.KubeSystemNamespace)
-		}
-	}
-
 	err := vm.CiliumPreFlightCheck()
 	ExpectWithOffset(1, err).Should(BeNil(), "cilium pre-flight checks failed")
 	ExpectCiliumOperatorReady(vm)
-
-	switch helpers.GetCurrentIntegration() {
-	case helpers.CIIntegrationGKE:
-		err := vm.WaitforPods(helpers.KubeSystemNamespace, "", longTimeout)
-		ExpectWithOffset(1, err).Should(BeNil(), "kube-system pods were not able to get into ready state after restart")
-	}
-}
-
-// SkipIfIntegration will skip a test if it's running with any of the specified
-// integration.
-func SkipIfIntegration(integration string) {
-	if helpers.IsIntegration(integration) {
-		Skip(fmt.Sprintf(
-			"This feature is not supported in Cilium %q mode. Skipping test.",
-			integration))
-	}
 }

@@ -6,7 +6,9 @@ package maglev
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
@@ -34,7 +36,7 @@ func TestPermutations(t *testing.T) {
 	}
 	for _, bCount := range []int{0, 1, 2, 5, 111, 222, 333, 1001} {
 		backends := make([]BackendInfo, bCount)
-		for i := 0; i < len(backends); i++ {
+		for i := range backends {
 			backends[i] = BackendInfo{
 				Addr:   mkAddr(int32(i)),
 				ID:     loadbalancer.BackendID(i),
@@ -43,15 +45,17 @@ func TestPermutations(t *testing.T) {
 			backends[i].setHashString()
 		}
 		for _, m := range []uint64{251, 509, 1021} {
-			ml, err := New(Config{
-				MaglevTableSize: uint(m),
-				MaglevHashSeed:  DefaultHashSeed,
-			}, lc)
+			cfg, err := UserConfig{
+				TableSize: uint(m),
+				HashSeed:  DefaultHashSeed,
+			}.ToConfig()
+			require.NoError(t, err, "ToConfig")
+			ml := New(cfg, lc)
 			require.NoError(t, err, "New")
-			expectedPerm := getExpectedPermutation(backends, m, ml.seedMurmur)
+			expectedPerm := getExpectedPermutation(backends, m, ml.SeedMurmur)
 			for _, numCPU := range []int{1, 2, 3, 4, 8, 100} {
 				testPerm := ml.getPermutation(backends, numCPU)
-				require.EqualValues(t, expectedPerm, testPerm)
+				require.Equal(t, expectedPerm, testPerm)
 			}
 		}
 	}
@@ -61,10 +65,9 @@ func mkAddr(i int32) loadbalancer.L3n4Addr {
 	intToAddr := func(i int32) cmtypes.AddrCluster {
 		var addr [4]byte
 		binary.BigEndian.PutUint32(addr[:], uint32(i))
-		addrCluster, _ := cmtypes.AddrClusterFromIP(addr[:])
-		return addrCluster
+		return cmtypes.AddrClusterFrom(netip.AddrFrom4(addr), 0)
 	}
-	a := *loadbalancer.NewL3n4Addr(
+	a := loadbalancer.NewL3n4Addr(
 		loadbalancer.TCP,
 		intToAddr(i),
 		uint16(i%65535),
@@ -78,18 +81,18 @@ func runLengthEncodeIDs(ids []loadbalancer.BackendID) string {
 	}
 	count := 1
 	current := ids[0]
-	var runs string
+	var runs strings.Builder
 	for _, id := range ids[1:] {
 		if id == current {
 			count++
 		} else {
-			runs += fmt.Sprintf("%d(%d),", current, count)
+			fmt.Fprintf(&runs, "%d(%d),", current, count)
 			count = 1
 			current = id
 		}
 	}
-	runs += fmt.Sprintf("%d(%d)", current, count)
-	return runs
+	fmt.Fprintf(&runs, "%d(%d)", current, count)
+	return runs.String()
 }
 
 func TestReproducible(t *testing.T) {
@@ -97,12 +100,12 @@ func TestReproducible(t *testing.T) {
 	// small.
 	m := uint64(251)
 
-	ml, err := New(
-		Config{
-			MaglevTableSize: uint(m),
-			MaglevHashSeed:  DefaultHashSeed,
-		}, hivetest.Lifecycle(t))
-	require.NoError(t, err, "New")
+	cfg, err := UserConfig{
+		TableSize: uint(m),
+		HashSeed:  DefaultHashSeed,
+	}.ToConfig()
+	require.NoError(t, err, "ToConfig")
+	ml := New(cfg, hivetest.Lifecycle(t))
 
 	// Run-length-encoded expected maglev table in format <id>(<count>),...
 	expected := "2(5),3(1),2(3),1(1),2(2),0(1),2(1),3(1),2(1),3(1),2(1),1(1),2(7),1(1),2(14),3(1),2(1)," +
@@ -124,11 +127,12 @@ func TestReproducible(t *testing.T) {
 
 func TestBackendRemoval(t *testing.T) {
 	m := uint(1021) // 3 (backends) * 100 should be less than M
-	ml, err := New(
-		Config{
-			MaglevTableSize: uint(m),
-			MaglevHashSeed:  DefaultHashSeed,
-		}, hivetest.Lifecycle(t))
+	cfg, err := UserConfig{
+		TableSize: uint(m),
+		HashSeed:  DefaultHashSeed,
+	}.ToConfig()
+	require.NoError(t, err, "ToConfig")
+	ml := New(cfg, hivetest.Lifecycle(t))
 	require.NoError(t, err, "New")
 	changesInExistingBackends := 0
 
@@ -160,11 +164,11 @@ func TestBackendRemoval(t *testing.T) {
 
 func TestWeightedBackendWithRemoval(t *testing.T) {
 	m := uint(1021) // 4 (backends) * 100 is still less than M
-	ml, err := New(
-		Config{
-			MaglevTableSize: uint(m),
-			MaglevHashSeed:  DefaultHashSeed,
-		}, hivetest.Lifecycle(t))
+	cfg, err := UserConfig{
+		TableSize: uint(m),
+		HashSeed:  DefaultHashSeed,
+	}.ToConfig()
+	ml := New(cfg, hivetest.Lifecycle(t))
 	require.NoError(t, err, "New")
 
 	changesInExistingBackends := 0
@@ -219,26 +223,25 @@ func BenchmarkGetMaglevTable(b *testing.B) {
 
 func benchmarkGetMaglevTable(b *testing.B, m uint64) {
 	backendCount := 1000
-	ml, err := New(
-		Config{
-			MaglevTableSize: uint(m),
-			MaglevHashSeed:  DefaultHashSeed,
-		}, hivetest.Lifecycle(b))
-	require.NoError(b, err, "New")
+	cfg, err := UserConfig{
+		TableSize: uint(m),
+		HashSeed:  DefaultHashSeed,
+	}.ToConfig()
+	require.NoError(b, err, "ToConfig")
+	ml := New(cfg, hivetest.Lifecycle(b))
 
 	// Preallocate the info buffer to not skew the allocation count.
 	ml.backendInfosBuffer = make([]BackendInfo, 0, 1024)
 
 	backends := make([]BackendInfo, backendCount)
-	for i := 0; i < backendCount; i++ {
+	for i := range backendCount {
 		backends[i] = BackendInfo{ID: loadbalancer.BackendID(i), Weight: 1, Addr: mkAddr(int32(i))}
 		// Already compute hash string so we compare apples-to-apples to prev benchmarks. Previously
 		// the backends were passed in as map[string]*Backend so these strings precomputed.
 		backends[i].setHashString()
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		table := ml.GetLookupTable(slices.Values(backends))
 		require.Len(b, table, int(m))
 	}

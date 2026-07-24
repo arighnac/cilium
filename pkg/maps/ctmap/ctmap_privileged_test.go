@@ -11,6 +11,7 @@ import (
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/fake"
+	"github.com/cilium/hive/hivetest"
 	"github.com/cilium/stream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,13 +26,15 @@ import (
 )
 
 func init() {
-	InitMapInfo(true, true, true)
+	nat4, nat6 := nat.GlobalMaps(nil, true, true)
+	InitMapInfo(nat4, nat6)
 }
 
 func setupCTMap(tb testing.TB) {
 	testutils.PrivilegedTest(tb)
+	logger := hivetest.Logger(tb)
 
-	bpf.CheckOrMountFS("")
+	bpf.CheckOrMountFS(logger, "")
 	err := rlimit.RemoveMemlock()
 	require.NoError(tb, err)
 }
@@ -45,15 +48,15 @@ func BenchmarkMapBatchLookup(b *testing.B) {
 	_ = populateFakeDataCTMap4(b, m, option.CTMapEntriesGlobalTCPDefault)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		count, err := m.Count(context.TODO())
 		assert.NoError(b, err)
 		assert.Greater(b, count, option.CTMapEntriesGlobalAnyDefault)
 	}
 }
 
-func Benchmark_MapUpdate(b *testing.B) {
+func BenchmarkPrivileged_MapUpdate(b *testing.B) {
 	setupCTMap(b)
 
 	m := newMap(MapNameTCP4Global+"_test", mapTypeIPv4TCPGlobal)
@@ -61,14 +64,16 @@ func Benchmark_MapUpdate(b *testing.B) {
 	defer m.Map.Unpin()
 	require.NoError(b, err)
 
-	key := &CtKey4{
-		tuple.TupleKey4{
-			DestAddr:   types.IPv4{0xa, 0x10, 0xc5, 0xf0},
-			SourceAddr: types.IPv4{0xa, 0x10, 0x9d, 0xb3},
-			DestPort:   0,
-			SourcePort: 0,
-			NextHeader: u8proto.TCP,
-			Flags:      tuple.TUPLE_F_OUT,
+	key := &CtKey4Global{
+		tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				DestAddr:   types.IPv4{0xa, 0x10, 0xc5, 0xf0},
+				SourceAddr: types.IPv4{0xa, 0x10, 0x9d, 0xb3},
+				DestPort:   0,
+				SourcePort: 0,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
 		},
 	}
 	value := &CtEntry{
@@ -85,7 +90,7 @@ func Benchmark_MapUpdate(b *testing.B) {
 	}
 
 	require.Less(b, b.N, 0xFFFF*0xFFFF)
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		key.DestPort = uint16(i % 0xFFFF)
 		key.SourcePort = uint16(i / 0xFFFF)
 		err := m.Map.Update(key, value)
@@ -118,13 +123,13 @@ func Benchmark_MapUpdate(b *testing.B) {
 	require.Equal(b, b.N, t)
 }
 
-// TestCtGcIcmp tests whether ICMP NAT entries are removed upon a removal of
+// TestPrivilegedCtGcIcmp tests whether ICMP NAT entries are removed upon a removal of
 // their CT entry (GH#12625).
-func TestCtGcIcmp(t *testing.T) {
+func TestPrivilegedCtGcIcmp(t *testing.T) {
 	setupCTMap(t)
 
 	// Init maps
-	natMap := nat.NewMap("cilium_nat_any4_test", nat.IPv4, 1000)
+	natMap := nat.NewMap(nil, "cilium_nat_any4_test", nat.IPv4, 1000)
 	err := natMap.OpenOrCreate()
 	require.NoError(t, err)
 	defer natMap.Map.Unpin()
@@ -222,8 +227,9 @@ func TestCtGcIcmp(t *testing.T) {
 	}
 	mcast, next, complete := stream.Multicast[GCEvent]()
 	mcast.Observe(context.Background(), NatMapNext4, func(err error) {})
-	stats := doGCForFamily(ctMap, filter, next, nil, false)
+	stats := ctMap.doGCForFamily(filter, next, nil, false)
 	complete(nil)
+	require.NotEqual(t, stats.Finished, stats.Started)
 	require.Equal(t, uint32(0), stats.aliveEntries)
 	require.Equal(t, uint32(1), stats.deleted)
 
@@ -233,12 +239,12 @@ func TestCtGcIcmp(t *testing.T) {
 	require.Empty(t, buf)
 }
 
-// TestCtGcTcp tests whether TCP SNAT entries are removed upon a removal of
+// TestPrivilegedCtGcTcp tests whether TCP SNAT entries are removed upon a removal of
 // their CT entry.
-func TestCtGcTcp(t *testing.T) {
+func TestPrivilegedCtGcTcp(t *testing.T) {
 	setupCTMap(t)
 	// Init maps
-	natMap := nat.NewMap("cilium_nat_any4_test", nat.IPv4, 1000)
+	natMap := nat.NewMap(nil, "cilium_nat_any4_test", nat.IPv4, 1000)
 	err := natMap.OpenOrCreate()
 	require.NoError(t, err)
 	defer natMap.Map.Unpin()
@@ -336,8 +342,9 @@ func TestCtGcTcp(t *testing.T) {
 	}
 	mcast, next, complete := stream.Multicast[GCEvent]()
 	mcast.Observe(context.Background(), NatMapNext4, func(err error) {})
-	stats := doGCForFamily(ctMap, filter, next, nil, false)
+	stats := ctMap.doGCForFamily(filter, next, nil, false)
 	complete(nil)
+	require.NotEqual(t, stats.Finished, stats.Started)
 	require.Equal(t, uint32(0), stats.aliveEntries)
 	require.Equal(t, uint32(1), stats.deleted)
 
@@ -347,13 +354,13 @@ func TestCtGcTcp(t *testing.T) {
 	require.Empty(t, buf)
 }
 
-// TestCtGcDsr tests whether DSR NAT entries are removed upon a removal of
+// TestPrivilegedCtGcDsr tests whether DSR NAT entries are removed upon a removal of
 // their CT entry (== CT_EGRESS).
-func TestCtGcDsr(t *testing.T) {
+func TestPrivilegedCtGcDsr(t *testing.T) {
 	setupCTMap(t)
 
 	// Init maps
-	natMap := nat.NewMap("cilium_nat_any4_test", nat.IPv4, 1000)
+	natMap := nat.NewMap(nil, "cilium_nat_any4_test", nat.IPv4, 1000)
 	err := natMap.OpenOrCreate()
 	require.NoError(t, err)
 	defer natMap.Map.Unpin()
@@ -430,7 +437,7 @@ func TestCtGcDsr(t *testing.T) {
 	}
 	mcast, next, complete := stream.Multicast[GCEvent]()
 	mcast.Observe(context.Background(), NatMapNext4, func(err error) {})
-	stats := doGCForFamily(ctMap, filter, next, nil, false)
+	stats := ctMap.doGCForFamily(filter, next, nil, false)
 	complete(nil)
 	require.Equal(t, uint32(0), stats.aliveEntries)
 	require.Equal(t, uint32(1), stats.deleted)
@@ -442,11 +449,11 @@ func TestCtGcDsr(t *testing.T) {
 }
 
 // TestOrphanNat checks whether dangling NAT entries are GC'd (GH#12686)
-func TestOrphanNatGC(t *testing.T) {
+func TestPrivilegedOrphanNatGC(t *testing.T) {
 	setupCTMap(t)
 
 	// Init maps
-	natMap := nat.NewMap("cilium_nat_any4_test", nat.IPv4, 1000)
+	natMap := nat.NewMap(nil, "cilium_nat_any4_test", nat.IPv4, 1000)
 	err := natMap.OpenOrCreate()
 	require.NoError(t, err)
 	defer natMap.Map.Unpin()
@@ -687,7 +694,7 @@ func TestOrphanNatGC(t *testing.T) {
 
 	// Let's check IPv6
 
-	natMapV6 := nat.NewMap("cilium_nat_any6_test", nat.IPv6, 1000)
+	natMapV6 := nat.NewMap(nil, "cilium_nat_any6_test", nat.IPv6, 1000)
 	err = natMapV6.OpenOrCreate()
 	require.NoError(t, err)
 	defer natMapV6.Map.Unpin()
@@ -742,7 +749,7 @@ func TestOrphanNatGC(t *testing.T) {
 
 // TestCount checks whether the CT map batch lookup dumps the count of the
 // entire map.
-func TestCount(t *testing.T) {
+func TestPrivilegedCount(t *testing.T) {
 	testutils.PrivilegedTest(t)
 
 	// Set the max size of the map explicitly so we can provide enough buffer
@@ -792,6 +799,125 @@ func TestCount(t *testing.T) {
 	assert.Equal(t, len(cache), batchCount)
 }
 
+// TestPrivilegedCtGCWithNetworkID tests the injection of additional CT maps for GC
+func TestPrivilegedCtNetworkID(t *testing.T) {
+	setupCTMap(t)
+
+	ctMap := NewGlobalMap("cilium_ct_network_10_test", MapConfig{TCP: true, IPv6: false}, WithNetworkID(10))
+
+	ctMapSpec := NewGlobalMapSpec(MapConfig{TCP: true, IPv6: false})
+	require.Equal(t, ctMap.Map.Type(), ctMapSpec.Type)
+	require.Equal(t, ctMap.Map.KeySize(), ctMapSpec.KeySize)
+	require.Equal(t, ctMap.Map.ValueSize(), ctMapSpec.ValueSize)
+	require.Equal(t, ctMap.Map.MaxEntries(), ctMapSpec.MaxEntries)
+	require.Equal(t, ctMap.Map.Flags(), ctMapSpec.Flags)
+
+	err := ctMap.OpenOrCreate()
+	require.NoError(t, err)
+	defer ctMap.Map.Unpin()
+
+	// Add entry about to expire
+	ctKey := &CtKey4Global{
+		TupleKey4Global: tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				DestAddr:   types.IPv4{10, 0, 2, 10},
+				SourceAddr: types.IPv4{10, 20, 30, 40},
+				SourcePort: 0x50c3,
+				DestPort:   0xd204,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
+	ctVal := &CtEntry{
+		Packets:  1,
+		Bytes:    216,
+		Lifetime: 37459,
+	}
+	err = ctMap.Map.Update(ctKey, ctVal)
+	require.NoError(t, err)
+
+	// Add non-expired entry to be matched by GCFilter
+	ctKey = &CtKey4Global{
+		tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				SourceAddr: types.IPv4{192, 168, 61, 11},
+				DestAddr:   types.IPv4{1, 1, 1, 1},
+				SourcePort: 0x5704,
+				DestPort:   0x901f,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
+	ctVal = &CtEntry{
+		Packets:  3,
+		Bytes:    360,
+		Lifetime: 40000,
+	}
+	err = ctMap.Map.Update(ctKey, ctVal)
+	require.NoError(t, err)
+
+	// Add non-expired entry to be kept alive
+	ctKey = &CtKey4Global{
+		tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				SourceAddr: types.IPv4{192, 168, 61, 12},
+				DestAddr:   types.IPv4{192, 168, 61, 11},
+				SourcePort: 0x3195,
+				DestPort:   0x50,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
+	ctVal = &CtEntry{
+		Packets:  1,
+		Bytes:    216,
+		Lifetime: 50000,
+	}
+	err = ctMap.Map.Update(ctKey, ctVal)
+	require.NoError(t, err)
+
+	buf := make(map[string][]string)
+	err = ctMap.Map.Dump(buf)
+	require.NoError(t, err)
+	require.Len(t, buf, 3)
+
+	// GC and check whether NAT entries have been collected
+	filter := GCFilter{
+		RemoveExpired: true,
+		Time:          39000,
+		MatchIPs: map[NetAddr]struct{}{
+			{Addr: netip.MustParseAddr("1.1.1.1"), NetID: 10}:      {}, // to be deleted
+			{Addr: netip.MustParseAddr("192.168.61.12"), NetID: 0}: {}, // to be kept alive (wrong net ID)
+		},
+		EmitCTEntryCB: func(srcIP, dstIP NetAddr, srcPort, dstPort uint16, nextHdr, flags uint8, entry *CtEntry) {
+			// Assert the correct entry is kept alive
+			require.Equal(t, NetAddr{Addr: netip.MustParseAddr("192.168.61.11"), NetID: 10}, srcIP)
+			require.Equal(t, NetAddr{Addr: netip.MustParseAddr("192.168.61.12"), NetID: 10}, dstIP)
+			require.Equal(t, uint32(50000), entry.Lifetime)
+		},
+	}
+
+	callBacks := 0
+	mcast, next, complete := stream.Multicast[GCEvent]()
+	mcast.Observe(context.Background(), func(event GCEvent) {
+		require.Nil(t, event.NatMap)
+		callBacks++
+	}, func(err error) {})
+	stats := ctMap.doGCForFamily(filter, next, nil, false)
+	complete(nil)
+	require.Equal(t, uint32(1), stats.aliveEntries)
+	require.Equal(t, uint32(2), stats.deleted)
+	require.Equal(t, 2, callBacks)
+
+	buf = make(map[string][]string)
+	err = ctMap.Map.Dump(buf)
+	require.NoError(t, err)
+	require.Len(t, buf, 1)
+}
+
 func populateFakeDataCTMap4(tb testing.TB, m CtMap, size int) map[*CtKey4Global]struct{} {
 	tb.Helper()
 
@@ -839,24 +965,24 @@ func populateFakeDataCTMap4(tb testing.TB, m CtMap, size int) map[*CtKey4Global]
 	return cache
 }
 
-func BenchmarkCtGcTcpXL(t *testing.B) {
+func BenchmarkPrivilegedCtGcTcpXL(t *testing.B) {
 	benchmarkCtGc(t, 1<<24) // max size
 }
 
-func BenchmarkCtGcTcpL(t *testing.B) {
+func BenchmarkPrivilegedCtGcTcpL(t *testing.B) {
 	benchmarkCtGc(t, 1<<22)
 }
 
-func BenchmarkCtGcTcpM(t *testing.B) {
+func BenchmarkPrivilegedCtGcTcpM(t *testing.B) {
 	benchmarkCtGc(t, 1<<17)
 }
 
 func benchmarkCtGc(t *testing.B, size int) {
-	for range t.N {
+	for t.Loop() {
 		t.StopTimer()
 		setupCTMap(t)
 		// Init maps
-		natMap := nat.NewMap("cilium_nat_any4_test", nat.IPv4, size)
+		natMap := nat.NewMap(nil, "cilium_nat_any4_test", nat.IPv4, size)
 		err := natMap.OpenOrCreate()
 		assert.NoError(t, err)
 		defer natMap.Map.Unpin()
@@ -912,6 +1038,6 @@ func benchmarkCtGc(t *testing.B, size int) {
 		t.Logf("starting gc")
 		defer t.Logf("done gc pass!")
 		t.StartTimer()
-		doGCForFamily(ctMap, filter, func(g GCEvent) {}, nil, false)
+		ctMap.doGCForFamily(filter, func(g GCEvent) {}, nil, false)
 	}
 }

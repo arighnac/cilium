@@ -18,7 +18,6 @@ import (
 	"github.com/cilium/cilium/cilium-cli/utils/features"
 	"github.com/cilium/cilium/pkg/defaults"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	"github.com/cilium/cilium/pkg/versioncheck"
 )
 
 type requestType int
@@ -131,6 +130,10 @@ func getFilter(ctx context.Context, t *check.Test, client, clientHost *check.Pod
 
 	if enc, ok := t.Context().Feature(features.EncryptionPod); wgEncap && tunnelEnabled && ok &&
 		enc.Enabled && enc.Mode == "wireguard" {
+		tunnelFilter, err := sniff.GetTunnelFilter(t.Context())
+		if err != nil {
+			t.Fatalf("Failed to build tunnel filter: %w", err)
+		}
 
 		// Captures the following:
 		// - Any VXLAN/Geneve pkt client host <-> server host. Such a pkt might
@@ -141,10 +144,23 @@ func getFilter(ctx context.Context, t *check.Test, client, clientHost *check.Pod
 		// - Any pkt client <-> server with a given proto. This might be useful
 		//   to catch any regression in the DP which makes the pkt to bypass
 		//   the VXLAN tunnel.
-		filter := fmt.Sprintf("(%s and host %s and host %s) or (host %s and host %s and %s)",
-			sniff.TunnelFilter,
-			clientHost.Address(features.IPFamilyV4), serverHost.Address(features.IPFamilyV4),
+		filter := fmt.Sprintf("host %s and host %s and %s",
 			client.Address(ipFam), server.Address(ipFam), protoFilter)
+		if clientHostV4 := clientHost.Address(features.IPFamilyV4); clientHostV4 != "" {
+			filterUnderlayV4 := fmt.Sprintf("%s and host %s and host %s", tunnelFilter,
+				clientHost.Address(features.IPFamilyV4), serverHost.Address(features.IPFamilyV4))
+			filter = fmt.Sprintf("(%s) or (%s)", filter, filterUnderlayV4)
+		}
+		if clientHostV6 := clientHost.Address(features.IPFamilyV6); clientHostV6 != "" {
+			filterUnderlayV6 := fmt.Sprintf("%s and host %s and host %s", tunnelFilter,
+				clientHost.Address(features.IPFamilyV6), serverHost.Address(features.IPFamilyV6))
+			filter = fmt.Sprintf("(%s) or (%s)", filter, filterUnderlayV6)
+		}
+
+		// Exclude icmpv6 neighbor broadcast packets, as these are intentionally not encrypted:
+		// Ref[0]: https://github.com/cilium/cilium/blob/e8543eef/bpf/lib/wireguard.h#L95
+		// See Issue: #38688
+		filter = fmt.Sprintf("(%s) and (%s)", filter, icmpv6NAFilter)
 
 		return filter
 
@@ -153,7 +169,7 @@ func getFilter(ctx context.Context, t *check.Test, client, clientHost *check.Pod
 	filter := fmt.Sprintf("src host %s", client.Address(ipFam))
 	dstIP := server.Address(ipFam)
 
-	if tunnelStatus, ok := t.Context().Feature(features.Tunnel); ok && tunnelStatus.Enabled {
+	if tunnelEnabled {
 		cmd := []string{
 			"/bin/sh", "-c",
 			fmt.Sprintf("ip -o route get %s | grep -oE 'src [^ ]*' | cut -d' ' -f2",
@@ -179,24 +195,20 @@ func getFilter(ctx context.Context, t *check.Test, client, clientHost *check.Pod
 	// make tcpdump to capture the pkts (false positive).
 	filter = fmt.Sprintf("%s and dst host %s", filter, dstIP)
 
+	// Exclude icmpv6 neighbor broadcast packets, as these are intentionally not encrypted:
+	// Ref[0]: https://github.com/cilium/cilium/blob/e8543eef/bpf/lib/wireguard.h#L95
+	// See Issue: #38688
+	filter = fmt.Sprintf("(%s) and (%s)", filter, icmpv6NAFilter)
+
 	return filter
 }
 
 // isWgEncap checks whether packets are encapsulated before encrypting with WG.
-//
-// In v1.14, it's an opt-in, and controlled by --wireguard-encapsulate.
-// In v1.15, it's enabled, and it's not possible to opt-out.
 func isWgEncap(t *check.Test) bool {
 	if e, ok := t.Context().Feature(features.EncryptionPod); !(ok && e.Enabled && e.Mode == "wireguard") {
 		return false
 	}
 	if t, ok := t.Context().Feature(features.Tunnel); !(ok && t.Enabled) {
-		return false
-	}
-	if versioncheck.MustCompile(">=1.15.0")(t.Context().CiliumVersion) {
-		return true
-	}
-	if encap, ok := t.Context().Feature(features.WireguardEncapsulate); !(ok && encap.Enabled) {
 		return false
 	}
 
@@ -213,10 +225,17 @@ func isWgEncap(t *check.Test) bool {
 // The checks are implemented by curl'ing a server pod from a client pod, and
 // then inspecting tcpdump captures from the client pod's node.
 func PodToPodEncryption(reqs ...features.Requirement) check.Scenario {
-	return &podToPodEncryption{reqs}
+	return &podToPodEncryption{
+		reqs:         reqs,
+		ScenarioBase: check.NewScenarioBase(),
+	}
 }
 
-type podToPodEncryption struct{ reqs []features.Requirement }
+type podToPodEncryption struct {
+	check.ScenarioBase
+
+	reqs []features.Requirement
+}
 
 func (s *podToPodEncryption) Name() string {
 	return "pod-to-pod-encryption"
@@ -251,14 +270,7 @@ func (s *podToPodEncryption) Run(ctx context.Context, t *check.Test) {
 		t.Debug("Encapsulation before WG encryption")
 	}
 
-	e, ok := t.Context().Feature(features.EncryptionPod)
-	isIPSec := ok && e.Enabled && e.Mode == "ipsec"
-
 	t.ForEachIPFamily(func(ipFam features.IPFamily) {
-		if isIPSec && ipFam == features.IPFamilyV6 {
-			t.Debugf("Inactive IPv6 test with IPSec, see https://github.com/cilium/cilium/issues/35485")
-			return
-		}
 		testNoTrafficLeak(ctx, t, s, client, &server, &clientHost, &serverHost, requestHTTP, ipFam, assertNoLeaks, true, wgEncap)
 	})
 }
@@ -267,6 +279,17 @@ func testNoTrafficLeak(ctx context.Context, t *check.Test, s check.Scenario,
 	client, server, clientHost *check.Pod, serverHost *check.Pod,
 	reqType requestType, ipFam features.IPFamily, assertNoLeaks, biDirCheck, wgEncap bool,
 ) {
+	var finalizers []func() error
+
+	// on exit, run registered finalizers
+	defer func() {
+		for _, f := range finalizers {
+			if err := f(); err != nil {
+				t.Infof("Failed to run finalizer: %w", err)
+			}
+		}
+	}()
+
 	srcFilter := getFilter(ctx, t, client, clientHost, server, serverHost, ipFam, reqType, wgEncap)
 	srcIface := getInterNodeIface(ctx, t, client, clientHost, server, serverHost, ipFam, wgEncap)
 
@@ -275,39 +298,41 @@ func testNoTrafficLeak(ctx context.Context, t *check.Test, s check.Scenario,
 		snifferMode = sniff.ModeSanity
 	}
 
-	srcSniffer, err := sniff.Sniff(ctx, s.Name(), clientHost, srcIface, srcFilter, snifferMode, t)
+	srcSniffer, cancel, err := sniff.Sniff(ctx, s.Name(), clientHost, srcIface, srcFilter, snifferMode, sniff.SniffKillTimeout, t)
 	if err != nil {
 		t.Fatal(err)
 	}
+	finalizers = append(finalizers, cancel)
 
 	var dstSniffer *sniff.Sniffer
 	if biDirCheck {
 		dstFilter := getFilter(ctx, t, server, serverHost, client, clientHost, ipFam, reqType, wgEncap)
 		dstIface := getInterNodeIface(ctx, t, server, serverHost, client, clientHost, ipFam, wgEncap)
 
-		dstSniffer, err = sniff.Sniff(ctx, s.Name(), serverHost, dstIface, dstFilter, snifferMode, t)
+		dstSniffer, cancel, err = sniff.Sniff(ctx, s.Name(), serverHost, dstIface, dstFilter, snifferMode, sniff.SniffKillTimeout, t)
 		if err != nil {
 			t.Fatal(err)
 		}
+		finalizers = append(finalizers, cancel)
 	}
 
 	switch reqType {
 	case requestHTTP:
 		// Curl the server from the client to generate some traffic
 		t.NewAction(s, fmt.Sprintf("curl-%s", ipFam), client, server, ipFam).Run(func(a *check.Action) {
-			a.ExecInPod(ctx, t.Context().CurlCommand(server, ipFam))
-			srcSniffer.Validate(ctx, a)
+			a.ExecInPod(ctx, a.CurlCommand(server))
+			srcSniffer.Validate(a)
 			if dstSniffer != nil {
-				dstSniffer.Validate(ctx, a)
+				dstSniffer.Validate(a)
 			}
 		})
 	case requestICMPEcho:
 		// Ping the server from the client to generate some traffic
 		t.NewAction(s, fmt.Sprintf("ping-%s", ipFam), client, server, ipFam).Run(func(a *check.Action) {
 			a.ExecInPod(ctx, t.Context().PingCommand(server, ipFam))
-			srcSniffer.Validate(ctx, a)
+			srcSniffer.Validate(a)
 			if dstSniffer != nil {
-				dstSniffer.Validate(ctx, a)
+				dstSniffer.Validate(a)
 			}
 		})
 	}
@@ -373,10 +398,17 @@ func nodeToNodeEncTestPods(nodes map[check.NodeIdentity]*ciliumv2.CiliumNode, ex
 }
 
 func NodeToNodeEncryption(reqs ...features.Requirement) check.Scenario {
-	return &nodeToNodeEncryption{reqs}
+	return &nodeToNodeEncryption{
+		reqs:         reqs,
+		ScenarioBase: check.NewScenarioBase(),
+	}
 }
 
-type nodeToNodeEncryption struct{ reqs []features.Requirement }
+type nodeToNodeEncryption struct {
+	check.ScenarioBase
+
+	reqs []features.Requirement
+}
 
 func (s *nodeToNodeEncryption) Name() string {
 	return "node-to-node-encryption"
@@ -410,6 +442,14 @@ func (s *nodeToNodeEncryption) Run(ctx context.Context, t *check.Test) {
 	clientHost := t.Context().HostNetNSPodsByNode()[client.Pod.Spec.NodeName]
 	// serverHost is a pod running in a remote node's host netns.
 	serverHost := t.Context().HostNetNSPodsByNode()[server.Pod.Spec.NodeName]
+
+	if clientHost.Pod == nil {
+		t.Fatalf("Could not find host network namespace pod on client node %s", client.Pod.Spec.NodeName)
+	}
+	if serverHost.Pod == nil {
+		t.Fatalf("Could not find host network namespace pod on server node %s", server.Pod.Spec.NodeName)
+	}
+
 	assertNoLeaks, _ := t.Context().Features.MatchRequirements(s.reqs...)
 
 	if !assertNoLeaks {

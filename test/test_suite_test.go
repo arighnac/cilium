@@ -6,7 +6,6 @@ package ciliumTest
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 	"github.com/onsi/gomega/format"
 	"github.com/sirupsen/logrus"
 
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/test/config"
 	. "github.com/cilium/cilium/test/ginkgo-ext"
 	"github.com/cilium/cilium/test/helpers"
@@ -26,15 +24,13 @@ import (
 	// These packages are where Ginkgo test specs live. They are declared as blank
 	// (_) global variables and are pulled in using package import side effects.
 	_ "github.com/cilium/cilium/test/k8s"
-	_ "github.com/cilium/cilium/test/runtime"
 )
 
 var (
-	log             = logging.DefaultLogger
+	log             = logrus.New()
 	DefaultSettings = map[string]string{
-		"K8S_VERSION": "1.32",
+		"K8S_VERSION": "1.35",
 	}
-	k8sNodesEnv         = "K8S_NODES"
 	commandsLogFileName = "cmds.log"
 )
 
@@ -147,18 +143,6 @@ func goReportSetupStatus() chan bool {
 	return exit
 }
 
-func reportCreateVMFailure(vm string, err error) {
-	failmsg := fmt.Sprintf(`
-        ===================== ERROR - VM PROVISION FAILED =====================
-
-        Unable to provision and start VM %q: %s", vm, err
-
-        =======================================================================
-        `, vm, err)
-	GinkgoPrint(failmsg)
-	Fail(failmsg)
-}
-
 var _ = BeforeAll(func() {
 	helpers.Init()
 	By("Starting tests: command line parameters: %+v environment variables: %v", config.CiliumTestConfig, os.Environ())
@@ -191,73 +175,8 @@ var _ = BeforeAll(func() {
 	}
 
 	switch scope {
-	case helpers.Runtime:
-		// Boot / provision VMs if specified by configuration.
-		if config.CiliumTestConfig.Reprovision {
-			err = helpers.CreateVM(helpers.Runtime)
-			if err != nil {
-				log.WithError(err).Error("Error starting VM")
-				reportCreateVMFailure(helpers.Runtime, err)
-			}
-		}
-
-		vm := helpers.InitRuntimeHelper(helpers.Runtime, logger)
-		err = vm.SetUpCilium()
-
-		if err != nil {
-			// AfterFailed function is not defined in this scope, fired the
-			// ReportFailed manually for this assert to gather cilium logs Fix
-			// #3428
-			vm.ReportFailed()
-			log.WithError(err).Error("Cilium was unable to be set up correctly")
-			reportCreateVMFailure(helpers.Runtime, err)
-		}
-		go vm.PprofReport()
 
 	case helpers.K8s:
-		// FIXME: This should be:
-		// Start k8s1 and provision kubernetes.
-		// When finish, start to build cilium in background
-		// Start k8s2
-		// Wait until compilation finished, and pull cilium image on k8s2
-
-		// Name for K8s VMs depends on K8s version that is running.
-
-		// Boot / provision VMs if specified by configuration.
-		if config.CiliumTestConfig.Reprovision {
-			var nodesInt int
-			nodes := os.Getenv(k8sNodesEnv)
-			if nodes != "" {
-				nodesInt, err = strconv.Atoi(nodes)
-				if err != nil {
-					Fail(fmt.Sprintf("%s value is not a number %q", k8sNodesEnv, nodes))
-				}
-			}
-
-			err = helpers.CreateVM(helpers.K8s1VMName())
-			if err != nil {
-				reportCreateVMFailure(helpers.K8s1VMName(), err)
-			}
-
-			if nodesInt != 1 {
-				err = helpers.CreateVM(helpers.K8s2VMName())
-				if err != nil {
-					reportCreateVMFailure(helpers.K8s2VMName(), err)
-				}
-			}
-
-			// For Nightly test we need to have more than two kubernetes nodes. If
-			// the env variable K8S_NODES is present, more nodes will be created.
-			if nodesInt > 2 {
-				for i := 3; i <= nodesInt; i++ {
-					vmName := fmt.Sprintf("%s%d-%s", helpers.K8s, i, helpers.GetCurrentK8SEnv())
-					err = helpers.CreateVM(vmName)
-					if err != nil {
-						reportCreateVMFailure(vmName, err)
-					}
-				}
-			}
-		}
 		kubectl := helpers.CreateKubectl(helpers.K8s1VMName(), logger)
 		kubectl.PrepareCluster()
 

@@ -2,7 +2,7 @@
 
 ## cilium-dbg statedb
 
-Inspect StateDB (deprecated)
+Dump StateDB contents as JSON
 
 ```
 cilium-dbg statedb [flags]
@@ -17,13 +17,14 @@ cilium-dbg statedb [flags]
 ### Options inherited from parent commands
 
 ```
-      --config string   Config file (default is $HOME/.cilium.yaml)
-  -D, --debug           Enable debug messages
-  -H, --host string     URI to server-side API
+      --config string        Config file (default is $HOME/.cilium.yaml)
+  -D, --debug                Enable debug messages
+  -H, --host string          URI to server-side API
+      --log-driver strings   Logging endpoints to use (example: syslog)
+      --log-opt map          Log driver options (example: format=json)
 ```
 
 ### SEE ALSO
 
 * [cilium-dbg](cilium-dbg.md)	 - CLI
-* [cilium-dbg statedb dump](cilium-dbg_statedb_dump.md)	 - Dump StateDB contents as JSON
 

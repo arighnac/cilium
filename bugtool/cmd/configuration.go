@@ -76,19 +76,15 @@ var bpfMapsPath = []string{
 	"tc/globals/cilium_auth_map",
 	"tc/globals/cilium_call_policy",
 	"tc/globals/cilium_calls_overlay_2",
-	"tc/globals/cilium_calls_wireguard_2",
-	"tc/globals/cilium_calls_xdp",
-	"tc/globals/cilium_capture_cache",
+	"tc/globals/cilium_calls_wireguard*",
+	"tc/globals/cilium_calls_xdp*",
 	"tc/globals/cilium_runtime_config",
 	"tc/globals/cilium_lxc",
 	"tc/globals/cilium_metrics",
-	"tc/globals/cilium_tunnel_map",
-	"tc/globals/cilium_ktime_cache",
 	"tc/globals/cilium_ipcache",
+	"tc/globals/cilium_ipcache_v2",
 	"tc/globals/cilium_events",
 	"tc/globals/cilium_signals",
-	"tc/globals/cilium_capture4_rules",
-	"tc/globals/cilium_capture6_rules",
 	"tc/globals/cilium_nodeport_neigh4",
 	"tc/globals/cilium_nodeport_neigh6",
 	"tc/globals/cilium_node_map",
@@ -104,9 +100,12 @@ var bpfMapsPath = []string{
 	"tc/globals/cilium_ipmasq_v4",
 	"tc/globals/cilium_ipmasq_v6",
 	"tc/globals/cilium_ipv4_frag_datagrams",
+	"tc/globals/cilium_ipv6_frag_datagrams",
 	"tc/globals/cilium_throttle",
 	"tc/globals/cilium_encrypt_state",
 	"tc/globals/cilium_egress_gw_policy_v4",
+	"tc/globals/cilium_egress_gw_policy_v4_v2",
+	"tc/globals/cilium_egress_gw_policy_v6",
 	"tc/globals/cilium_srv6_vrf_v4",
 	"tc/globals/cilium_srv6_vrf_v6",
 	"tc/globals/cilium_srv6_policy_v4",
@@ -131,8 +130,11 @@ var bpfMapsPath = []string{
 	"tc/globals/cilium_ct_any6_global",
 	"tc/globals/cilium_snat_v4_external",
 	"tc/globals/cilium_snat_v6_external",
+	"tc/globals/cilium_snat_v4_alloc_retries",
+	"tc/globals/cilium_snat_v6_alloc_retries",
 	"tc/globals/cilium_vtep_map",
 	"tc/globals/cilium_l2_responder_v4",
+	"tc/globals/cilium_l2_responder_v6",
 	"tc/globals/cilium_ratelimit",
 	"tc/globals/cilium_ratelimit_metrics",
 	"tc/globals/cilium_skip_lb4",
@@ -158,14 +160,20 @@ func defaultCommands(confDir string, cmdDir string) []string {
 	commands = append(commands, copyStateDirCommand(cmdDir)...)
 	commands = append(commands, tcInterfaceCommands()...)
 
-	// We want to collect this twice: at the very beginning and at the
+	// We want to collect these twice: at the very beginning and at the
 	// very end of the bugtool collection, to see if the counters are
 	// increasing.
 	// The commands end up being the names of the files where their output
 	// is stored, so we can't have the two commands be the exact same or the
 	// second would overwrite. To avoid that, we use the -u flag in this second
 	// command; that flag is documented as being ignored.
-	commands = append(commands, "cat -u /proc/net/xfrm_stat")
+	commands = append(commands,
+		"cat -u /proc/net/xfrm_stat",
+		"cat -u /proc/net/softnet_stat",
+		"cat -u /proc/net/snmp",
+		"cat -u /proc/net/netstat",
+		"cat -u /proc/net/snmp6",
+	)
 
 	return commands
 }
@@ -176,13 +184,32 @@ func miscSystemCommands() []string {
 		// very end of the bugtool collection, to see if the counters are
 		// increasing.
 		"cat /proc/net/xfrm_stat",
+		// Host packet-drop counters, collected at the start and, via the -u
+		// variants in defaultCommands, at the end so the delta over the
+		// collection window is visible. softnet_stat is the only place a packet
+		// dropped before it reaches a netdev or socket queue is counted: column
+		// 2 is the per-CPU backlog drop count (netdev_max_backlog exceeded) and
+		// column 3 is time_squeeze (softirq ran out of budget, i.e. the CPU
+		// could not keep up). snmp and netstat add the IP/TCP layer drop
+		// counters (e.g. ListenDrops, ListenOverflows, TCPBacklogDrop) that tell
+		// a socket accept-queue drop apart from a backlog drop. snmp6 and
+		// dev_snmp6 are the IPv6 counterparts: they carry Ip6InDiscards,
+		// Ip6InAddrErrors, Ip6InNoRoutes, Ip6InHdrErrors, Ip6InTruncatedPkts,
+		// Ip6InUnknownProtos and the Tcp6/Udp6 error counters, i.e. the one
+		// place an IPv6 packet dropped in the host IP stack is recorded. The
+		// dev_snmp6 glob is expanded by bash -c into the per-interface files.
+		"cat /proc/net/softnet_stat",
+		"cat /proc/net/snmp",
+		"cat /proc/net/netstat",
+		"cat /proc/net/snmp6",
+		"cat -v -A /proc/net/dev_snmp6/*",
 		// Host and misc
 		"ps auxfw",
 		"hostname",
 		"ip a",
 		"ip -4 r",
 		"ip -6 r",
-		"ip -d -s l",
+		"ip -d -s -s l",
 		"ip -4 n",
 		"ip -6 n",
 		"ss -t -p -a -i -s -n -e",
@@ -218,6 +245,7 @@ func miscSystemCommands() []string {
 		// tc
 		"tc qdisc show",
 		"tc -d -s qdisc show", // Show statistics on queuing disciplines
+		"find /sys/fs/bpf -ls",
 	}
 }
 
@@ -235,15 +263,19 @@ func bpfCgroupCommands() []string {
 	return commands
 }
 
-func bpfMapDumpCommands(mapPaths []string) []string {
+func bpfMapDumpCommands(mapPathsPatterns []string) []string {
 	bpffsMountpoint := bpffsMountpoint()
 	if bpffsMountpoint == "" {
 		return nil
 	}
 
-	commands := make([]string, 0, len(mapPaths))
-	for _, mapPath := range mapPaths {
-		commands = append(commands, "bpftool map dump pinned "+filepath.Join(bpffsMountpoint, mapPath))
+	commands := make([]string, 0, len(mapPathsPatterns))
+	for _, pattern := range mapPathsPatterns {
+		if matches, err := filepath.Glob(filepath.Join(bpffsMountpoint, pattern)); err == nil {
+			for _, match := range matches {
+				commands = append(commands, "bpftool map dump pinned "+match)
+			}
+		}
 	}
 
 	return commands
@@ -330,7 +362,7 @@ func routeCommands() []string {
 	commands := []string{}
 	routes, _ := execCommand("ip route show table all | grep -E --only-matching 'table [0-9]+'")
 
-	for _, r := range bytes.Split(bytes.TrimSuffix(routes, []byte("\n")), []byte("\n")) {
+	for r := range bytes.SplitSeq(bytes.TrimSuffix(routes, []byte("\n")), []byte("\n")) {
 		routeTablev4 := fmt.Sprintf("ip -4 route show %s", r)
 		routeTablev6 := fmt.Sprintf("ip -6 route show %s", r)
 		commands = append(commands, routeTablev4, routeTablev6)
@@ -379,15 +411,16 @@ func ciliumDbgCommands(cmdDir string) []string {
 		fmt.Sprintf("cilium-dbg debuginfo --output=markdown,json -f --output-directory=%s", cmdDir),
 		"cilium-dbg metrics list",
 		"cilium-dbg shell -- metrics/html",
+		"cilium-dbg shell -- health/history",
 		"cilium-dbg bpf metrics list",
 		"cilium-dbg fqdn cache list",
 		"cilium-dbg config -a",
 		"cilium-dbg encrypt status",
 		"cilium-dbg endpoint list",
+		"cilium-dbg endpoint list -o json",
 		"cilium-dbg bpf auth list",
 		"cilium-dbg bpf bandwidth list",
 		"cilium-dbg bpf config list",
-		"cilium-dbg bpf tunnel list",
 		"cilium-dbg bpf lb list",
 		"cilium-dbg bpf lb list --revnat",
 		"cilium-dbg bpf lb list --frontends",
@@ -397,8 +430,9 @@ func ciliumDbgCommands(cmdDir string) []string {
 		"cilium-dbg bpf egress list",
 		"cilium-dbg bpf vtep list",
 		"cilium-dbg bpf endpoint list",
-		"cilium-dbg bpf ct list global",
+		"cilium-dbg bpf ct list --time-diff",
 		"cilium-dbg bpf nat list",
+		"cilium-dbg bpf nat retries list",
 		"cilium-dbg bpf ipmasq list",
 		"cilium-dbg bpf ipcache list",
 		"cilium-dbg bpf policy get --all --numeric",
@@ -408,13 +442,6 @@ func ciliumDbgCommands(cmdDir string) []string {
 		"cilium-dbg ip list -n -o json",
 		"cilium-dbg map list --verbose",
 		"cilium-dbg map events cilium_ipcache -o json",
-		"cilium-dbg map events cilium_tunnel_map -o json",
-		"cilium-dbg map events cilium_lb4_services_v2 -o json",
-		"cilium-dbg map events cilium_lb4_backends_v2 -o json",
-		"cilium-dbg map events cilium_lb4_backends_v3 -o json",
-		"cilium-dbg map events cilium_lb6_services_v2 -o json",
-		"cilium-dbg map events cilium_lb6_backends_v2 -o json",
-		"cilium-dbg map events cilium_lb6_backends_v3 -o json",
 		"cilium-dbg map events cilium_lxc -o json",
 		"cilium-dbg service list",
 		"cilium-dbg service list -o json",
@@ -428,13 +455,18 @@ func ciliumDbgCommands(cmdDir string) []string {
 		"cilium-dbg bpf nodeid list",
 		"cilium-dbg lrp list",
 		"cilium-dbg cgroups list -o json",
-		"cilium-dbg statedb dump",
-		"cilium-dbg bgp peers",
-		"cilium-dbg bgp routes available ipv4 unicast",
-		"cilium-dbg bgp routes available ipv6 unicast",
-		"cilium-dbg bgp routes advertised ipv4 unicast",
-		"cilium-dbg bgp routes advertised ipv6 unicast",
-		"cilium-dbg bgp route-policies",
+		"cilium-dbg statedb",
+		"cilium-dbg shell -- bgp/peers",
+		"cilium-dbg shell -- bgp/peers -f detailed",
+		"cilium-dbg shell -- bgp/routes -a in ipv4 unicast",
+		"cilium-dbg shell -- bgp/routes -a in ipv6 unicast",
+		"cilium-dbg shell -- bgp/routes -a loc ipv4 unicast",
+		"cilium-dbg shell -- bgp/routes -a loc ipv6 unicast",
+		"cilium-dbg shell -- bgp/routes -a out ipv4 unicast",
+		"cilium-dbg shell -- bgp/routes -a out ipv6 unicast",
+		"cilium-dbg shell -- bgp/route-policies",
+		"cilium-dbg shell -- policy/mapstate/entries",
+		"cilium-dbg shell -- policy/mapstate/topk",
 		"cilium-dbg troubleshoot kvstore",
 		"cilium-dbg troubleshoot clustermesh",
 		"cilium-dbg bpf frag list",

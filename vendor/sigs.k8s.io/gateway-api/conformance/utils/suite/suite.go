@@ -31,19 +31,21 @@ import (
 	"github.com/stretchr/testify/require"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	xmeshv1alpha1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 	confv1 "sigs.k8s.io/gateway-api/conformance/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance/utils/config"
-	"sigs.k8s.io/gateway-api/conformance/utils/flags"
 	"sigs.k8s.io/gateway-api/conformance/utils/grpc"
 	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
 	"sigs.k8s.io/gateway-api/conformance/utils/roundtripper"
 	"sigs.k8s.io/gateway-api/conformance/utils/tlog"
+	"sigs.k8s.io/gateway-api/conformance/utils/websocket"
 	"sigs.k8s.io/gateway-api/pkg/consts"
 	"sigs.k8s.io/gateway-api/pkg/features"
 )
@@ -62,24 +64,33 @@ type ConformanceTestSuite struct {
 	RestConfig               *rest.Config
 	RoundTripper             roundtripper.RoundTripper
 	GRPCClient               grpc.Client
+	WebSocketDialer          websocket.Dialer
 	GatewayClassName         string
+	MeshName                 string
 	ControllerName           string
 	Debug                    bool
 	Cleanup                  bool
+	CleanupTestResources     bool
 	BaseManifests            string
 	MeshManifests            string
 	Applier                  kubernetes.Applier
-	SupportedFeatures        sets.Set[features.FeatureName]
+	SupportedFeatures        FeaturesSet
 	TimeoutConfig            config.TimeoutConfig
 	SkipTests                sets.Set[string]
 	SkipProvisionalTests     bool
 	RunTest                  string
+	Hook                     func(t *testing.T, test ConformanceTest, suite *ConformanceTestSuite)
 	ManifestFS               []fs.FS
-	UsableNetworkAddresses   []v1beta1.GatewayAddress
-	UnusableNetworkAddresses []v1beta1.GatewayAddress
+	UsableNetworkAddresses   []gatewayv1.GatewaySpecAddress
+	UnusableNetworkAddresses []gatewayv1.GatewaySpecAddress
+
+	// If SupportedFeatures are automatically determined from GWC Status.
+	// This will be required to report in future iterations as the passing
+	// will be determined based on this.
+	supportedFeaturesSource supportedFeaturesSource
 
 	// mode is the operating mode of the implementation.
-	// The default value for it is "default".
+	// The default value is "default".
 	mode string
 
 	// implementation contains the details of the implementation, such as
@@ -119,55 +130,70 @@ type ConformanceTestSuite struct {
 
 	// lock is a mutex to help ensure thread safety of the test suite object.
 	lock sync.RWMutex
+
+	failFast bool
 }
 
-// Options can be used to initialize a ConformanceTestSuite.
-type ConformanceOptions struct {
-	Client               client.Client
-	ClientOptions        client.Options
-	Clientset            clientset.Interface
-	RestConfig           *rest.Config
-	GatewayClassName     string
-	Debug                bool
-	RoundTripper         roundtripper.RoundTripper
-	GRPCClient           grpc.Client
-	BaseManifests        string
-	MeshManifests        string
-	NamespaceLabels      map[string]string
-	NamespaceAnnotations map[string]string
-	ReportOutputPath     string
-
+// ConfigurableOptions defines conformance options that are configurable by the user via flags or yaml.
+type ConfigurableOptions struct {
+	GatewayClassName     string            `json:"gatewayClassName"`
+	MeshName             string            `json:"meshName"`
+	Debug                bool              `json:"debug"`
+	NamespaceLabels      map[string]string `json:"namespaceLabels"`
+	NamespaceAnnotations map[string]string `json:"namespaceAnnotations"`
+	ReportOutputPath     string            `json:"reportOutputPath"`
 	// CleanupBaseResources indicates whether or not the base test
 	// resources such as Gateways should be cleaned up after the run.
-	CleanupBaseResources       bool
-	SupportedFeatures          sets.Set[features.FeatureName]
-	ExemptFeatures             sets.Set[features.FeatureName]
-	EnableAllSupportedFeatures bool
-	TimeoutConfig              config.TimeoutConfig
+	CleanupBaseResources bool `json:"cleanupBaseResources"`
+	// CleanupTestResources indicates whether or not test-specific manifests
+	// should be cleaned up after each test.
+	CleanupTestResources       bool                   `json:"cleanupTestResources"`
+	SupportedFeatures          []features.FeatureName `json:"supportedFeatures"`
+	ExemptFeatures             []features.FeatureName `json:"exemptFeatures"`
+	EnableAllSupportedFeatures bool                   `json:"enableAllSupportedFeatures"`
+	TimeoutConfig              config.TimeoutConfig   `json:"timeoutConfig"`
 	// SkipTests contains all the tests not to be run and can be used to opt out
 	// of specific tests
-	SkipTests []string
+	SkipTests []string `json:"skipTests"`
 	// SkipProvisionalTests indicates whether or not to skip provisional tests.
-	SkipProvisionalTests bool
+	SkipProvisionalTests bool `json:"skipProvisionalTests"`
 	// RunTest is a single test to run, mostly for development/debugging convenience.
-	RunTest string
-
-	ManifestFS []fs.FS
+	RunTest             string                   `json:"runTest"`
+	Mode                string                   `json:"mode"`
+	AllowCRDsMismatch   bool                     `json:"allowCrdsMismatch"`
+	Implementation      confv1.Implementation    `json:"implementation"`
+	ConformanceProfiles []ConformanceProfileName `json:"conformanceProfiles"`
+	FailFast            bool                     `json:"failFast"`
 
 	// UsableNetworkAddresses is an optional pool of usable addresses for
 	// Gateways for tests which need to test manual address assignments.
-	UsableNetworkAddresses []v1beta1.GatewayAddress
+	UsableNetworkAddresses []gatewayv1.GatewaySpecAddress `json:"usableNetworkAddresses"`
 
 	// UnusableNetworkAddresses is an optional pool of unusable addresses for
 	// Gateways for tests which need to test failures with manual Gateway
 	// address assignment.
-	UnusableNetworkAddresses []v1beta1.GatewayAddress
-
-	Mode                string
-	AllowCRDsMismatch   bool
-	Implementation      confv1.Implementation
-	ConformanceProfiles sets.Set[ConformanceProfileName]
+	UnusableNetworkAddresses []gatewayv1.GatewaySpecAddress `json:"unusableNetworkAddresses"`
 }
+
+// ConformanceOptions can be used to initialize a ConformanceTestSuite.
+type ConformanceOptions struct {
+	ConfigurableOptions
+
+	Client          client.Client
+	ClientOptions   client.Options
+	Clientset       clientset.Interface
+	RestConfig      *rest.Config
+	RoundTripper    roundtripper.RoundTripper
+	GRPCClient      grpc.Client
+	WebSocketDialer websocket.Dialer
+	BaseManifests   string
+	MeshManifests   string
+	// Hook is an optional function that can be used to run custom logic after each test at suite level.
+	Hook       func(t *testing.T, test ConformanceTest, suite *ConformanceTestSuite)
+	ManifestFS []fs.FS
+}
+
+type FeaturesSet = sets.Set[features.FeatureName]
 
 const (
 	// undefinedKeyword is set in the ConformanceReport "GatewayAPIVersion" and
@@ -176,18 +202,67 @@ const (
 	undefinedKeyword = "UNDEFINED"
 )
 
+// SupportedFeaturesSource represents the source from which supported features are derived.
+// It is used to distinguish between them being inferred from GWC Status or manually
+// supplied for the conformance report.
+type supportedFeaturesSource string
+
+const (
+	supportedFeaturesSourceManual   supportedFeaturesSource = "Manual"
+	supportedFeaturesSourceInferred supportedFeaturesSource = "Inferred"
+)
+
 // NewConformanceTestSuite is a helper to use for creating a new ConformanceTestSuite.
 func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite, error) {
-	// test suite callers are required to provide either:
-	// - one conformance profile via the flag '-conformance-profiles'
-	// - a list of supported features via the flag '-supported-features'
-	// - an explicit test to run via the flag '-run-test'
-	// - all features are being tested via the flag '-all-features'
-	if options.SupportedFeatures.Len() == 0 &&
-		options.ConformanceProfiles.Len() == 0 &&
-		!options.EnableAllSupportedFeatures &&
-		options.RunTest == "" {
-		return nil, fmt.Errorf("no conformance profile, supported features, explicit tests were provided so no tests could be selected")
+	if options.Mode == "" {
+		// Necessary for now, in case downstream consumers call
+		// NewConformanceTestSuite without setting Mode.
+		options.Mode = "default"
+	}
+	supportedFeatures := sets.New(options.SupportedFeatures...).Difference(sets.New(options.ExemptFeatures...))
+	source := supportedFeaturesSourceManual
+	if options.EnableAllSupportedFeatures {
+		supportedFeatures = features.SetsToNamesSet(features.AllFeatures).Difference(sets.New(options.ExemptFeatures...))
+	} else if shouldInferSupportedFeatures(&options) {
+		var err error
+		if options.GatewayClassName != "" {
+			supportedFeatures, err = fetchGatewayClassSupportedFeatures(options.Client, options.GatewayClassName)
+			if err != nil {
+				return nil, fmt.Errorf("cannot infer supported features from GWC: %w", err)
+			}
+		}
+
+		supportedMeshFeatures := FeaturesSet{}
+		if options.MeshName != "" {
+			supportedMeshFeatures, err = fetchMeshSupportedFeatures(options.Client, options.MeshName)
+			if err != nil {
+				return nil, fmt.Errorf("cannot infer supported features from XMesh: %w", err)
+			}
+		}
+
+		source = supportedFeaturesSourceInferred
+		supportedFeatures = supportedFeatures.Union(supportedMeshFeatures)
+	}
+
+	// If features were not inferred from Status, it's a GWC issue.
+	if source == supportedFeaturesSourceInferred && supportedFeatures.Len() == 0 {
+		return nil, fmt.Errorf("no supported features were determined for test suite")
+	}
+
+	extendedSupportedFeatures := make(map[ConformanceProfileName]FeaturesSet, 0)
+	extendedUnsupportedFeatures := make(map[ConformanceProfileName]FeaturesSet, 0)
+
+	for _, conformanceProfileName := range options.ConformanceProfiles {
+		conformanceProfile, err := getConformanceProfileForName(conformanceProfileName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve conformance profile: %w", err)
+		}
+		// the use of a conformance profile implicitly enables any features of
+		// that profile which are supported at a Core level of support.
+		supportedFeatures = supportedFeatures.Union(conformanceProfile.CoreFeatures)
+
+		extendedSupportedFeatures[conformanceProfileName] = conformanceProfile.ExtendedFeatures.Intersection(supportedFeatures)
+		extendedUnsupportedFeatures[conformanceProfileName] = conformanceProfile.ExtendedFeatures.Difference(supportedFeatures)
 	}
 
 	config.SetupTimeoutConfig(&options.TimeoutConfig)
@@ -198,6 +273,11 @@ func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite,
 	}
 
 	grpcClient := options.GRPCClient
+
+	webSocketDialer := options.WebSocketDialer
+	if webSocketDialer == nil {
+		webSocketDialer = &websocket.DefaultDialer{}
+	}
 
 	installedCRDs := &apiextensionsv1.CustomResourceDefinitionList{}
 	err := options.Client.List(context.TODO(), installedCRDs)
@@ -216,41 +296,25 @@ func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite,
 		apiChannel = undefinedKeyword
 	}
 
-	mode := flags.DefaultMode
-	if options.Mode != "" {
-		mode = options.Mode
-	}
-
-	// test suite callers can potentially just run all tests by saying they
-	// cover all features, if they don't they'll need to have provided a
-	// conformance profile or at least some specific features they support.
-	if options.EnableAllSupportedFeatures {
-		options.SupportedFeatures = features.SetsToNamesSet(features.AllFeatures)
-	} else if options.SupportedFeatures == nil {
-		options.SupportedFeatures = sets.New[features.FeatureName]()
-	}
-
-	for feature := range options.ExemptFeatures {
-		options.SupportedFeatures.Delete(feature)
-	}
-
 	suite := &ConformanceTestSuite{
-		Client:           options.Client,
-		ClientOptions:    options.ClientOptions,
-		Clientset:        options.Clientset,
-		RestConfig:       options.RestConfig,
-		RoundTripper:     roundTripper,
-		GRPCClient:       grpcClient,
-		GatewayClassName: options.GatewayClassName,
-		Debug:            options.Debug,
-		Cleanup:          options.CleanupBaseResources,
-		BaseManifests:    options.BaseManifests,
-		MeshManifests:    options.MeshManifests,
+		Client:               options.Client,
+		ClientOptions:        options.ClientOptions,
+		Clientset:            options.Clientset,
+		RestConfig:           options.RestConfig,
+		RoundTripper:         roundTripper,
+		GRPCClient:           grpcClient,
+		WebSocketDialer:      webSocketDialer,
+		GatewayClassName:     options.GatewayClassName,
+		Debug:                options.Debug,
+		Cleanup:              options.CleanupBaseResources,
+		CleanupTestResources: options.CleanupTestResources,
+		BaseManifests:        options.BaseManifests,
+		MeshManifests:        options.MeshManifests,
 		Applier: kubernetes.Applier{
 			NamespaceLabels:      options.NamespaceLabels,
 			NamespaceAnnotations: options.NamespaceAnnotations,
 		},
-		SupportedFeatures:           options.SupportedFeatures,
+		SupportedFeatures:           supportedFeatures,
 		TimeoutConfig:               options.TimeoutConfig,
 		SkipTests:                   sets.New(options.SkipTests...),
 		RunTest:                     options.RunTest,
@@ -259,44 +323,16 @@ func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite,
 		UsableNetworkAddresses:      options.UsableNetworkAddresses,
 		UnusableNetworkAddresses:    options.UnusableNetworkAddresses,
 		results:                     make(map[string]testResult),
-		extendedUnsupportedFeatures: make(map[ConformanceProfileName]sets.Set[features.FeatureName]),
-		extendedSupportedFeatures:   make(map[ConformanceProfileName]sets.Set[features.FeatureName]),
-		conformanceProfiles:         options.ConformanceProfiles,
+		extendedUnsupportedFeatures: extendedUnsupportedFeatures,
+		extendedSupportedFeatures:   extendedSupportedFeatures,
+		conformanceProfiles:         sets.New(options.ConformanceProfiles...),
 		implementation:              options.Implementation,
-		mode:                        mode,
+		mode:                        options.Mode,
 		apiVersion:                  apiVersion,
 		apiChannel:                  apiChannel,
-	}
-
-	for _, conformanceProfileName := range options.ConformanceProfiles.UnsortedList() {
-		conformanceProfile, err := getConformanceProfileForName(conformanceProfileName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve conformance profile: %w", err)
-		}
-		// the use of a conformance profile implicitly enables any features of
-		// that profile which are supported at a Core level of support.
-		for _, f := range conformanceProfile.CoreFeatures.UnsortedList() {
-			if !options.SupportedFeatures.Has(f) {
-				suite.SupportedFeatures.Insert(f)
-			}
-		}
-		for _, f := range conformanceProfile.ExtendedFeatures.UnsortedList() {
-			if options.SupportedFeatures.Has(f) {
-				if suite.extendedSupportedFeatures[conformanceProfileName] == nil {
-					suite.extendedSupportedFeatures[conformanceProfileName] = sets.New[features.FeatureName]()
-				}
-				suite.extendedSupportedFeatures[conformanceProfileName].Insert(f)
-			} else {
-				if suite.extendedUnsupportedFeatures[conformanceProfileName] == nil {
-					suite.extendedUnsupportedFeatures[conformanceProfileName] = sets.New[features.FeatureName]()
-				}
-				suite.extendedUnsupportedFeatures[conformanceProfileName].Insert(f)
-			}
-			// Add Exempt Features into unsupported features list
-			if options.ExemptFeatures.Has(f) {
-				suite.extendedUnsupportedFeatures[conformanceProfileName].Insert(f)
-			}
-		}
+		supportedFeaturesSource:     source,
+		Hook:                        options.Hook,
+		failFast:                    options.FailFast,
 	}
 
 	// apply defaults
@@ -353,20 +389,49 @@ func (suite *ConformanceTestSuite) Setup(t *testing.T, tests []ConformanceTest) 
 		suite.Applier.MustApplyWithCleanup(t, suite.Client, suite.TimeoutConfig, suite.BaseManifests, suite.Cleanup)
 
 		tlog.Logf(t, "Test Setup: Applying programmatic resources")
-		secret := kubernetes.MustCreateSelfSignedCertSecret(t, "gateway-conformance-web-backend", "certificate", []string{"*"})
+		secret := kubernetes.MustCreateSelfSignedCertSecret(t, WebBackendNamespace, "certificate", []string{"*"})
 		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
-		secret = kubernetes.MustCreateSelfSignedCertSecret(t, "gateway-conformance-infra", "tls-validity-checks-certificate", []string{"*", "*.org"})
+		secret = kubernetes.MustCreateSelfSignedCertSecret(t, InfrastructureNamespace, "tls-validity-checks-certificate", []string{"*", "*.org", "*.wildcard.org"})
 		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
-		secret = kubernetes.MustCreateSelfSignedCertSecret(t, "gateway-conformance-infra", "tls-passthrough-checks-certificate", []string{"abc.example.com"})
+		configMap, _, _ := kubernetes.MustCreateCACertConfigMap(t, WebBackendNamespace, "web-backend-cm")
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{configMap}, suite.Cleanup)
+
+		// secrets for client certificates validation tests
+		caConfigMap, ca, caPrivKey := kubernetes.MustCreateCACertConfigMap(t, InfrastructureNamespace, "tls-validity-checks-ca-certificate")
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{caConfigMap}, suite.Cleanup)
+		secret = kubernetes.MustCreateCASignedClientCertSecret(t, "gateway-conformance-infra", "tls-validity-checks-client-certificate", ca, caPrivKey)
 		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
-		secret = kubernetes.MustCreateSelfSignedCertSecret(t, "gateway-conformance-app-backend", "tls-passthrough-checks-certificate", []string{"abc.example.com"})
+		caConfigMap, ca, caPrivKey = kubernetes.MustCreateCACertConfigMap(t, InfrastructureNamespace, "tls-validity-checks-per-port-ca-certificate")
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{caConfigMap}, suite.Cleanup)
+		secret = kubernetes.MustCreateCASignedClientCertSecret(t, InfrastructureNamespace, "tls-validity-checks-per-port-client-certificate", ca, caPrivKey)
 		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
+
+		caConfigMap, ca, caPrivKey = kubernetes.MustCreateCACertConfigMap(t, InfrastructureNamespace, "tls-checks-ca-certificate")
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{caConfigMap}, suite.Cleanup)
+		secret = kubernetes.MustCreateCASignedCertSecret(t, InfrastructureNamespace, "tls-checks-certificate", []string{"abc.example.com", "spiffe://abc.example.com/test-identity", "other.example.com"}, ca, caPrivKey)
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
+		secret = kubernetes.MustCreateCASignedClientCertSecret(t, InfrastructureNamespace, "tls-checks-client-certificate", ca, caPrivKey)
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
+
+		// Secret used for tcp-backend serving TLS
+		secret = kubernetes.MustCreateCASignedCertSecret(t, InfrastructureNamespace, "tls-passthrough-checks-certificate", []string{"abc.example.com"}, ca, caPrivKey)
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
+		secret = kubernetes.MustCreateCASignedCertSecret(t, AppBackendNamespace, "tls-passthrough-checks-certificate", []string{"abc.example.com"}, ca, caPrivKey)
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
+
+		// The following secret is used for TLSRoute mode Terminate validation
+		secret = kubernetes.MustCreateCASignedCertSecret(t, InfrastructureNamespace, "tls-terminate-checks-certificate", []string{"tls.example.com"}, ca, caPrivKey)
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{secret}, suite.Cleanup)
+
+		// The following CA certificate is used for BackendTLSPolicy testing to intentionally force TLS validation to fail.
+		caConfigMap, _, _ = kubernetes.MustCreateCACertConfigMap(t, InfrastructureNamespace, "mismatch-ca-certificate")
+		suite.Applier.MustApplyObjectsWithCleanup(t, suite.Client, suite.TimeoutConfig, []client.Object{caConfigMap}, suite.Cleanup)
 
 		tlog.Logf(t, "Test Setup: Ensuring Gateways and Pods from base manifests are ready")
 		namespaces := []string{
-			"gateway-conformance-infra",
-			"gateway-conformance-app-backend",
-			"gateway-conformance-web-backend",
+			InfrastructureNamespace,
+			AppBackendNamespace,
+			WebBackendNamespace,
 		}
 		kubernetes.NamespacesMustBeReady(t, suite.Client, suite.TimeoutConfig, namespaces)
 	}
@@ -376,10 +441,10 @@ func (suite *ConformanceTestSuite) Setup(t *testing.T, tests []ConformanceTest) 
 		suite.Applier.MustApplyWithCleanup(t, suite.Client, suite.TimeoutConfig, suite.MeshManifests, suite.Cleanup)
 		tlog.Logf(t, "Test Setup: Ensuring Gateways and Pods from mesh manifests are ready")
 		namespaces := []string{
-			"gateway-conformance-mesh",
-			"gateway-conformance-mesh-consumer",
-			"gateway-conformance-app-backend",
-			"gateway-conformance-web-backend",
+			MeshNamespace,
+			MeshConsumerNamespace,
+			AppBackendNamespace,
+			WebBackendNamespace,
 		}
 		kubernetes.MeshNamespacesMustBeReady(t, suite.Client, suite.TimeoutConfig, namespaces)
 	}
@@ -435,6 +500,9 @@ func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) er
 	sleepForTestIsolation := false
 	for _, test := range tests {
 		res := testSucceeded
+		if suite.RunTest != "" && test.ShortName != suite.RunTest {
+			res = testSkipped
+		}
 		if suite.SkipTests.Has(test.ShortName) {
 			res = testSkipped
 		}
@@ -447,7 +515,7 @@ func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) er
 
 		// TODO(wstcliyu): need a better long term solution for test isolation
 		// https://github.com/kubernetes-sigs/gateway-api/issues/3233
-		if res != testSkipped && res != testNotSupported && sleepForTestIsolation {
+		if res != testSkipped && res != testNotSupported && sleepForTestIsolation && suite.TimeoutConfig.TestIsolation > 0 {
 			tlog.Logf(t, "Sleeping %v for test isolation", suite.TimeoutConfig.TestIsolation)
 			time.Sleep(suite.TimeoutConfig.TestIsolation)
 		}
@@ -467,6 +535,17 @@ func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) er
 		}
 		if res == testSucceeded || res == testFailed {
 			sleepForTestIsolation = true
+		}
+
+		// call the hook function if it was provided,
+		// this's useful for running custom logic after each test at suite level,
+		// such as collecting current state of the cluster for debugging.
+		if suite.Hook != nil {
+			suite.Hook(t, test, suite)
+		}
+
+		if suite.failFast && res == testFailed {
+			break
 		}
 	}
 
@@ -535,30 +614,94 @@ func (suite *ConformanceTestSuite) Report() (*confv1.ConformanceReport, error) {
 	}, nil
 }
 
-// ParseImplementation parses implementation-specific flag arguments and
-// creates a *confv1a1.Implementation.
-func ParseImplementation(org, project, url, version, contact string) confv1.Implementation {
-	return confv1.Implementation{
-		Organization: org,
-		Project:      project,
-		URL:          url,
-		Version:      version,
-		Contact:      strings.Split(contact, ","),
+// ParseConformanceProfiles parses a comma-separated string of conformance
+// profile names into a set. Used for backward compatibility with
+// external consumers of this package.
+func ParseConformanceProfiles(p string) sets.Set[ConformanceProfileName] {
+	slice := ParseConformanceProfilesSlice(p)
+	if slice == nil {
+		return nil
 	}
+	return sets.New(slice...)
 }
 
-// ParseConformanceProfiles parses flag arguments and converts the string to
-// sets.Set[ConformanceProfileName].
-func ParseConformanceProfiles(p string) sets.Set[ConformanceProfileName] {
-	res := sets.Set[ConformanceProfileName]{}
+// ParseConformanceProfilesSlice parses a comma-separated string of conformance
+// profile names into a slice. Used internally for populating ConfigurableOptions.
+func ParseConformanceProfilesSlice(p string) []ConformanceProfileName {
 	if p == "" {
-		return res
+		return nil
 	}
-
-	for _, value := range strings.Split(p, ",") {
-		res.Insert(ConformanceProfileName(value))
+	var res []ConformanceProfileName
+	for value := range strings.SplitSeq(p, ",") {
+		res = append(res, ConformanceProfileName(value))
 	}
 	return res
+}
+
+func fetchGatewayClassSupportedFeatures(client client.Client, gatewayClassName string) (FeaturesSet, error) {
+	if gatewayClassName == "" {
+		return nil, fmt.Errorf("GatewayClass name must be provided to fetch supported features")
+	}
+	gwc := &gatewayv1.GatewayClass{}
+	err := client.Get(context.TODO(), types.NamespacedName{Name: gatewayClassName}, gwc)
+	if err != nil {
+		return nil, fmt.Errorf("fetchGatewayClassSupportedFeatures(): %w", err)
+	}
+
+	fs := FeaturesSet{}
+	for _, feature := range gwc.Status.SupportedFeatures {
+		fs.Insert(features.FeatureName(feature.Name))
+	}
+
+	// If Mesh features are populated in the GatewayClass we remove them from the supported features set.
+	meshFeatureNames := features.SetsToNamesSet(features.MeshCoreFeatures, features.MeshExtendedFeatures)
+	for _, f := range fs.UnsortedList() {
+		if meshFeatureNames.Has(f) {
+			fs.Delete(f)
+			fmt.Printf("WARNING: Mesh feature %q should not be populated in GatewayClass, skipping...", f)
+		}
+	}
+	fmt.Printf("Supported features for GatewayClass %s: %v\n", gatewayClassName, fs.UnsortedList())
+	return fs, nil
+}
+
+func fetchMeshSupportedFeatures(client client.Client, meshName string) (FeaturesSet, error) {
+	if meshName == "" {
+		return nil, fmt.Errorf("mesh name must be provided to fetch supported features")
+	}
+	xmesh := &xmeshv1alpha1.XMesh{}
+	err := client.Get(context.TODO(), types.NamespacedName{Name: meshName}, xmesh)
+	if err != nil {
+		return nil, fmt.Errorf("fetchMeshSupportedFeatures(): %w", err)
+	}
+
+	fs := FeaturesSet{}
+	for _, feature := range xmesh.Status.SupportedFeatures {
+		fs.Insert(features.FeatureName(feature.Name))
+	}
+
+	gwcFeatureNames := features.SetsToNamesSet(features.GatewayCoreFeatures, features.GatewayExtendedFeatures)
+	for _, f := range fs.UnsortedList() {
+		if gwcFeatureNames.Has(f) {
+			fs.Delete(f)
+			fmt.Printf("WARNING: Mesh feature %q should not be populated in XMesh.Status, skipping...", f)
+		}
+	}
+	fmt.Printf("Supported features for XMesh%s: %v\n", meshName, fs.UnsortedList())
+	return fs, nil
+}
+
+// shouldInferSupportedFeatures checks if any flags were supplied for manually
+// picking what to test. Inferred supported features are only used when no flags
+// are set.
+func shouldInferSupportedFeatures(opts *ConformanceOptions) bool {
+	if opts == nil {
+		return false
+	}
+	return !opts.EnableAllSupportedFeatures &&
+		len(opts.SupportedFeatures) == 0 &&
+		len(opts.ExemptFeatures) == 0 &&
+		opts.RunTest == ""
 }
 
 // getAPIVersionAndChannel iterates over all the crds installed in the cluster and check the version and channel annotations.

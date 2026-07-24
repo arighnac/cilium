@@ -14,9 +14,6 @@ import (
 const (
 	// ClusterName is the default cluster name
 	ClusterName = ciliumDefaults.ClusterName
-	// DialTimeout is the timeout that is used when establishing a new
-	// connection.
-	DialTimeout = 30 * time.Second
 	// HealthCheckInterval is the time interval between health checks.
 	HealthCheckInterval = 5 * time.Second
 	// GopsPort is the default port for gops to listen on.
@@ -44,6 +41,9 @@ const (
 	// PeerUpdateInterval is the time interval in which relay is checking for
 	// newly joined peers for long running requests
 	PeerUpdateInterval = 2 * time.Second
+
+	// GRPCMetadataRelayVersionKey is the grpc metadata key for the Hubble relay server version.
+	GRPCMetadataRelayVersionKey = "hubble-relay-version"
 )
 
 var (

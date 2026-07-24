@@ -17,16 +17,18 @@ const (
 	// as the MTU for container devices when running direct routing mode.
 	EthernetMTU = 1500
 
-	// TunnelOverhead is an approximation for bytes used for tunnel
+	// TunnelOverheadIPv{4,6} is an approximation for bytes used for tunnel
 	// encapsulation. It accounts for:
+	//                       IPv4  IPv6
 	//    (Outer ethernet is not accounted against MTU size)
-	//    Outer IPv4 header:  20B
-	//    Outer UDP header:    8B
-	//    Outer VXLAN header:  8B
-	//    Original Ethernet:  14B
-	//                        ---
-	//    Total extra bytes:  50B
-	TunnelOverhead = 50
+	//    Outer IP header:    20B  40B
+	//    Outer UDP header:    8B   8B
+	//    Outer VXLAN header:  8B   8B
+	//    Original Ethernet:  14B  14B
+	//                        ---  ---
+	//    Total extra bytes:  50B  70B
+	TunnelOverheadIPv4 = 50
+	TunnelOverheadIPv6 = 70
 
 	// DsrTunnelOverhead is about the GENEVE DSR option that gets inserted
 	// by the LB, when addressing a Service in hs-ipcache mode
@@ -56,30 +58,55 @@ const (
 	// encapsulation.
 	//
 	// https://github.com/torvalds/linux/blob/v5.12/drivers/net/wireguard/device.c#L262:
+	// https://github.com/torvalds/linux/blob/v5.12/drivers/net/wireguard/send.c#L141
 	//      MESSAGE_MINIMUM_LENGTH:    32B
 	//      Outer IPv4 or IPv6 header: 40B
 	//      Outer UDP header:           8B
+	//      Maximum padding:           15B
 	//                                 ---
 	//      Total extra bytes:         80B
-	WireguardOverhead = 80
+	WireguardOverhead = 95
+
+	// IPv6MinMTU is the minimum MTU required for IPv6 to function on a
+	// network interface, as defined in RFC 8200 section 5. The Linux kernel
+	// refuses to initialize inet6_dev on interfaces with MTU below this
+	// value, causing all IPv6 packet reception to be silently discarded.
+	IPv6MinMTU = 1280
+
+	// IPIPv4Overhead is the overhead for the IPv4 header used in IPIP devices.
+	// sizeof(struct iphdr)
+	IPIPv4Overhead = 20
+
+	// IPIPv6Overhead is the overhead for the IPv6 header (40B) as well as tunnel
+	// encap limit option used in IP6IP6 devices.
+	// sizeof(struct ipv6hdr) + 8
+	// See kernel commit 381601e5bbae ("Make the ip6_tunnel reflect the true mtu.")
+	// for details.
+	IPIPv6Overhead = 48
 )
 
 // Configuration is an MTU configuration as returned by NewConfiguration
 type Configuration struct {
 	authKeySize      int
 	encapEnabled     bool
-	encryptEnabled   bool
+	ipsecEnabled     bool
 	wireguardEnabled bool
+	tunnelOverhead   int
 }
 
 // NewConfiguration returns a new MTU configuration which is used to calculate
 // MTU values from a base MTU based on the config.
-func NewConfiguration(authKeySize int, encryptEnabled bool, encapEnabled bool, wireguardEnabled bool) Configuration {
+func NewConfiguration(authKeySize int, ipsecEnabled, encapEnabled, wireguardEnabled, tunnelOverIPv6 bool) Configuration {
+	tunnelOverhead := TunnelOverheadIPv4
+	if tunnelOverIPv6 {
+		tunnelOverhead = TunnelOverheadIPv6
+	}
 	return Configuration{
 		authKeySize:      authKeySize,
 		encapEnabled:     encapEnabled,
-		encryptEnabled:   encryptEnabled,
+		ipsecEnabled:     ipsecEnabled,
 		wireguardEnabled: wireguardEnabled,
+		tunnelOverhead:   tunnelOverhead,
 	}
 }
 
@@ -87,49 +114,37 @@ func (c Configuration) Calculate(baseMTU int) RouteMTU {
 	return RouteMTU{
 		DeviceMTU:           c.getDeviceMTU(baseMTU),
 		RouteMTU:            c.getRouteMTU(baseMTU),
-		RoutePostEncryptMTU: c.getRoutePostEncryptMTU(baseMTU),
+		RoutePostEncryptMTU: c.getDeviceMTU(baseMTU),
 	}
-}
-
-// GetRoutePostEncryptMTU return the MTU to be used on the encryption routing
-// table. This is the MTU without encryption overhead and in the tunnel
-// case accounts for the tunnel overhead.
-func (c *Configuration) getRoutePostEncryptMTU(baseMTU int) int {
-	if c.encapEnabled {
-		postEncryptMTU := baseMTU - TunnelOverhead
-		if postEncryptMTU == 0 {
-			return EthernetMTU - TunnelOverhead
-		}
-		return postEncryptMTU
-
-	}
-	return c.getDeviceMTU(baseMTU)
 }
 
 // GetRouteMTU returns the MTU to be used on the network. When running in
 // tunneling mode and/or with encryption enabled, this will have tunnel and
 // encryption overhead accounted for.
+//
+// Note that IPIPv4Overhead and IPIPv6Overhead is not considered in getRouteMTU
+// today since Pod E/W traffic does not go through these devices today.
 func (c *Configuration) getRouteMTU(baseMTU int) int {
 	if c.wireguardEnabled {
 		if c.encapEnabled {
-			return c.getDeviceMTU(baseMTU) - (WireguardOverhead + TunnelOverhead)
+			return c.getDeviceMTU(baseMTU) - (WireguardOverhead + c.tunnelOverhead)
 		}
 		return c.getDeviceMTU(baseMTU) - WireguardOverhead
 	}
 
-	if !c.encapEnabled && !c.encryptEnabled {
+	if !c.encapEnabled && !c.ipsecEnabled {
 		return c.getDeviceMTU(baseMTU)
 	}
 
 	encryptOverhead := 0
 
-	if c.encryptEnabled {
+	if c.ipsecEnabled {
 		// Add the difference between the default and the actual key sizes here
 		// to account for users specifying non-default auth key lengths.
 		encryptOverhead = EncryptionIPsecOverhead + (c.authKeySize - EncryptionDefaultAuthKeyLength)
 	}
 
-	if c.encryptEnabled && !c.encapEnabled {
+	if c.ipsecEnabled && !c.encapEnabled {
 		preEncryptMTU := baseMTU - encryptOverhead
 		if preEncryptMTU == 0 {
 			return EthernetMTU - EncryptionIPsecOverhead
@@ -137,12 +152,12 @@ func (c *Configuration) getRouteMTU(baseMTU int) int {
 		return preEncryptMTU
 	}
 
-	tunnelMTU := baseMTU - (TunnelOverhead + encryptOverhead)
+	tunnelMTU := baseMTU - (c.tunnelOverhead + encryptOverhead)
 	if tunnelMTU <= 0 {
-		if c.encryptEnabled {
-			return EthernetMTU - (TunnelOverhead + EncryptionIPsecOverhead)
+		if c.ipsecEnabled {
+			return EthernetMTU - (c.tunnelOverhead + EncryptionIPsecOverhead)
 		}
-		return EthernetMTU - TunnelOverhead
+		return EthernetMTU - c.tunnelOverhead
 	}
 
 	return tunnelMTU

@@ -131,12 +131,16 @@ To override the namespace and configMap when using `auto`:
 {{- define "k8sServiceHost" }}
   {{- $configmapName := default "cluster-info" .Values.k8sServiceLookupConfigMapName }}
   {{- $configmapNamespace := default "kube-public" .Values.k8sServiceLookupNamespace }}
-  {{- if and (eq .Values.k8sServiceHost "auto") (lookup "v1" "ConfigMap" $configmapNamespace $configmapName) }}
+  {{- if eq .Values.k8sServiceHost "auto" }}
     {{- $configmap := (lookup "v1" "ConfigMap" $configmapNamespace $configmapName) }}
-    {{- $kubeconfig := get $configmap.data "kubeconfig" }}
-    {{- $k8sServer := get ($kubeconfig | fromYaml) "clusters" | mustFirst | dig "cluster" "server" "" }}
-    {{- $uri := (split "https://" $k8sServer)._1 | trim }}
-    {{- (split ":" $uri)._0 | quote }}
+    {{- if $configmap }}
+      {{- $kubeconfig := get $configmap.data "kubeconfig" }}
+      {{- $k8sServer := get ($kubeconfig | fromYaml) "clusters" | mustFirst | dig "cluster" "server" "" }}
+      {{- $uri := (split "https://" $k8sServer)._1 | trim }}
+      {{- (split ":" $uri)._0 | quote }}
+    {{- else }}
+      {{- fail (printf "ConfigMap %s/%s not found, please create it or set k8sServiceHost to a valid value" $configmapNamespace $configmapName) }}
+    {{- end }}
   {{- else }}
     {{- .Values.k8sServiceHost | quote }}
   {{- end }}
@@ -180,6 +184,19 @@ Return user specify envoy.enabled or default value based on the upgradeCompatibi
 {{- end }}
 
 {{/*
+Return user specified envoy.xdsMode or default value based on the upgradeCompatibility.
+*/}}
+{{- define "envoyXdsMode" }}
+  {{- if ne .Values.envoy.xdsMode nil }}
+    {{- .Values.envoy.xdsMode }}
+  {{- else }}
+    {{- if semverCompare ">=1.20" (default "1.20" .Values.upgradeCompatibility) }}
+      {{- "ads" }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{/*
 Return user specify tls.readSecretsOnlyFromSecretsNamespace and take into account tls.secretsBackend
 */}}
 {{- define "readSecretsOnlyFromSecretsNamespace" }}
@@ -209,4 +226,11 @@ Return user specify tls.secretSync.enabled or default value based on the upgrade
       {{- false }}
     {{- end }}
   {{- end }}
+{{- end }}
+
+{{/*
+Determine if CRDs are used for identity allocation
+*/}}
+{{- define "identityAllocationCRD" }}
+  {{- list "crd" "doublewrite-readkvstore" "doublewrite-readcrd" | has .Values.identityAllocationMode }}
 {{- end }}

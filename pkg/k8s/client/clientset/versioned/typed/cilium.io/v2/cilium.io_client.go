@@ -15,22 +15,53 @@ import (
 
 type CiliumV2Interface interface {
 	RESTClient() rest.Interface
+	CiliumBGPAdvertisementsGetter
+	CiliumBGPClusterConfigsGetter
+	CiliumBGPNodeConfigsGetter
+	CiliumBGPNodeConfigOverridesGetter
+	CiliumBGPPeerConfigsGetter
+	CiliumCIDRGroupsGetter
 	CiliumClusterwideEnvoyConfigsGetter
 	CiliumClusterwideNetworkPoliciesGetter
 	CiliumEgressGatewayPoliciesGetter
 	CiliumEndpointsGetter
 	CiliumEnvoyConfigsGetter
-	CiliumExternalWorkloadsGetter
 	CiliumIdentitiesGetter
+	CiliumLoadBalancerIPPoolsGetter
 	CiliumLocalRedirectPoliciesGetter
 	CiliumNetworkPoliciesGetter
 	CiliumNodesGetter
 	CiliumNodeConfigsGetter
+	CiliumPodIPPoolsGetter
 }
 
 // CiliumV2Client is used to interact with features provided by the cilium.io group.
 type CiliumV2Client struct {
 	restClient rest.Interface
+}
+
+func (c *CiliumV2Client) CiliumBGPAdvertisements() CiliumBGPAdvertisementInterface {
+	return newCiliumBGPAdvertisements(c)
+}
+
+func (c *CiliumV2Client) CiliumBGPClusterConfigs() CiliumBGPClusterConfigInterface {
+	return newCiliumBGPClusterConfigs(c)
+}
+
+func (c *CiliumV2Client) CiliumBGPNodeConfigs() CiliumBGPNodeConfigInterface {
+	return newCiliumBGPNodeConfigs(c)
+}
+
+func (c *CiliumV2Client) CiliumBGPNodeConfigOverrides() CiliumBGPNodeConfigOverrideInterface {
+	return newCiliumBGPNodeConfigOverrides(c)
+}
+
+func (c *CiliumV2Client) CiliumBGPPeerConfigs() CiliumBGPPeerConfigInterface {
+	return newCiliumBGPPeerConfigs(c)
+}
+
+func (c *CiliumV2Client) CiliumCIDRGroups() CiliumCIDRGroupInterface {
+	return newCiliumCIDRGroups(c)
 }
 
 func (c *CiliumV2Client) CiliumClusterwideEnvoyConfigs() CiliumClusterwideEnvoyConfigInterface {
@@ -53,12 +84,12 @@ func (c *CiliumV2Client) CiliumEnvoyConfigs(namespace string) CiliumEnvoyConfigI
 	return newCiliumEnvoyConfigs(c, namespace)
 }
 
-func (c *CiliumV2Client) CiliumExternalWorkloads() CiliumExternalWorkloadInterface {
-	return newCiliumExternalWorkloads(c)
-}
-
 func (c *CiliumV2Client) CiliumIdentities() CiliumIdentityInterface {
 	return newCiliumIdentities(c)
+}
+
+func (c *CiliumV2Client) CiliumLoadBalancerIPPools() CiliumLoadBalancerIPPoolInterface {
+	return newCiliumLoadBalancerIPPools(c)
 }
 
 func (c *CiliumV2Client) CiliumLocalRedirectPolicies(namespace string) CiliumLocalRedirectPolicyInterface {
@@ -77,14 +108,16 @@ func (c *CiliumV2Client) CiliumNodeConfigs(namespace string) CiliumNodeConfigInt
 	return newCiliumNodeConfigs(c, namespace)
 }
 
+func (c *CiliumV2Client) CiliumPodIPPools() CiliumPodIPPoolInterface {
+	return newCiliumPodIPPools(c)
+}
+
 // NewForConfig creates a new CiliumV2Client for the given config.
 // NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
 // where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(c *rest.Config) (*CiliumV2Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
-		return nil, err
-	}
+	setConfigDefaults(&config)
 	httpClient, err := rest.HTTPClientFor(&config)
 	if err != nil {
 		return nil, err
@@ -96,9 +129,7 @@ func NewForConfig(c *rest.Config) (*CiliumV2Client, error) {
 // Note the http client provided takes precedence over the configured transport values.
 func NewForConfigAndClient(c *rest.Config, h *http.Client) (*CiliumV2Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
-		return nil, err
-	}
+	setConfigDefaults(&config)
 	client, err := rest.RESTClientForConfigAndClient(&config, h)
 	if err != nil {
 		return nil, err
@@ -121,7 +152,7 @@ func New(c rest.Interface) *CiliumV2Client {
 	return &CiliumV2Client{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
+func setConfigDefaults(config *rest.Config) {
 	gv := ciliumiov2.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
@@ -130,8 +161,6 @@ func setConfigDefaults(config *rest.Config) error {
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate

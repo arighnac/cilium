@@ -4,9 +4,6 @@
 /* Enable code paths under test */
 #define ENABLE_IPV4		1
 #define ENABLE_NODEPORT		1
-#define ENABLE_HOST_ROUTING	1
-
-#define DISABLE_LOOPBACK_LB	1
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -27,18 +24,16 @@
 
 #define BACKEND_EP_ID		127
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
 
 static volatile const __u8 *client_mac = mac_one;
-/* this matches the default node_config.h: */
-static volatile const __u8 lb_mac[ETH_ALEN]	= { 0xce, 0x72, 0xa7, 0x03, 0x88, 0x56 };
+static volatile const __u8 *lb_mac = mac_host;
 static volatile const __u8 *node_mac = mac_three;
 static volatile const __u8 *local_backend_mac = mac_four;
 
-__section("mock-handle-policy")
+__section_entry
 int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
 {
 	return TC_ACT_REDIRECT;
@@ -84,32 +79,18 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 	return CTX_ACT_DROP;
 }
 
-#define SECCTX_FROM_IPCACHE 1
-
-#include "bpf_host.c"
+#include "lib/bpf_host.h"
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 #include "lib/lb.h"
 
-#define FROM_NETDEV	0
-
+ASSIGN_CONFIG(bool, enable_bpf_host_routing, true)
 ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(max_entries, 2);
-	__array(values, int());
-} entry_call_map __section(".maps") = {
-	.values = {
-		[FROM_NETDEV] = &cil_from_netdev,
-	},
-};
 
 /* Test that a SVC request (UDP) to a local backend
  * - gets DNATed (but not SNATed)
- * - gets redirected by TC (as ENABLE_HOST_ROUTING is set)
+ * - gets redirected by TC (as BPF Host Routing is enabled)
  */
 PKTGEN("tc", "tc_nodeport_lb_terminating_backend_0")
 int tc_nodeport_lb_terminating_backend_0_pktgen(struct __ctx_buff *ctx)
@@ -143,7 +124,7 @@ int tc_nodeport_lb_terminating_backend_0_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = SVC_REV_NAT_ID;
 
-	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, IPPROTO_UDP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, 125,
 			  BACKEND_IP_LOCAL, BACKEND_PORT, IPPROTO_UDP, 0);
 
@@ -153,10 +134,7 @@ int tc_nodeport_lb_terminating_backend_0_setup(struct __ctx_buff *ctx)
 
 	ipcache_v4_add_entry(BACKEND_IP_LOCAL, 0, 112233, 0, 0);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_receive_packet(ctx);
 }
 
 CHECK("tc", "tc_nodeport_lb_terminating_backend_0")
@@ -169,6 +147,8 @@ int tc_nodeport_lb_terminating_backend_0_check(const struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP_LOCAL);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -213,7 +193,7 @@ int tc_nodeport_lb_terminating_backend_0_check(const struct __ctx_buff *ctx)
 		test_fatal("dst port hasn't been NATed to backend port");
 
 	if (l4->check != bpf_htons(0x699a))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x699a));
 
 	test_finish();
 }
@@ -253,17 +233,17 @@ int tc_nodeport_lb_terminating_backend_1_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = SVC_REV_NAT_ID;
 
+	endpoint_v4_add_entry(BACKEND_IP_LOCAL, BACKEND_IFACE, BACKEND_EP_ID, 0, 0, 0,
+			      (__u8 *)local_backend_mac, (__u8 *)node_mac);
+
 	/* Remove the service's last backend, and flip the backend to
 	 * 'terminating' state.
 	 */
-	lb_v4_upsert_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, 0, revnat_id);
+	lb_v4_upsert_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, IPPROTO_UDP, 0, revnat_id);
 	lb_v4_upsert_backend(125, BACKEND_IP_LOCAL, BACKEND_PORT, IPPROTO_UDP,
 			     BE_STATE_TERMINATING, 0);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_receive_packet(ctx);
 }
 
 CHECK("tc", "tc_nodeport_lb_terminating_backend_1")
@@ -276,6 +256,8 @@ int tc_nodeport_lb_terminating_backend_1_check(const struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP_LOCAL);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -320,7 +302,7 @@ int tc_nodeport_lb_terminating_backend_1_check(const struct __ctx_buff *ctx)
 		test_fatal("dst port hasn't been NATed to backend port");
 
 	if (l4->check != bpf_htons(0x699a))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x699a));
 
 	test_finish();
 }

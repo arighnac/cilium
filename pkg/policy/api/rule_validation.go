@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -29,9 +30,12 @@ var (
 	enableDefaultDenyDefault = true
 )
 
-// Sanitize validates and sanitizes a policy rule. Minor edits such as
-// capitalization of the protocol name are automatically fixed up. More
-// fundamental violations will cause an error to be returned.
+// Sanitize validates and sanitizes a policy rule. Minor edits such as capitalization
+// of the protocol name are automatically fixed up.
+// As part of `EndpointSelector` sanitization we also convert the label keys to internal
+// representation prefixed with the source information. Check `EndpointSelector.sanitize()`
+// method for more details.
+// More fundamental violations will cause an error to be returned.
 //
 // Note: this function is called from both the operator and the agent;
 // make sure any configuration flags are bound in **both** binaries.
@@ -67,14 +71,14 @@ func (r *Rule) Sanitize() error {
 	}
 
 	if r.EndpointSelector.LabelSelector != nil {
-		if err := r.EndpointSelector.sanitize(); err != nil {
+		if err := r.EndpointSelector.Sanitize(); err != nil {
 			return err
 		}
 	}
 
 	var hostPolicy bool
 	if r.NodeSelector.LabelSelector != nil {
-		if err := r.NodeSelector.sanitize(); err != nil {
+		if err := r.NodeSelector.Sanitize(); err != nil {
 			return err
 		}
 		hostPolicy = true
@@ -113,7 +117,6 @@ func countL7Rules(ports []PortRule) map[string]int {
 		if !port.Rules.IsEmpty() {
 			result["DNS"] += len(port.Rules.DNS)
 			result["HTTP"] += len(port.Rules.HTTP)
-			result["Kafka"] += len(port.Rules.Kafka)
 		}
 	}
 	return result
@@ -122,9 +125,8 @@ func countL7Rules(ports []PortRule) map[string]int {
 func (i *IngressRule) sanitize(hostPolicy bool) error {
 	l7Members := countL7Rules(i.ToPorts)
 	l7IngressSupport := map[string]bool{
-		"DNS":   false,
-		"Kafka": true,
-		"HTTP":  true,
+		"DNS":  false,
+		"HTTP": true,
 	}
 
 	if err := i.IngressCommonRule.sanitize(); err != nil {
@@ -164,8 +166,6 @@ func (i *IngressRule) sanitize(hostPolicy bool) error {
 		}
 	}
 
-	i.SetAggregatedSelectors()
-
 	return nil
 }
 
@@ -194,8 +194,6 @@ func (i *IngressDenyRule) sanitize() error {
 		}
 	}
 
-	i.SetAggregatedSelectors()
-
 	return nil
 }
 
@@ -223,20 +221,14 @@ func (i *IngressCommonRule) sanitize() error {
 		retErr = ErrFromToNodesRequiresNodeSelectorOption
 	}
 
-	for _, es := range i.FromEndpoints {
-		if err := es.sanitize(); err != nil {
+	for n := range i.FromEndpoints {
+		if err := i.FromEndpoints[n].Sanitize(); err != nil {
 			return errors.Join(err, retErr)
 		}
 	}
 
-	for _, es := range i.FromRequires {
-		if err := es.sanitize(); err != nil {
-			return errors.Join(err, retErr)
-		}
-	}
-
-	for _, ns := range i.FromNodes {
-		if err := ns.sanitize(); err != nil {
+	for n := range i.FromNodes {
+		if err := i.FromNodes[n].Sanitize(); err != nil {
 			return errors.Join(err, retErr)
 		}
 	}
@@ -302,9 +294,8 @@ func (e *EgressRule) sanitize(hostPolicy bool) error {
 	l3DependentL4Support := e.l3DependentL4Support()
 	l7Members := countL7Rules(e.ToPorts)
 	l7EgressSupport := map[string]bool{
-		"DNS":   true,
-		"Kafka": !hostPolicy,
-		"HTTP":  !hostPolicy,
+		"DNS":  true,
+		"HTTP": !hostPolicy,
 	}
 
 	if err := e.EgressCommonRule.sanitize(l3Members); err != nil {
@@ -357,8 +348,6 @@ func (e *EgressRule) sanitize(hostPolicy bool) error {
 		}
 	}
 
-	e.SetAggregatedSelectors()
-
 	return nil
 }
 
@@ -408,8 +397,6 @@ func (e *EgressDenyRule) sanitize() error {
 		}
 	}
 
-	e.SetAggregatedSelectors()
-
 	return nil
 }
 
@@ -436,20 +423,14 @@ func (e *EgressCommonRule) sanitize(l3Members map[string]int) error {
 		retErr = ErrFromToNodesRequiresNodeSelectorOption
 	}
 
-	for _, es := range e.ToEndpoints {
-		if err := es.sanitize(); err != nil {
+	for i := range e.ToEndpoints {
+		if err := e.ToEndpoints[i].Sanitize(); err != nil {
 			return errors.Join(err, retErr)
 		}
 	}
 
-	for _, es := range e.ToRequires {
-		if err := es.sanitize(); err != nil {
-			return errors.Join(err, retErr)
-		}
-	}
-
-	for _, ns := range e.ToNodes {
-		if err := ns.sanitize(); err != nil {
+	for i := range e.ToNodes {
+		if err := e.ToNodes[i].Sanitize(); err != nil {
 			return errors.Join(err, retErr)
 		}
 	}
@@ -511,15 +492,6 @@ func (pr *L7Rules) sanitize(ports []PortProtocol) error {
 		}
 	}
 
-	if pr.Kafka != nil {
-		nTypes++
-		for i := range pr.Kafka {
-			if err := pr.Kafka[i].Sanitize(); err != nil {
-				return err
-			}
-		}
-	}
-
 	if pr.DNS != nil {
 		// Forthcoming TPROXY redirection restricts DNS proxy to the standard DNS port (53).
 		// Require the port 53 be explicitly configured, and disallow other port numbers.
@@ -530,18 +502,6 @@ func (pr *L7Rules) sanitize(ports []PortProtocol) error {
 		nTypes++
 		for i := range pr.DNS {
 			if err := pr.DNS[i].Sanitize(); err != nil {
-				return err
-			}
-		}
-	}
-
-	if pr.L7 != nil && pr.L7Proto == "" {
-		return fmt.Errorf("'l7' may only be specified when a 'l7proto' is also specified")
-	}
-	if pr.L7Proto != "" {
-		nTypes++
-		for i := range pr.L7 {
-			if err := pr.L7[i].Sanitize(); err != nil {
 				return err
 			}
 		}
@@ -566,10 +526,8 @@ func (pr *PortRule) sanitize(ingress bool) error {
 	if len(pr.ServerNames) > 0 && !pr.Rules.IsEmpty() && pr.TerminatingTLS == nil {
 		return fmt.Errorf("ServerNames are not allowed with L7 rules without TLS termination")
 	}
-	for _, sn := range pr.ServerNames {
-		if sn == "" {
-			return errEmptyServerName
-		}
+	if slices.Contains(pr.ServerNames, "") {
+		return errEmptyServerName
 	}
 
 	if len(pr.Ports) > maxPorts {
@@ -602,10 +560,7 @@ func (pr *PortRule) sanitize(ingress bool) error {
 		if ingress && !TestAllowIngressListener {
 			return fmt.Errorf("Listener is not allowed on ingress (%s)", listener.Name)
 		}
-		// There is no quarantee that Listener will support Cilium policy enforcement.  Even
-		// now proxylib-based enforcement (e.g, Kafka) may work, but has not been tested.
-		// TODO (jrajahalme): Lift this limitation in follow-up work for proxylib based
-		// parsers if needed and when tested.
+		// There is no guarantee that Listener will support Cilium policy enforcement.
 		if !pr.Rules.IsEmpty() {
 			return fmt.Errorf("Listener is not allowed with L7 rules (%s)", listener.Name)
 		}
@@ -637,9 +592,23 @@ func (pr *PortDenyRule) sanitize() error {
 	return nil
 }
 
+// isExtendedIPProtocol returns true if the protocol is an extended IP protocol
+// that does not use transport-layer ports (e.g., VRRP, IGMP, GRE, IPIP, ESP, AH).
+func isExtendedIPProtocol(proto L4Proto) bool {
+	switch proto {
+	case ProtoVRRP, ProtoIGMP,
+		ProtoGRE, ProtoIPIP, ProtoIPv6, ProtoESP, ProtoAH:
+		return true
+	default:
+		return false
+	}
+}
+
 func (pp *PortProtocol) sanitize(hasDNSRules bool) (isZero bool, err error) {
 	if pp.Port == "" {
-		return isZero, errors.New("Port must be specified")
+		if !option.Config.EnableExtendedIPProtocols {
+			return isZero, errors.New("port must be specified")
+		}
 	}
 
 	// Port names are formatted as IANA Service Names.  This means that
@@ -647,7 +616,12 @@ func (pp *PortProtocol) sanitize(hasDNSRules bool) (isZero bool, err error) {
 	// 0x10 is now considered a name rather than number 16.
 	if iana.IsSvcName(pp.Port) {
 		pp.Port = strings.ToLower(pp.Port) // Normalize for case insensitive comparison
-	} else {
+	} else if pp.Port != "" {
+		// Extended IP protocols and tunnel/encapsulation protocols do not have
+		// transport-layer ports. Require port to be empty or 0 for these protocols.
+		if pp.Port != "0" && isExtendedIPProtocol(pp.Protocol) {
+			return isZero, errors.New("port must be empty or 0")
+		}
 		p, err := strconv.ParseUint(pp.Port, 0, 16)
 		if err != nil {
 			return isZero, fmt.Errorf("unable to parse port: %w", err)
@@ -685,11 +659,7 @@ func (c CIDR) sanitize() error {
 
 	prefix, err := netip.ParsePrefix(strCIDR)
 	if err != nil {
-		_, err := netip.ParseAddr(strCIDR)
-		if err != nil {
-			return fmt.Errorf("unable to parse CIDR: %w", err)
-		}
-		return nil
+		return fmt.Errorf("unable to parse CIDR: %w", err)
 	}
 	prefixLength := prefix.Bits()
 	if prefixLength < 0 {
@@ -711,11 +681,11 @@ func (c *CIDRRule) sanitize() error {
 	if len(c.Cidr) > 0 {
 		cnt++
 	}
-	if c.CIDRGroupSelector != nil {
+	if c.CIDRGroupSelector.LabelSelector != nil {
 		cnt++
-		es := NewESFromK8sLabelSelector(labels.LabelSourceCIDRGroupKeyPrefix, c.CIDRGroupSelector)
-		if err := es.sanitize(); err != nil {
-			return fmt.Errorf("failed to parse cidrGroupSelector %v: %w", c.CIDRGroupSelector.String(), err)
+		c.CIDRGroupSelector = NewESFromK8sLabelSelector(labels.LabelSourceCIDRGroupKeyPrefix, c.CIDRGroupSelector.LabelSelector)
+		if err := c.CIDRGroupSelector.Sanitize(); err != nil {
+			return fmt.Errorf("failed to sanitize cidrGroupSelector %v: %w", c.CIDRGroupSelector.String(), err)
 		}
 	}
 	if cnt == 0 {
@@ -725,7 +695,7 @@ func (c *CIDRRule) sanitize() error {
 		return fmt.Errorf("more than one of cidr, cidrGroupRef, or cidrGroupSelector may not be set")
 	}
 
-	if len(c.CIDRGroupRef) > 0 || c.CIDRGroupSelector != nil {
+	if len(c.CIDRGroupRef) > 0 || c.CIDRGroupSelector.LabelSelector != nil {
 		return nil // these are selectors;
 	}
 
@@ -752,7 +722,7 @@ func (c *CIDRRule) sanitize() error {
 
 		// Note: this also checks that the allow CIDR prefix and the exception
 		// CIDR prefixes are part of the same address family.
-		if !prefix.Contains(except.Addr()) {
+		if prefix.Bits() > except.Bits() || !prefix.Contains(except.Addr()) {
 			return fmt.Errorf("allow CIDR prefix %s does not contain "+
 				"exclude CIDR prefix %s", c.Cidr, p)
 		}

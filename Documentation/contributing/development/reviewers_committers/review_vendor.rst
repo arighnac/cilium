@@ -32,7 +32,7 @@ To join the team, you must be a Cilium Reviewer. see `Cilium's Contributor
 Ladder <ladder_>`_ for details on the requirements and the application process.
 
 The team has a dedicated Slack channel in the Cilium Community Slack Workspace
-named `#sig-vendor <sig_vendor_slack_>`_, which can be used for starting discussions
+named `#dev-vendor <dev_vendor_slack_>`_, which can be used for starting discussions
 and asking questions in regards to dependency management for Cilium and its related
 projects.
 
@@ -42,7 +42,7 @@ projects.
 .. _vendor_slash: https://github.com/cilium/cilium/blob/main/vendor
 .. _vendor_to_review: https://github.com/pulls?q=is%3Aopen+is%3Apr+team-review-requested%3Acilium%2Fvendor+archived%3Afalse+org%3Acilium+
 .. _ladder: https://github.com/cilium/community/blob/main/CONTRIBUTOR-LADDER.md
-.. _sig_vendor_slack: https://cilium.slack.com/archives/C07GZTL0Z1P
+.. _dev_vendor_slack: https://cilium.slack.com/archives/C07GZTL0Z1P
 
 Reviewing Pull Requests
 =======================
@@ -56,7 +56,7 @@ Existing Dependencies
 ---------------------
 
 Updates to existing dependencies most commonly occur through PRs opened by
-`Renovate <renovate_>`_, which is a 3rd party service used throughout the
+`Renovate`_, which is a 3rd party service used throughout the
 Cilium organization. Renovate continually checks repositories for out-of-date
 dependencies and opens new PRs to update any it finds.
 
@@ -67,7 +67,7 @@ GitHub Action CI workflows, which are triggered by commenting ``/test`` within
 a PR. See :ref:`CI  / GitHub Actions <ci_gha>` for more information on their
 use.
 
-.. _renovate: https://docs.renovatebot.com
+.. _Renovate: https://docs.renovatebot.com
 
 New Dependencies
 ----------------
@@ -84,7 +84,7 @@ be assigned to ensure the new dependency meets the following criteria:
    releases within the past year.
 4. The new dependency must appear to be of generally good quality, having a
    strong user base, automated testing with high code coverage, and documentation.
-5. The new dependency must have a license which is allowed by the `CNCF <cncf_>`_,
+5. The new dependency must have a license which is allowed by the `CNCF`_,
    as either one of the `generally approved licenses <allowed_licenses_>`_ or one
    that is allowed via `exception <license_exceptions_>`_. An automated CI check
    is in place to help check this requirement, but may need updating as the list
@@ -94,7 +94,7 @@ be assigned to ensure the new dependency meets the following criteria:
 These criteria ensure the long-term success of the project by justifying the
 inclusion of the new dependency into the project's codebase.
 
-.. _cncf: https://www.cncf.io
+.. _CNCF: https://www.cncf.io
 .. _allowed_licenses: https://github.com/cncf/foundation/blob/main/allowed-third-party-license-policy.md
 .. _license_exceptions: https://github.com/cncf/foundation/tree/main/license-exceptions
 .. _licensecheck: https://github.com/cilium/cilium/blob/main/tools/licensecheck/allowed.go

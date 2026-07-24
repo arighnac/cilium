@@ -4,22 +4,28 @@
 package envoy
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"sync"
 
 	envoyAPI "github.com/cilium/proxy/go/cilium/api"
-	"github.com/sirupsen/logrus"
+	envoy_config_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/envoy/config"
 	"github.com/cilium/cilium/pkg/envoy/xds"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/time"
 )
 
+// todo (nezdolik) migrate to go control plane constants when available
 const (
 	// ListenerTypeURL is the type URL of Listener resources.
 	ListenerTypeURL = "type.googleapis.com/envoy.config.listener.v3.Listener"
@@ -55,6 +61,103 @@ const (
 	DownstreamTlsContextURL = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext"
 )
 
+// CiliumAdsConfigSource is the ApiConfigSource for the State-of-the-World ADS stream
+var CiliumAdsConfigSource = &envoy_config_core.ApiConfigSource{
+	RequestTimeout:            &durationpb.Duration{Seconds: 30},
+	ApiType:                   envoy_config_core.ApiConfigSource_GRPC,
+	TransportApiVersion:       envoy_config_core.ApiVersion_V3,
+	SetNodeOnFirstMessageOnly: true,
+	GrpcServices: []*envoy_config_core.GrpcService{
+		{
+			TargetSpecifier: &envoy_config_core.GrpcService_EnvoyGrpc_{
+				EnvoyGrpc: &envoy_config_core.GrpcService_EnvoyGrpc{
+					ClusterName: CiliumXDSClusterName,
+				},
+			},
+		},
+	},
+}
+
+// CiliumConfigSource returns the config source to be used for xDS resource config source
+// configurations for the given mode. The returned value may not be modified.
+func CiliumConfigSource(mode config.XDSMode) *envoy_config_core.ConfigSource {
+	switch mode {
+	case config.EnvoyXDSModeDeltaSplit:
+		return CiliumDeltaXDSConfigSource
+	case config.EnvoyXDSModeADS, config.EnvoyXDSModeStrictADS:
+		return CiliumXdsWithAdsConfigSource
+	case config.EnvoyXDSModeDeltaADS, config.EnvoyXDSModeStrictDeltaADS:
+		// Delta ADS mode not supported yet
+		return nil
+	}
+	return CiliumXDSConfigSource
+}
+
+const adsConfigSourceInitialFetchTimeout = time.Millisecond
+
+// CiliumXdsWithAdsConfigSource is the ConfigSource for xDS resources using ADS
+var CiliumXdsWithAdsConfigSource = &envoy_config_core.ConfigSource{
+	ConfigSourceSpecifier: &envoy_config_core.ConfigSource_Ads{Ads: &envoy_config_core.AggregatedConfigSource{}},
+	InitialFetchTimeout:   durationpb.New(adsConfigSourceInitialFetchTimeout),
+	ResourceApiVersion:    envoy_config_core.ApiVersion_V3,
+}
+
+// CiliumXDSConfigSource is the ConfigSource for split State-of-the-World xDS
+var CiliumXDSConfigSource = &envoy_config_core.ConfigSource{
+	InitialFetchTimeout: &durationpb.Duration{Seconds: 30},
+	ResourceApiVersion:  envoy_config_core.ApiVersion_V3,
+	ConfigSourceSpecifier: &envoy_config_core.ConfigSource_ApiConfigSource{
+		ApiConfigSource: &envoy_config_core.ApiConfigSource{
+			ApiType:                   envoy_config_core.ApiConfigSource_GRPC,
+			TransportApiVersion:       envoy_config_core.ApiVersion_V3,
+			SetNodeOnFirstMessageOnly: true,
+			GrpcServices: []*envoy_config_core.GrpcService{
+				{
+					TargetSpecifier: &envoy_config_core.GrpcService_EnvoyGrpc_{
+						EnvoyGrpc: &envoy_config_core.GrpcService_EnvoyGrpc{
+							ClusterName: CiliumXDSClusterName,
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+var CiliumDeltaXDSConfigSource = &envoy_config_core.ConfigSource{
+	InitialFetchTimeout: &durationpb.Duration{Seconds: 30},
+	ResourceApiVersion:  envoy_config_core.ApiVersion_V3,
+	ConfigSourceSpecifier: &envoy_config_core.ConfigSource_ApiConfigSource{
+		ApiConfigSource: &envoy_config_core.ApiConfigSource{
+			ApiType:                   envoy_config_core.ApiConfigSource_DELTA_GRPC,
+			TransportApiVersion:       envoy_config_core.ApiVersion_V3,
+			SetNodeOnFirstMessageOnly: true,
+			GrpcServices: []*envoy_config_core.GrpcService{
+				{
+					TargetSpecifier: &envoy_config_core.GrpcService_EnvoyGrpc_{
+						EnvoyGrpc: &envoy_config_core.GrpcService_EnvoyGrpc{
+							ClusterName: CiliumXDSClusterName,
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+func SetXDSConfigSourceInitialFetchTimeout(proxyInitialFetchTimeout uint) {
+	CiliumXDSConfigSource.InitialFetchTimeout = durationpb.New(time.Duration(proxyInitialFetchTimeout) * time.Second)
+	CiliumDeltaXDSConfigSource.InitialFetchTimeout = durationpb.New(time.Duration(proxyInitialFetchTimeout) * time.Second)
+
+	// Initial fetch timeout is not set on the ADS config sources.
+	// ADS resources are published on one stream, but Cilium may reconcile a
+	// resource referenced by LDS/CDS/RDS/SDS in a later StateDB row. A long initial
+	// fetch timeout keeps dependent listeners/clusters warming and can expose a
+	// proxy port before the listener's filter chains are active. Keep ADS inline
+	// references short-lived so Envoy activates with the current snapshot and
+	// consumes the follow-up ADS update when the dependency arrives.
+}
+
 // NPHDSCache is a cache of resources in the Network Policy Hosts Discovery
 // Service.
 //
@@ -64,6 +167,7 @@ const (
 type NPHDSCache struct {
 	*xds.Cache
 
+	logger  *slog.Logger
 	ipcache IPCacheEventSource
 }
 
@@ -71,20 +175,25 @@ type IPCacheEventSource interface {
 	AddListener(ipcache.IPIdentityMappingListener)
 }
 
-func newNPHDSCache(ipcache IPCacheEventSource) NPHDSCache {
-	return NPHDSCache{Cache: xds.NewCache(), ipcache: ipcache}
+func newNPHDSCache(logger *slog.Logger, ipcache IPCacheEventSource) NPHDSCache {
+	return NPHDSCache{Cache: xds.NewCache(logger), logger: logger, ipcache: ipcache}
 }
 
 var observerOnce = sync.Once{}
 
-func (cache *NPHDSCache) MarkRestorePending()   {}
+func (cache *NPHDSCache) MarkRestorePending() {}
+
 func (cache *NPHDSCache) MarkRestoreCompleted() {}
+
+func (cache *NPHDSCache) WaitForFirstAck(ctx context.Context, node string, typeURL string) {
+	// not implemented
+}
 
 // HandleResourceVersionAck is required to implement ResourceVersionAckObserver.
 // We use this to start the IP Cache listener on the first ACK so that we only
 // start the IP Cache listener if there is an Envoy node that uses NPHDS
 // (e.g. Cilium host proxy running on kernel w/o LPM bpf map support).
-func (cache *NPHDSCache) HandleResourceVersionAck(ackVersion uint64, nackVersion uint64, nodeIP string, resourceNames []string, typeURL string, detail string) {
+func (cache *NPHDSCache) HandleResourceVersionAck(nodeIP string, ackVersion uint64, responseVersion uint64, isNACK bool, errorDetail string, typeURL string, resourceNames []string) {
 	// Start caching for IP/ID mappings on the first indication someone wants them
 	observerOnce.Do(func() {
 		cache.ipcache.AddListener(cache)
@@ -99,25 +208,21 @@ func (cache *NPHDSCache) HandleResourceVersionAck(ackVersion uint64, nackVersion
 // IP/ID mappings.
 func (cache *NPHDSCache) OnIPIdentityCacheChange(modType ipcache.CacheModification, cidrCluster cmtypes.PrefixCluster,
 	oldHostIP, newHostIP net.IP, oldID *ipcache.Identity, newID ipcache.Identity,
-	encryptKey uint8, k8sMeta *ipcache.K8sMetadata,
+	encryptKey uint8, k8sMeta *ipcache.K8sMetadata, endpointFlags uint8,
 ) {
 	cidr := cidrCluster.AsIPNet()
 
 	cidrStr := cidr.String()
 	resourceName := newID.ID.StringID()
 
-	scopedLog := log.WithFields(logrus.Fields{
-		logfields.IPAddr:       cidrStr,
-		logfields.Identity:     resourceName,
-		logfields.Modification: modType,
-	})
+	scopedLog := cache.logger.With(
+		logfields.IPAddr, cidrStr,
+		logfields.Identity, resourceName,
+		logfields.Modification, modType,
+	)
 
 	// Look up the current resources for the specified Identity.
-	msg, err := cache.Lookup(NetworkPolicyHostsTypeURL, resourceName)
-	if err != nil {
-		scopedLog.WithError(err).Warning("Can't lookup NPHDS cache")
-		return
-	}
+	msg := cache.Lookup(NetworkPolicyHostsTypeURL, resourceName)
 
 	var npHost *envoyAPI.NetworkPolicyHosts
 	if msg != nil {
@@ -130,16 +235,20 @@ func (cache *NPHDSCache) OnIPIdentityCacheChange(modType ipcache.CacheModificati
 		// but only if the old ID is different.
 		if oldID != nil && oldID.ID != newID.ID {
 			// Recursive call to delete the 'cidr' from the 'oldID'
-			cache.OnIPIdentityCacheChange(ipcache.Delete, cidrCluster, nil, nil, nil, *oldID, encryptKey, k8sMeta)
+			cache.OnIPIdentityCacheChange(ipcache.Delete, cidrCluster, nil, nil, nil, *oldID, encryptKey, k8sMeta, endpointFlags)
 		}
 		err := cache.handleIPUpsert(npHost, resourceName, cidrStr, newID.ID)
 		if err != nil {
-			scopedLog.WithError(err).Warning("NPHSD upsert failed")
+			scopedLog.Warn("NPHSD upsert failed",
+				logfields.Error, err,
+			)
 		}
 	case ipcache.Delete:
 		err := cache.handleIPDelete(npHost, resourceName, cidrStr)
 		if err != nil {
-			scopedLog.WithError(err).Warning("NPHDS delete failed")
+			scopedLog.Warn("NPHDS delete failed",
+				logfields.Error, err,
+			)
 		}
 	}
 }
@@ -153,11 +262,9 @@ func (cache *NPHDSCache) handleIPUpsert(npHost *envoyAPI.NetworkPolicyHosts, ide
 	} else {
 		// Resource already exists, create a copy of it and insert
 		// the new IP address into its HostAddresses list, if not already there.
-		for _, addr := range npHost.HostAddresses {
-			if addr == cidrStr {
-				// IP already exists, nothing to add
-				return nil
-			}
+		if slices.Contains(npHost.HostAddresses, cidrStr) {
+			// IP already exists, nothing to add
+			return nil
 		}
 		hostAddresses = make([]string, 0, len(npHost.HostAddresses)+1)
 		hostAddresses = append(hostAddresses, npHost.HostAddresses...)

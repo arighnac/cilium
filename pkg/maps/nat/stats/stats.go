@@ -9,32 +9,28 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"strconv"
-
-	"github.com/cilium/stream"
-
-	"github.com/cilium/cilium/pkg/datapath/linux/config"
-	"github.com/cilium/cilium/pkg/datapath/linux/probes"
-	"github.com/cilium/cilium/pkg/logging"
-	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/maps/nat"
-	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/promise"
-	"github.com/cilium/cilium/pkg/time"
-	"github.com/cilium/cilium/pkg/tuple"
-	"github.com/cilium/cilium/pkg/u8proto"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
-)
+	"github.com/cilium/stream"
 
-var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "nat-stats")
+	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/nat"
+	"github.com/cilium/cilium/pkg/time"
+	"github.com/cilium/cilium/pkg/tuple"
+	"github.com/cilium/cilium/pkg/u8proto"
+)
 
 // Stats provides a implementation of performing nat map stats
 // counting.
 type Stats struct {
+	logger *slog.Logger
+
 	metrics natMetrics
 
 	db    *statedb.DB
@@ -114,26 +110,23 @@ func (s NatMapStats) TableRow() []string {
 type params struct {
 	cell.In
 
+	Logger *slog.Logger
+
 	Lifecycle cell.Lifecycle
 	DB        *statedb.DB
 	Table     statedb.RWTable[NatMapStats]
-	NatMap4   promise.Promise[nat.NatMap4]
-	NatMap6   promise.Promise[nat.NatMap6]
+	NatMap4   nat.NatMap4
+	NatMap6   nat.NatMap6
 	Jobs      job.Group
 	Metrics   natMetrics
 	Config    Config
+	LBConfig  loadbalancer.Config
 	Health    cell.Health
 }
 
-func newStats(params params) (*Stats, error) {
-	if err := probes.HaveBatchAPI(); err != nil {
-		if errors.Is(err, probes.ErrNotSupported) {
-			log.WithError(err).Info("nat-stats is not supported")
-			return nil, nil
-		}
-		log.WithError(err).Error("could not probe for nat-stats feature")
-	}
+const nodePortMaxNAT = 65535
 
+func newStats(params params) (*Stats, error) {
 	if params.Config.NATMapStatInterval == 0 {
 		return nil, nil
 	}
@@ -146,11 +139,12 @@ func newStats(params params) (*Stats, error) {
 
 	// number of available source-ports is ephemeral range subtracting those
 	// used by node-ports.
-	maxAvailPorts := config.NodePortMaxNAT - (option.Config.NodePortMax + 1)
+	maxAvailPorts := nodePortMaxNAT - (params.LBConfig.NodePortMax + 1)
 	m := &Stats{
+		logger:   params.Logger,
 		metrics:  params.Metrics,
 		config:   params.Config,
-		maxPorts: maxAvailPorts,
+		maxPorts: int(maxAvailPorts),
 		db:       params.DB,
 		table:    params.Table,
 	}
@@ -162,22 +156,8 @@ func newStats(params params) (*Stats, error) {
 
 	params.Lifecycle.Append(cell.Hook{
 		OnStart: func(hc cell.HookContext) error {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
-			defer cancel()
-			nmap4, err := params.NatMap4.Await(ctx)
-			if err != nil {
-				if !errors.Is(err, nat.MapDisabled) {
-					return err
-				}
-			}
-			nmap6, err := params.NatMap6.Await(ctx)
-			if err != nil {
-				if !errors.Is(err, nat.MapDisabled) {
-					return err
-				}
-			}
-			m.natMap4 = nmap4
-			m.natMap6 = nmap6
+			m.natMap4 = params.NatMap4
+			m.natMap6 = params.NatMap6
 			if m.natMap4 == nil && m.natMap6 == nil {
 				return nil
 			}
@@ -192,7 +172,7 @@ func newStats(params params) (*Stats, error) {
 				<-time.After(5 * time.Second)
 				tr.Trigger()
 			}()
-			return params.Jobs.Start(hc)
+			return nil
 		},
 		OnStop: func(hc cell.HookContext) error {
 			m.complete4(nil)
@@ -262,9 +242,10 @@ func (m *Stats) countNat(ctx context.Context) error {
 		})
 
 		if err != nil {
-			log.WithError(err).
-				Error("failed to count ipv4 nat map entries, " +
-					"this may result in out of date nat-stats data and nat_endpoint_ metrics")
+			m.logger.Error("failed to count ipv4 nat map entries, "+
+				"this may result in out of date nat-stats data and nat_endpoint_ metrics",
+				logfields.Error, err,
+			)
 			errs = errors.Join(errs, err)
 		} else {
 			m.next4(toIter(tupleToPortCount))
@@ -291,9 +272,10 @@ func (m *Stats) countNat(ctx context.Context) error {
 		})
 
 		if err != nil {
-			log.WithError(err).
-				Error("failed to count ipv6 nat map entries, " +
-					"this may result in out of date nat-stats data and nat_endpoint_ metrics")
+			m.logger.Error("failed to count ipv6 nat map entries, "+
+				"this may result in out of date nat-stats data and nat_endpoint_ metrics",
+				logfields.Error, err,
+			)
 			errs = errors.Join(errs, err)
 		} else {
 			m.next6(toIter(tupleToPortCount))
@@ -333,7 +315,7 @@ func (t *topk) Push(key SNATTupleAccessor, count int) {
 }
 
 func (t *topk) popForEach(fn func(key SNATTupleAccessor, count, ith int)) {
-	for i := 0; i < t.size; i++ {
+	for i := range t.size {
 		tuple := heap.Pop(t.mq).(tupleBucket)
 		fn(tuple.key, tuple.count, t.size-i)
 	}

@@ -1,7 +1,7 @@
 metadata:
   creationTimestamp: null
-  labels:
-    cilium.io/use-original-source-address: "false"
+  annotations:
+    cec.cilium.io/use-original-source-address: "false"
   name: cilium-ingress-random-namespace-host-rules
   namespace: random-namespace
 spec:
@@ -52,6 +52,7 @@ spec:
           rds:
             routeConfigName: listener-insecure
           statPrefix: listener-insecure
+          streamIdleTimeout: 300s
           upgradeConfigs:
           - upgradeType: websocket
           useRemoteAddress: true
@@ -92,6 +93,7 @@ spec:
           rds:
             routeConfigName: listener-secure
           statPrefix: listener-secure
+          streamIdleTimeout: 300s
           upgradeConfigs:
           - upgradeType: websocket
           useRemoteAddress: true
@@ -101,7 +103,7 @@ spec:
           '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
           commonTlsContext:
             tlsCertificateSdsSecretConfigs:
-            - name: cilium-secrets/random-namespace-conformance-tls
+            - name: cilium-secrets/cilium-sync-secret-de1e96197af3e410455aa0ba9ee53655cc11ded3b5594eef38841f3b6cce9a24
     listenerFilters:
     - name: envoy.filters.listener.tls_inspector
       typedConfig:
@@ -167,7 +169,6 @@ spec:
           maxStreamDuration:
             maxStreamDuration: 0s
   - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
-    connectTimeout: 5s
     edsClusterConfig:
       serviceName: random-namespace/foo-bar-com:http
     name: random-namespace:foo-bar-com:http
@@ -182,7 +183,6 @@ spec:
         useDownstreamProtocolConfig:
           http2ProtocolOptions: {}
   - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
-    connectTimeout: 5s
     edsClusterConfig:
       serviceName: random-namespace/wildcard-foo-com:8080
     name: random-namespace:wildcard-foo-com:8080

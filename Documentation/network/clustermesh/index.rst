@@ -13,11 +13,11 @@ Multi-cluster Networking
 .. toctree::
    :maxdepth: 2
    :glob:
+   :includehidden:
 
    intro
-   clustermesh
-   services
-   mcsapi
+   setup
+   load-balancing
    policy
    affinity
    aks-clustermesh-prep

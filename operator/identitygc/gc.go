@@ -20,6 +20,7 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	ciliumV2 "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/rate"
 )
@@ -33,6 +34,7 @@ type params struct {
 	Lifecycle cell.Lifecycle
 
 	Clientset           k8sClient.Clientset
+	KVStoreClient       kvstore.Client
 	Identity            resource.Resource[*v2.CiliumIdentity]
 	CiliumEndpoint      resource.Resource[*v2.CiliumEndpoint]
 	CiliumEndpointSlice resource.Resource[*v2alpha1.CiliumEndpointSlice]
@@ -49,7 +51,9 @@ type params struct {
 type GC struct {
 	logger *slog.Logger
 
+	k8sClient           k8sClient.Clientset
 	clientset           ciliumV2.CiliumIdentityInterface
+	kvstoreClient       kvstore.Client
 	identity            resource.Resource[*v2.CiliumIdentity]
 	ciliumEndpoint      resource.Resource[*v2.CiliumEndpoint]
 	ciliumEndpointSlice resource.Resource[*v2alpha1.CiliumEndpointSlice]
@@ -91,7 +95,9 @@ func registerGC(p params) {
 
 	gc := &GC{
 		logger:              p.Logger,
+		k8sClient:           p.Clientset,
 		clientset:           p.Clientset.CiliumV2().CiliumIdentities(),
+		kvstoreClient:       p.KVStoreClient,
 		identity:            p.Identity,
 		ciliumEndpoint:      p.CiliumEndpoint,
 		ciliumEndpointSlice: p.CiliumEndpointSlice,
@@ -141,10 +147,14 @@ func registerGC(p params) {
 				gc.allocationMode == option.IdentityAllocationModeDoubleWriteReadCRD ||
 				gc.allocationMode == option.IdentityAllocationModeDoubleWriteReadKVstore {
 				// CRD mode GC runs in an additional goroutine
-				gc.mgr.RemoveAllAndWait()
+				if gc.mgr != nil {
+					gc.mgr.RemoveAllAndWait()
+				}
 			}
-			gc.rateLimiter.Stop()
+			// Close the worker pool first to ensure all goroutines complete
+			// before stopping the rate limiter they depend on
 			gc.wp.Close()
+			gc.rateLimiter.Stop()
 
 			return nil
 		},

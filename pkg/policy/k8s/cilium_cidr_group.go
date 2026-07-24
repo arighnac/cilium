@@ -9,9 +9,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/ipcache"
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
-	cilium_v2_alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -23,7 +24,7 @@ import (
 // if this CIDRGroup is referenced by any policies,
 // applies it to the IPCache.
 func (p *policyWatcher) onUpsertCIDRGroup(
-	cidrGroup *cilium_v2_alpha1.CiliumCIDRGroup,
+	cidrGroup *cilium_v2.CiliumCIDRGroup,
 	apiGroup string,
 ) {
 	defer func() {
@@ -33,6 +34,41 @@ func (p *policyWatcher) onUpsertCIDRGroup(
 
 	p.cidrGroupCache[name] = cidrGroup
 	p.applyCIDRGroup(name)
+}
+
+func (p *policyWatcher) cidrsAndLabelsForCIDRGroup(name string) (sets.Set[netip.Prefix], labels.Labels) {
+	newCIDRs := make(sets.Set[netip.Prefix])
+	var lbls labels.Labels
+
+	// If CIDRGroup isn't deleted; populate newCIDRs
+	if cidrGroup, ok := p.cidrGroupCache[name]; ok {
+		filtered := utils.RemoveCiliumLabels(cidrGroup.Labels)
+		lbls = make(labels.Labels, len(filtered)*2+1) // +1 for CIDRGroupRef label
+		for k, v := range filtered {
+			l := labels.NewLabel(k, v, labels.LabelSourceCIDRGroup)
+			lbls[l.Key] = l // may collide; only used for Exists
+			encoded := labels.EncodedCIDRGroupLabel(l.Key, l.Value, l.Source)
+			lbls[encoded.Key] = encoded
+		}
+		lbl := api.LabelForCIDRGroupRef(name)
+		lbls[lbl.Key] = lbl
+
+		for i, c := range cidrGroup.Spec.ExternalCIDRs {
+			pfx, err := netip.ParsePrefix(string(c))
+			if err != nil {
+				p.log.Warn(
+					"CIDRGroup has invalid CIDR",
+					logfields.Error, err,
+					logfields.CIDRGroupRef, name,
+					logfields.Index, i,
+				)
+				continue
+			}
+			newCIDRs.Insert(pfx)
+		}
+	}
+
+	return newCIDRs, lbls
 }
 
 // applyCIDRGroup inserts / removes prefixes in the ipcache
@@ -45,25 +81,8 @@ func (p *policyWatcher) applyCIDRGroup(name string) {
 	if !ok {
 		oldCIDRs = make(sets.Set[netip.Prefix])
 	}
-	newCIDRs := make(sets.Set[netip.Prefix])
-	lbls := labels.Labels{}
 
-	// If CIDRGroup isn't deleted; populate newCIDRs
-	if cidrGroup, ok := p.cidrGroupCache[name]; ok {
-		lbls = labels.Map2Labels(utils.RemoveCiliumLabels(cidrGroup.Labels), labels.LabelSourceCIDRGroup)
-		lbl := api.LabelForCIDRGroupRef(name)
-		lbls[lbl.Key] = lbl
-
-		for i, c := range cidrGroup.Spec.ExternalCIDRs {
-			pfx, err := netip.ParsePrefix(string(c))
-			if err != nil {
-				p.log.WithField(logfields.CIDRGroupRef, name).WithError(err).Warnf("CIDRGroup has invalid CIDR at index %d", i)
-				continue
-			}
-			newCIDRs.Insert(pfx)
-		}
-	}
-
+	newCIDRs, lbls := p.cidrsAndLabelsForCIDRGroup(name)
 	if len(newCIDRs) == 0 {
 		delete(p.cidrGroupCIDRs, name)
 	} else {
@@ -92,7 +111,7 @@ func (p *policyWatcher) applyCIDRGroup(name string) {
 		cidrLbls.AddWorldLabel(newCIDR.Addr())
 
 		mu = append(mu, ipcache.MU{
-			Prefix:   newCIDR,
+			Prefix:   cmtypes.NewLocalPrefixCluster(newCIDR),
 			Source:   source.Generated,
 			Resource: resourceID,
 			Metadata: []ipcache.IPMetadata{cidrLbls},
@@ -106,7 +125,7 @@ func (p *policyWatcher) applyCIDRGroup(name string) {
 	mu = make([]ipcache.MU, 0, len(oldCIDRs))
 	for oldCIDR := range oldCIDRs {
 		mu = append(mu, ipcache.MU{
-			Prefix:   oldCIDR,
+			Prefix:   cmtypes.NewLocalPrefixCluster(oldCIDR),
 			Source:   source.Generated,
 			Resource: resourceID,
 			Metadata: []ipcache.IPMetadata{labels.Labels{}},

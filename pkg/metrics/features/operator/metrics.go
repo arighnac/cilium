@@ -4,6 +4,11 @@
 package features
 
 import (
+	"fmt"
+	"reflect"
+
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/cilium/cilium/operator/option"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/metric"
@@ -15,15 +20,19 @@ type Metrics struct {
 	ACLBIPAMEnabled                     metric.Gauge
 	ACLBL7AwareTrafficManagementEnabled metric.Gauge
 	ACLBNodeIPAMEnabled                 metric.Gauge
+
+	CPKubernetesVersion metric.Vec[metric.Gauge]
 }
 
 const (
 	subsystemACLB = "feature_adv_connect_and_lb"
+	subsystemCP   = "feature_controlplane"
 )
 
 // NewMetrics returns all feature metrics. If 'withDefaults' is set, then
-// all metrics will have defined all of their possible values.
-func NewMetrics(withDefaults bool) Metrics {
+// all metrics will have defined all of their possible values.  If 'withEnvVersion'
+// is set, then we include things like version information from the host.
+func NewMetrics(withDefaults bool, withEnvVersion bool) Metrics {
 	return Metrics{
 		ACLBGatewayAPIEnabled: metric.NewGauge(metric.GaugeOpts{
 			Namespace: metrics.Namespace,
@@ -59,27 +68,63 @@ func NewMetrics(withDefaults bool) Metrics {
 			Help:      "Node IPAM enabled on the operator",
 			Name:      "node_ipam_enabled",
 		}),
+
+		CPKubernetesVersion: metric.NewGaugeVecWithLabels(metric.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystemCP,
+			Help:      "Kubernetes version detected by the operator",
+			Name:      "kubernetes_version",
+			Disabled:  !withEnvVersion,
+		}, metric.Labels{
+			{
+				Name: "version",
+			},
+		}),
 	}
 }
 
 type featureMetrics interface {
 	update(params enabledFeatures, config *option.OperatorConfig)
+	toGatherer() (prometheus.Gatherer, error)
 }
 
 func (m Metrics) update(params enabledFeatures, config *option.OperatorConfig) {
 	if config.EnableGatewayAPI {
-		m.ACLBGatewayAPIEnabled.Add(1)
+		m.ACLBGatewayAPIEnabled.Set(1)
 	}
 	if params.IsIngressControllerEnabled() {
-		m.ACLBIngressControllerEnabled.Add(1)
+		m.ACLBIngressControllerEnabled.Set(1)
 	}
 	if params.IsLBIPAMEnabled() {
-		m.ACLBIPAMEnabled.Add(1)
+		m.ACLBIPAMEnabled.Set(1)
 	}
 	if params.GetLoadBalancerL7() != "" {
-		m.ACLBL7AwareTrafficManagementEnabled.Add(1)
+		m.ACLBL7AwareTrafficManagementEnabled.Set(1)
 	}
 	if params.IsNodeIPAMEnabled() {
-		m.ACLBNodeIPAMEnabled.Add(1)
+		m.ACLBNodeIPAMEnabled.Set(1)
 	}
+	if m.CPKubernetesVersion.IsEnabled() {
+		if k8sVersionStr := params.K8sVersion(); k8sVersionStr != "" {
+			m.CPKubernetesVersion.WithLabelValues(k8sVersionStr).Set(1)
+		}
+	}
+}
+
+func (m Metrics) toGatherer() (prometheus.Gatherer, error) {
+	rv := reflect.ValueOf(m)
+	reg := prometheus.NewPedanticRegistry()
+	for _, f := range rv.Fields() {
+		if !f.CanInterface() {
+			continue
+		}
+		c, ok := f.Interface().(prometheus.Collector)
+		if !ok {
+			continue
+		}
+		if err := reg.Register(c); err != nil {
+			return nil, fmt.Errorf("registering metric: %w", err)
+		}
+	}
+	return reg, nil
 }

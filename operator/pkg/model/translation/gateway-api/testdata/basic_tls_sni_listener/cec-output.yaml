@@ -1,7 +1,8 @@
 metadata:
   creationTimestamp: null
+  annotations:
+    cec.cilium.io/use-original-source-address: "false"
   labels:
-    cilium.io/use-original-source-address: "false"
     gateway.networking.k8s.io/gateway-name: my-gateway
   name: cilium-gateway-my-gateway
   namespace: default
@@ -29,7 +30,7 @@ spec:
         typedConfig:
           '@type': type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
           cluster: default:my-service:8080
-          statPrefix: default:my-service:8080
+          statPrefix: tls-passthrough:foo.com
     listenerFilters:
     - name: envoy.filters.listener.tls_inspector
       typedConfig:
@@ -53,7 +54,6 @@ spec:
       level: "6"
       name: "6"
   - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
-    connectTimeout: 5s
     edsClusterConfig:
       serviceName: default/my-service:8080
     name: default:my-service:8080

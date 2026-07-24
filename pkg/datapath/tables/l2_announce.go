@@ -10,8 +10,7 @@ import (
 
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
-
-	"github.com/cilium/cilium/pkg/k8s/resource"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type L2AnnounceKey struct {
@@ -30,12 +29,12 @@ type L2AnnounceEntry struct {
 	L2AnnounceKey
 
 	// The key of the services for which this proxy entry was added
-	Origins []resource.Key
+	Origins []types.NamespacedName
 }
 
 func (pne *L2AnnounceEntry) DeepCopy() *L2AnnounceEntry {
 	// Shallow copy
-	var n L2AnnounceEntry = *pne
+	var n = *pne
 	// Explicit clone for slices
 	n.Origins = slices.Clone(pne.Origins)
 	return &n
@@ -59,18 +58,19 @@ var (
 		Unique: true,
 	}
 
-	L2AnnounceOriginIndex = statedb.Index[*L2AnnounceEntry, resource.Key]{
+	L2AnnounceOriginIndex = statedb.Index[*L2AnnounceEntry, types.NamespacedName]{
 		Name: "origin",
 		FromObject: func(b *L2AnnounceEntry) index.KeySet {
 			return index.StringerSlice(b.Origins)
 		},
-		FromKey:    index.Stringer[resource.Key],
+		FromKey:    index.Stringer[types.NamespacedName],
 		FromString: index.FromString,
 	}
 )
 
-func NewL2AnnounceTable() (statedb.RWTable[*L2AnnounceEntry], error) {
+func NewL2AnnounceTable(db *statedb.DB) (statedb.RWTable[*L2AnnounceEntry], error) {
 	return statedb.NewTable(
+		db,
 		"l2-announce",
 		L2AnnounceIDIndex,
 		L2AnnounceOriginIndex,

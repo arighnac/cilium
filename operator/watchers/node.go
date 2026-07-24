@@ -5,7 +5,6 @@ package watchers
 
 import (
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
@@ -70,41 +69,42 @@ func (nodeGetter) ListK8sSlimNode() []*slim_corev1.Node {
 }
 
 // nodesInit starts up a node watcher to handle node events.
-func nodesInit(wg *sync.WaitGroup, slimClient slimclientset.Interface, stopCh <-chan struct{}, logger *slog.Logger) {
+func nodesInit(wg *sync.WaitGroup, slimClient slimclientset.Interface, stopCh <-chan struct{}, mp workqueue.MetricsProvider) {
 	nodeSyncOnce.Do(func() {
 		nodeQueue = workqueue.NewTypedRateLimitingQueueWithConfig[string](
 			workqueue.NewTypedItemExponentialFailureRateLimiter[string](1*time.Second, 120*time.Second),
-			workqueue.TypedRateLimitingQueueConfig[string]{Name: "node-queue"},
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name:            "node-queue",
+				MetricsProvider: mp,
+			},
 		)
 		slimNodeStore, nodeController = informer.NewInformer(
-			utils.ListerWatcherFromTyped[*slim_corev1.NodeList](slimClient.CoreV1().Nodes()),
+			utils.ListerWatcherFromTyped(slimClient.CoreV1().Nodes()),
 			&slim_corev1.Node{},
 			0,
 			cache.ResourceEventHandlerFuncs{
-				AddFunc: func(obj interface{}) {
+				AddFunc: func(obj any) {
 					key, _ := queueKeyFunc(obj)
 					nodeQueue.Add(key)
 				},
-				UpdateFunc: func(_, newObj interface{}) {
+				UpdateFunc: func(_, newObj any) {
 					key, _ := queueKeyFunc(newObj)
 					nodeQueue.Add(key)
 				},
 			},
 			transformToNode,
 		)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer nodeQueue.ShutDown()
 			nodeController.Run(stopCh)
-		}()
+		})
 
 		cache.WaitForCacheSync(stopCh, nodeController.HasSynced)
 		close(slimNodeStoreSynced)
 	})
 }
 
-func transformToNode(obj interface{}) (interface{}, error) {
+func transformToNode(obj any) (any, error) {
 	switch concreteObj := obj.(type) {
 	case *slim_corev1.Node:
 		n := &slim_corev1.Node{

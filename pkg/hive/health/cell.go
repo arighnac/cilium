@@ -4,13 +4,12 @@
 package health
 
 import (
-	"github.com/cilium/hive/cell"
-
-	"github.com/cilium/statedb"
-	"github.com/cilium/statedb/index"
-
 	"github.com/cilium/cilium/pkg/hive/health/types"
 	"github.com/cilium/cilium/pkg/metrics"
+
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/index"
 )
 
 var Cell = cell.Module(
@@ -21,11 +20,16 @@ var Cell = cell.Module(
 		newHealthV2Provider,
 		statedb.RWTable[types.Status].ToTable,
 	),
-
 	// Module health metrics.
 	cell.Invoke(metricPublisher),
 	metrics.Metric(newMetrics),
+
+	cell.Provide(healthCommands),
 )
+
+// HistoryCell provides the health/history commands. The [HistoryDir]
+// must be provided for storing status logs.
+var HistoryCell = cell.Provide(newHealthHistory)
 
 var (
 	PrimaryIndex = statedb.Index[types.Status, types.HealthID]{
@@ -49,14 +53,9 @@ var (
 )
 
 func newTablesPrivate(db *statedb.DB) (statedb.RWTable[types.Status], error) {
-	statusTable, err := statedb.NewTable(TableName,
+	return statedb.NewTable(
+		db,
+		TableName,
 		PrimaryIndex,
 		LevelIndex)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.RegisterTable(statusTable); err != nil {
-		return nil, err
-	}
-	return statusTable, nil
 }

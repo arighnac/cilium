@@ -38,14 +38,18 @@ func Test_Metrics(t *testing.T) {
 
 		cell.ProvidePrivate(newTablesPrivate),
 		cell.Provide(
+			newHealthHistory,
+			func() HistoryDir {
+				return HistoryDir(t.TempDir())
+			},
+		),
+		cell.Provide(
 			newHealthV2Provider,
 			statedb.RWTable[types.Status].ToTable,
 		),
-		cell.Provide(func(lc cell.Lifecycle, p types.Provider, jr job.Registry) job.Group {
+		cell.Provide(func(p types.Provider, jr job.Registry) job.Group {
 			h := p.ForModule(cell.FullModuleID{"test"})
-			jg := jr.NewGroup(h)
-			lc.Append(jg)
-			return jg
+			return jr.NewGroup(h)
 		}),
 
 		cell.Module("health-metrics-test", "hive module health metrics test",

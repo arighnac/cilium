@@ -18,6 +18,12 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+
 	"github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/datapath/connector"
@@ -30,20 +36,12 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/pidfile"
 	"github.com/cilium/cilium/pkg/time"
-
-	"github.com/cilium/hive/cell"
-	"github.com/cilium/hive/job"
-	"github.com/cilium/statedb"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 type endpointUpdaterParams struct {
 	cell.In
 
-	Lifecycle   cell.Lifecycle
-	Health      cell.Health
-	JobRegistry job.Registry
+	JobGroup    job.Group
 	DB          *statedb.DB
 	MTUTable    statedb.Table[RouteMTU]
 	DeviceTable statedb.Table[*tables.Device]
@@ -84,9 +82,7 @@ func newEndpointUpdater(p endpointUpdaterParams) EndpointMTUUpdater {
 
 	// If we are not in chaining mode, or if we are in chaining mode and the CNI config requests us to manage route MTU
 	// Start the endpoint updater
-	jobGroup := p.JobRegistry.NewGroup(p.Health)
-	jobGroup.Add(job.OneShot("endpoint-mtu-updater", endpointUpdater.Updater))
-	p.Lifecycle.Append(jobGroup)
+	p.JobGroup.Add(job.OneShot("endpoint-mtu-updater", endpointUpdater.Updater))
 
 	return &endpointUpdater
 }
@@ -112,9 +108,10 @@ func (emu *endpointUpdater) Updater(ctx context.Context, health cell.Health) err
 	watch = closed
 
 	retryLimit := backoff.Exponential{
-		Name: "endpoint-mtu-updater",
-		Min:  1 * time.Second,
-		Max:  1 * time.Minute,
+		Logger: emu.logger,
+		Name:   "endpoint-mtu-updater",
+		Min:    1 * time.Second,
+		Max:    1 * time.Minute,
 	}
 
 	for {
@@ -178,8 +175,6 @@ func (emu *endpointUpdater) updateHostNSDevices(rx statedb.ReadTxn, routeMtus []
 		return err
 	}
 
-	var errs []error
-
 	// Update the MTU of all endpoint interfaces in the host network namespace
 	deviceIter := emu.deviceTable.All(rx)
 	for dev := range deviceIter {
@@ -197,27 +192,19 @@ func (emu *endpointUpdater) updateHostNSDevices(rx statedb.ReadTxn, routeMtus []
 
 		link, err := netlink.LinkByIndex(dev.Index)
 		if err != nil {
-			emu.logger.Error("Error getting link by index",
-				"index", dev.Index,
-				logfields.Error, err,
-			)
-			errs = append(errs, err)
+			// Ignore any errors. It is possible that the device has been removed between the time
+			// we read the device table and now.
 			continue
 		}
 
 		if err := netlink.LinkSetMTU(link, defaultRouteMTU.DeviceMTU); err != nil {
-			emu.logger.Error("Error setting MTU for link",
-				"link", link.Attrs().Name,
-				"index", link.Attrs().Index,
-				"mtu", defaultRouteMTU.DeviceMTU,
-				logfields.Error, err,
-			)
-			errs = append(errs, err)
+			// Ignore any errors. It is possible that the device has been removed between the time
+			// we got the link and now.
 			continue
 		}
 	}
 
-	return errors.Join(errs...)
+	return nil
 }
 
 // RegisterHook registers a hook to be called when updating the MTU of endpoints.
@@ -230,12 +217,11 @@ func (emu *endpointUpdater) RegisterHook(hook EndpointMTUUpdateHook) {
 func (emu *endpointUpdater) updateEndpoints(routeMTUs []RouteMTU) error {
 	files, err := os.ReadDir(defaults.NetNsPath)
 	if err != nil {
-		emu.logger.Error("Error opening the netns dir while "+
-			"updating MTU for endpoints",
-			"netns-dir", defaults.NetNsPath,
-			logfields.Error, err,
+		return fmt.Errorf(
+			"Error opening the netns dir (%q) while updating MTU for endpoints: %w",
+			defaults.NetNsPath,
+			err,
 		)
-		return err
 	}
 
 	var errs []error
@@ -243,8 +229,14 @@ func (emu *endpointUpdater) updateEndpoints(routeMTUs []RouteMTU) error {
 	for _, file := range files {
 		ns, err := netns.OpenPinned(filepath.Join(defaults.NetNsPath, file.Name()))
 		if err != nil {
+			// If the netns disappeared between the time we read the directory and now, ignore it,
+			// it likely means the endpoint was deleted.
+			if os.IsNotExist(err) {
+				continue
+			}
+
 			emu.logger.Error("Error opening netns",
-				"netns", file.Name(),
+				logfields.NetNSName, file.Name(),
 				logfields.Error, err,
 			)
 			errs = append(errs, err)
@@ -256,9 +248,9 @@ func (emu *endpointUpdater) updateEndpoints(routeMTUs []RouteMTU) error {
 				if err := hook(routeMTUs); err != nil {
 					errs = append(errs, err)
 					emu.logger.Error("error while updating MTU for endpoint",
-						"netns", file.Name(),
+						logfields.NetNSName, file.Name(),
 						logfields.Error, err,
-						"hook", runtime.FuncForPC(reflect.ValueOf(hook).Pointer()).Name(),
+						logfields.Hook, runtime.FuncForPC(reflect.ValueOf(hook).Pointer()).Name(),
 					)
 				}
 			}
@@ -267,9 +259,17 @@ func (emu *endpointUpdater) updateEndpoints(routeMTUs []RouteMTU) error {
 		ns.Close()
 		// Even though we never return an error from ns.Do, it can still fail internally
 		if err != nil {
+			// When we open a netns, we get a file descriptor to the netns, which ns.Do uses internally
+			// to do syscalls for the switching. If the netns is deleted between the time we open it and
+			// the time of calling ns.Do, we get an -EINVAL error, since the file descriptor is no longer valid.
+			// We ignore this error, since it means the netns and thus the endpoint was deleted.
+			if errors.Is(err, unix.EINVAL) {
+				continue
+			}
+
 			errs = append(errs, err)
 			emu.logger.Error("error while updating MTU for endpoint",
-				"netns", file.Name(),
+				logfields.NetNSName, file.Name(),
 				logfields.Error, err,
 			)
 			continue
@@ -295,6 +295,10 @@ func defaultRouteHook(routeMTUs []RouteMTU) error {
 		switch link.Type() {
 		case "veth", "netkit":
 		default:
+			continue
+		}
+
+		if !connector.IsCiliumManagedLink(link) {
 			continue
 		}
 
@@ -348,7 +352,7 @@ func (emu *endpointUpdater) updateHealthEndpoint(routeMTUs []RouteMTU) error {
 		err error
 	)
 
-	for i := 0; i < healthEPRetries; i++ {
+	for range healthEPRetries {
 		pid, err = pidfile.Read(healthPIDPath)
 		if err == nil {
 			break
@@ -367,7 +371,7 @@ func (emu *endpointUpdater) updateHealthEndpoint(routeMTUs []RouteMTU) error {
 
 	file := fmt.Sprintf("/proc/%d/ns/net", pid)
 	var healthNS *netns.NetNS
-	for i := 0; i < healthEPRetries; i++ {
+	for range healthEPRetries {
 		healthNS, err = netns.OpenPinned(file)
 		if err == nil {
 			break
@@ -386,9 +390,9 @@ func (emu *endpointUpdater) updateHealthEndpoint(routeMTUs []RouteMTU) error {
 			if err := hook(routeMTUs); err != nil {
 				errs = append(errs, err)
 				emu.logger.Error("error while updating MTU for health endpoint",
-					"netns", file,
+					logfields.NetNSName, file,
 					logfields.Error, err,
-					"hook", runtime.FuncForPC(reflect.ValueOf(hook).Pointer()).Name(),
+					logfields.Hook, runtime.FuncForPC(reflect.ValueOf(hook).Pointer()).Name(),
 				)
 			}
 		}
@@ -399,7 +403,7 @@ func (emu *endpointUpdater) updateHealthEndpoint(routeMTUs []RouteMTU) error {
 	// Even though we never return an error from ns.Do, it can still fail internally
 	if err != nil {
 		emu.logger.Error("Error updating MTU for health endpoint",
-			"pid", pid,
+			logfields.PID, pid,
 			logfields.Error, err,
 		)
 		errs = append(errs, err)

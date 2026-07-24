@@ -5,6 +5,7 @@ package auth
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 
 	"github.com/cilium/hive/cell"
@@ -13,12 +14,13 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/auth/spire"
-	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/maps/authmap"
+	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 	nodeManager "github.com/cilium/cilium/pkg/node/manager"
-	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	"github.com/cilium/cilium/pkg/signal"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -47,7 +49,7 @@ var Cell = cell.Module(
 		newAlwaysFailAuthHandler,
 	),
 	cell.Config(config{
-		MeshAuthEnabled:               true,
+		MeshAuthEnabled:               false,
 		MeshAuthQueueSize:             1024,
 		MeshAuthGCInterval:            5 * time.Minute,
 		MeshAuthSignalBackoffDuration: 1 * time.Second, // this default is based on the default TCP retransmission timeout
@@ -64,6 +66,7 @@ type config struct {
 
 func (r config) Flags(flags *pflag.FlagSet) {
 	flags.Bool("mesh-auth-enabled", r.MeshAuthEnabled, "Enable authentication processing & garbage collection (beta)")
+	flags.MarkDeprecated("mesh-auth-enabled", "Mutual Auth is deprecated as of Cilium v1.20. See https://github.com/cilium/cilium/issues/47132 for details.")
 	flags.Int("mesh-auth-queue-size", r.MeshAuthQueueSize, "Queue size for the auth manager")
 	flags.Duration("mesh-auth-gc-interval", r.MeshAuthGCInterval, "Interval in which auth entries are attempted to be garbage collected")
 	flags.Duration("mesh-auth-signal-backoff-duration", r.MeshAuthSignalBackoffDuration, "Time to wait betweeen two authentication required signals in case of a cache mismatch")
@@ -81,40 +84,46 @@ type MeshAuthConfig interface {
 type authManagerParams struct {
 	cell.In
 
-	Logger    *slog.Logger
-	Lifecycle cell.Lifecycle
-	JobGroup  job.Group
-	Health    cell.Health
+	Logger          *slog.Logger
+	Lifecycle       cell.Lifecycle
+	JobGroup        job.Group
+	Health          cell.Health
+	MetricsRegistry *metrics.Registry
 
 	Config       config
 	AuthMap      authmap.Map
 	AuthHandlers []authHandler `group:"authHandlers"`
 
 	SignalManager   signal.SignalManager
-	NodeIDHandler   types.NodeIDHandler
+	NodeIDHandler   node.IDHandler
 	IdentityChanges stream.Observable[cache.IdentityChange]
 	NodeManager     nodeManager.NodeManager
 	EndpointManager endpointmanager.EndpointManager
-	PolicyRepo      policy.PolicyRepository
+	PolicyComputer  compute.PolicyRecomputer
 }
 
 func registerAuthManager(params authManagerParams) (*AuthManager, error) {
 	if !params.Config.MeshAuthEnabled {
 		params.Logger.Info("Authentication processing is disabled")
+		// No-op signal handler because because the manager expects at least
+		// one handler.
+		if err := params.SignalManager.RegisterHandler(func(_ io.Reader) (_ string, _ error) { return "", nil }, signal.SignalAuthRequired); err != nil {
+			return nil, fmt.Errorf("failed to set up no-op signal handler for disabled auth events: %w", err)
+		}
 		return nil, nil
 	}
 
 	// Instantiate & wire auth components
 
 	mapWriter := newAuthMapWriter(params.Logger, params.AuthMap)
-	mapCache := newAuthMapCache(params.Logger, mapWriter)
+	mapCache := newAuthMapCache(params.Logger, params.MetricsRegistry, mapWriter)
 
 	mgr, err := newAuthManager(params.Logger, params.AuthHandlers, mapCache, params.NodeIDHandler, params.Config.MeshAuthSignalBackoffDuration)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create auth manager: %w", err)
 	}
 
-	mapGC := newAuthMapGC(params.Logger, mapCache, params.NodeIDHandler, params.PolicyRepo)
+	mapGC := newAuthMapGC(params.Logger, mapCache, params.NodeIDHandler, params.PolicyComputer)
 
 	// Register auth components to lifecycle hooks & jobs
 

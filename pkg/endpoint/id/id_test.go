@@ -38,14 +38,6 @@ func TestSplitID(t *testing.T) {
 			},
 		},
 		{
-			name: "ID with PodNamePrefix prefix",
-			id:   string(PodNamePrefix) + ":default:foobar",
-			want: want{
-				prefixType: PodNamePrefix,
-				id:         "default:foobar",
-			},
-		},
-		{
 			name: "ID with CEPNamePrefix prefix",
 			id:   string(CEPNamePrefix) + ":default:baz-net1",
 			want: want{
@@ -85,11 +77,11 @@ func BenchmarkSplitID(b *testing.B) {
 	}{
 		{"123456", CiliumLocalIdPrefix, "123456"},
 		{string(CiliumLocalIdPrefix + ":123456"), CiliumLocalIdPrefix, "123456"},
-		{string(PodNamePrefix + ":default:foobar"), PodNamePrefix, "default:foobar"},
+		{string(CEPNamePrefix + ":default/foobar"), CEPNamePrefix, "default/foobar"},
 	}
 	count := 0
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		for _, test := range tests {
 			pt, str := splitID(test.str)
 			if pt == test.prefixType && str == test.id {
@@ -104,7 +96,7 @@ func BenchmarkSplitID(b *testing.B) {
 	b.ReportAllocs()
 }
 
-func TestParse(t *testing.T) {
+func TestPrivilegedParse(t *testing.T) {
 	type test struct {
 		input      PrefixType
 		wantPrefix PrefixType
@@ -113,8 +105,6 @@ func TestParse(t *testing.T) {
 	}
 
 	tests := []test{
-		{DockerEndpointPrefix + ":foo", DockerEndpointPrefix, "foo", false},
-		{DockerEndpointPrefix + ":foo:foo", DockerEndpointPrefix, "foo:foo", false},
 		{"unknown:unknown", "", "", true},
 		{"unknown", CiliumLocalIdPrefix, "unknown", false},
 	}

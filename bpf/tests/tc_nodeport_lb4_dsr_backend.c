@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
 
 /* Enable code paths under test */
@@ -11,9 +10,6 @@
 #define ENABLE_NODEPORT
 #define ENABLE_DSR		1
 #define DSR_ENCAP_GENEVE	3
-#define ENABLE_HOST_ROUTING
-
-#define DISABLE_LOOPBACK_LB
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -35,7 +31,7 @@ static volatile const __u8 *client_mac = mac_one;
 static volatile const __u8 *node_mac = mac_three;
 static volatile const __u8 *backend_mac = mac_four;
 
-__section("mock-handle-policy")
+__section_entry
 int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
 {
 	return TC_ACT_REDIRECT;
@@ -103,33 +99,17 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 	return CTX_ACT_DROP;
 }
 
-#define SECCTX_FROM_IPCACHE 1
-
-#include "bpf_host.c"
+#include "lib/bpf_host.h"
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 
-#define FROM_NETDEV	0
-#define TO_NETDEV	1
-
+ASSIGN_CONFIG(bool, enable_bpf_host_routing, true)
 ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(max_entries, 2);
-	__array(values, int());
-} entry_call_map __section(".maps") = {
-	.values = {
-		[FROM_NETDEV] = &cil_from_netdev,
-		[TO_NETDEV] = &cil_to_netdev,
-	},
-};
 
 /* Test that a remote node
  * - doesn't touch a DSR request,
- * - redirects it to the pod (as ENABLE_HOST_ROUTING is set)
+ * - redirects it to the pod (as BPF Host Routing is enabled)
  * - creates a matching CT entry, and SNAT entry from the DSR info
  */
 PKTGEN("tc", "tc_nodeport_dsr_backend")
@@ -193,10 +173,7 @@ int nodeport_dsr_backend_setup(struct __ctx_buff *ctx)
 
 	ipcache_v4_add_entry(BACKEND_IP, 0, 112233, 0, 0);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_receive_packet(ctx);
 }
 
 CHECK("tc", "tc_nodeport_dsr_backend")
@@ -210,6 +187,8 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -266,15 +245,17 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0xd7d0))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x3771))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x3771));
 
 	struct ipv4_ct_tuple tuple;
 	struct ct_entry *ct_entry;
-	int l4_off, ret;
+	int l3_off, l4_off, ret;
 
-	ret = lb4_extract_tuple(ctx, l3, sizeof(*status_code) + ETH_HLEN,
-				&l4_off, &tuple);
+	l3_off = sizeof(*status_code) + ETH_HLEN;
+	l4_off = l3_off + ipv4_hdrlen(l3);
+
+	ret = lb4_extract_tuple(ctx, l3, ipfrag_encode_ipv4(l3), l4_off, &tuple);
 	assert(!IS_ERR(ret));
 
 	tuple.flags = TUPLE_F_IN;
@@ -285,19 +266,10 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 		test_fatal("no CT entry for DSR found");
 	if (!ct_entry->dsr_internal)
 		test_fatal("CT entry doesn't have the .dsr_internal flag set");
-
-	struct ipv4_nat_entry *nat_entry;
-
-	tuple.sport = BACKEND_PORT;
-	tuple.dport = CLIENT_PORT;
-
-	nat_entry = snat_v4_lookup(&tuple);
-	if (!nat_entry)
-		test_fatal("no SNAT entry for DSR found");
-	if (nat_entry->to_saddr != FRONTEND_IP)
-		test_fatal("SNAT entry has wrong address");
-	if (nat_entry->to_sport != FRONTEND_PORT)
-		test_fatal("SNAT entry has wrong port");
+	if (ct_entry->nat_addr.p4 != FRONTEND_IP)
+		test_fatal("CT entry has wrong RevDNAT address");
+	if (ct_entry->nat_port != FRONTEND_PORT)
+		test_fatal("CT entry has wrong RevDNAT port");
 
 	test_finish();
 }
@@ -380,8 +352,8 @@ static __always_inline int check_reply(const struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x01a9))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x6149))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x6149));
 
 	test_finish();
 }
@@ -398,10 +370,7 @@ int nodeport_dsr_backend_reply_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "tc_nodeport_dsr_backend_reply")
 int nodeport_dsr_backend_reply_setup(struct __ctx_buff *ctx)
 {
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, TO_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_send_packet(ctx);
 }
 
 CHECK("tc", "tc_nodeport_dsr_backend_reply")
@@ -468,10 +437,10 @@ int nodeport_dsr_backend_redirect_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "tc_nodeport_dsr_backend_redirect")
 int nodeport_dsr_backend_redirect_setup(struct __ctx_buff *ctx)
 {
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFACE, BACKEND_EP_ID, 0, 0, 0,
+			      (__u8 *)backend_mac, (__u8 *)node_mac);
+
+	return netdev_receive_packet(ctx);
 }
 
 CHECK("tc", "tc_nodeport_dsr_backend_redirect")
@@ -485,6 +454,8 @@ int nodeport_dsr_backend_redirect_check(struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -541,15 +512,17 @@ int nodeport_dsr_backend_redirect_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0xcccf))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x2c70))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x2c70));
 
 	struct ipv4_ct_tuple tuple;
 	struct ct_entry *ct_entry;
-	int l4_off, ret;
+	int l3_off, l4_off, ret;
 
-	ret = lb4_extract_tuple(ctx, l3, sizeof(*status_code) + ETH_HLEN,
-				&l4_off, &tuple);
+	l3_off = sizeof(*status_code) + ETH_HLEN;
+	l4_off = l3_off + ipv4_hdrlen(l3);
+
+	ret = lb4_extract_tuple(ctx, l3, ipfrag_encode_ipv4(l3), l4_off, &tuple);
 	assert(!IS_ERR(ret));
 
 	tuple.flags = TUPLE_F_IN;
@@ -560,19 +533,6 @@ int nodeport_dsr_backend_redirect_check(struct __ctx_buff *ctx)
 		test_fatal("no CT entry for DSR found");
 	if (!ct_entry->dsr_internal)
 		test_fatal("CT entry doesn't have the .dsr_internal flag set");
-
-	struct ipv4_nat_entry *nat_entry;
-
-	tuple.sport = BACKEND_PORT;
-	tuple.dport = CLIENT_PORT;
-
-	nat_entry = snat_v4_lookup(&tuple);
-	if (!nat_entry)
-		test_fatal("no SNAT entry for DSR found");
-	if (nat_entry->to_saddr != FRONTEND_IP)
-		test_fatal("SNAT entry has wrong address");
-	if (nat_entry->to_sport != FRONTEND_PORT)
-		test_fatal("SNAT entry has wrong port");
 
 	test_finish();
 }
@@ -607,10 +567,7 @@ int nodeport_dsr_backend_redirect_reply_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "tc_nodeport_dsr_backend_redirect_reply")
 int nodeport_dsr_backend_redirect_reply_setup(struct __ctx_buff *ctx)
 {
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, TO_NETDEV);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return netdev_send_packet(ctx);
 }
 
 /* Test that to-netdev respects the routing needed for CLIENT_IP_2,
@@ -669,8 +626,8 @@ int nodeport_dsr_backend_redirect_reply_check(struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0xcccf))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x2c70))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x2c70));
 
 	test_finish();
 }

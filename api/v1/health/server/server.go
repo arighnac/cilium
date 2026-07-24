@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cilium/hive/cell"
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/runtime/middleware"
 	"github.com/go-openapi/swag"
@@ -29,10 +29,9 @@ import (
 
 	"github.com/cilium/cilium/api/v1/health/server/restapi"
 	"github.com/cilium/cilium/api/v1/health/server/restapi/connectivity"
-	"github.com/cilium/hive/cell"
-
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/logging"
 )
 
 // Cell implements the cilium health API REST API server when provided
@@ -54,6 +53,8 @@ type apiParams struct {
 	cell.In
 
 	Spec *Spec
+
+	Logger *slog.Logger
 
 	Middleware middleware.Builder `name:"cilium-health-api-middleware" optional:"true"`
 
@@ -77,6 +78,8 @@ func newAPI(p apiParams) *restapi.CiliumHealthAPIAPI {
 			return p.Middleware(api.Context().APIHandler(builder))
 		}
 	}
+
+	api.Logger = p.Logger.Info
 
 	return api
 }
@@ -197,7 +200,7 @@ func NewServer(api *restapi.CiliumHealthAPIAPI) *Server {
 // ConfigureAPI configures the API and handlers.
 func (s *Server) ConfigureAPI() {
 	if s.api != nil {
-		s.handler = configureAPI(s.api)
+		s.handler = configureAPI(s.logger, s.api)
 	}
 }
 
@@ -252,9 +255,18 @@ func (s *Server) Logf(f string, args ...interface{}) {
 	if s.logger != nil {
 		s.logger.Info(fmt.Sprintf(f, args...))
 	} else if s.api != nil && s.api.Logger != nil {
-		s.api.Logger(f, args...)
+		s.api.Logger(fmt.Sprintf(f, args...))
 	} else {
-		log.Printf(f, args...)
+		slog.Info(fmt.Sprintf(f, args...))
+	}
+}
+
+// Debugf logs debug messages either via defined user logger or via system one if no user logger is defined.
+func (s *Server) Debugf(f string, args ...interface{}) {
+	if s.logger != nil {
+		s.logger.Debug(fmt.Sprintf(f, args...))
+	} else {
+		slog.Debug(fmt.Sprintf(f, args...))
 	}
 }
 
@@ -267,7 +279,7 @@ func (s *Server) Fatalf(f string, args ...interface{}) {
 		s.api.Logger(f, args...)
 		os.Exit(1)
 	} else {
-		log.Fatalf(f, args...)
+		logging.Fatal(slog.Default(), fmt.Sprintf(f, args...))
 	}
 }
 
@@ -280,7 +292,7 @@ func (s *Server) SetAPI(api *restapi.CiliumHealthAPIAPI) {
 	}
 
 	s.api = api
-	s.handler = configureAPI(api)
+	s.handler = configureAPI(s.logger, api)
 }
 
 // GetAPI returns the configured API. Modifications on the API must be performed
@@ -340,7 +352,7 @@ func (s *Server) Start(cell.HookContext) (err error) {
 		configureServer(domainSocket, "unix", s.SocketPath)
 
 		if os.Getuid() == 0 {
-			err := api.SetDefaultPermissions(s.SocketPath)
+			err := api.SetDefaultPermissions(s.Debugf, s.SocketPath)
 			if err != nil {
 				return err
 			}

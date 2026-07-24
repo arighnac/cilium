@@ -8,12 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/cilium/fake"
+	"github.com/cilium/hive/hivetest"
 	"github.com/gopacket/gopacket/layers"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -24,29 +25,21 @@ import (
 	observerpb "github.com/cilium/cilium/api/v1/observer"
 	hubv1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/cilium/pkg/hubble/container"
+	"github.com/cilium/cilium/pkg/hubble/observer/namespace"
 	"github.com/cilium/cilium/pkg/hubble/observer/observeroption"
 	observerTypes "github.com/cilium/cilium/pkg/hubble/observer/types"
 	"github.com/cilium/cilium/pkg/hubble/parser"
 	"github.com/cilium/cilium/pkg/hubble/testutils"
+	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/monitor"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/types"
 )
 
-var (
-	log       *logrus.Logger
-	nsManager = NewNamespaceManager()
-)
-
-func init() {
-	log = logrus.New()
-	log.SetOutput(io.Discard)
-}
-
-func noopParser(t *testing.T) *parser.Parser {
+func noopParser(tb testing.TB) *parser.Parser {
 	pp, err := parser.New(
-		log,
+		hivetest.Logger(tb),
 		&testutils.NoopEndpointGetter,
 		&testutils.NoopIdentityGetter,
 		&testutils.NoopDNSGetter,
@@ -54,15 +47,14 @@ func noopParser(t *testing.T) *parser.Parser {
 		&testutils.NoopServiceGetter,
 		&testutils.NoopLinkGetter,
 		&testutils.NoopPodMetadataGetter,
-		true,
 	)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return pp
 }
 
 func TestNewLocalServer(t *testing.T) {
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log)
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t))
 	require.NoError(t, err)
 	assert.NotNil(t, s.GetStopped())
 	assert.NotNil(t, s.GetPayloadParser())
@@ -72,10 +64,10 @@ func TestNewLocalServer(t *testing.T) {
 }
 
 func TestLocalObserverServer_ServerStatus(t *testing.T) {
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log, observeroption.WithMaxFlows(container.Capacity1))
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t), observeroption.WithMaxFlows(container.Capacity1))
 	require.NoError(t, err)
-	res, err := s.ServerStatus(context.Background(), &observerpb.ServerStatusRequest{})
+	res, err := s.ServerStatus(t.Context(), &observerpb.ServerStatusRequest{})
 	require.NoError(t, err)
 	assert.Equal(t, uint64(0), res.SeenFlows)
 	assert.Equal(t, uint64(0), res.NumFlows)
@@ -86,7 +78,7 @@ func TestLocalObserverServer_ServerStatus(t *testing.T) {
 func TestGetFlowRate(t *testing.T) {
 	type event struct {
 		offset int
-		event  interface{}
+		event  any
 	}
 
 	tcs := map[string]struct {
@@ -181,14 +173,14 @@ func TestGetFlowRate(t *testing.T) {
 				c = tc.ringCap
 			}
 			ring := container.NewRing(c)
-			for i := len(tc.events) - 1; i >= 0; i-- {
-				ev := tc.events[i].event
+			for _, evWithOffset := range slices.Backward(tc.events) {
+				ev := evWithOffset.event
 				if ev == nil {
 					// Default is flow
 					ev = &flowpb.Flow{}
 				}
 				ring.Write(&hubv1.Event{
-					Timestamp: timestamppb.New(now.Add(-1 * time.Duration(tc.events[i].offset) * time.Millisecond)),
+					Timestamp: timestamppb.New(now.Add(-1 * time.Duration(evWithOffset.offset) * time.Millisecond)),
 					Event:     ev,
 				})
 			}
@@ -219,13 +211,13 @@ func TestLocalObserverServer_GetFlows(t *testing.T) {
 		},
 		FakeGRPCServerStream: &testutils.FakeGRPCServerStream{
 			OnContext: func() context.Context {
-				return context.Background()
+				return t.Context()
 			},
 		},
 	}
 
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithMaxFlows(container.Capacity127),
 		observeroption.WithMonitorBuffer(queueSize),
 	)
@@ -235,11 +227,10 @@ func TestLocalObserverServer_GetFlows(t *testing.T) {
 	m := s.GetEventsChannel()
 	input := make([]*observerpb.Flow, numFlows)
 
-	for i := 0; i < numFlows; i++ {
-		tn := monitor.TraceNotifyV0{Type: byte(monitorAPI.MessageTypeTrace)}
-		macOnly := func(mac string) net.HardwareAddr {
-			m, _ := net.ParseMAC(mac)
-			return m
+	for i := range numFlows {
+		tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
+		macOnly := func(s string) net.HardwareAddr {
+			return net.HardwareAddr(mac.MustParseMAC(s))
 		}
 		data := testutils.MustCreateL3L4Payload(tn, &layers.Ethernet{
 			SrcMAC: macOnly(fake.MAC()),
@@ -298,9 +289,6 @@ func TestLocalObserverServer_GetFlows(t *testing.T) {
 	req = &observerpb.GetFlowsRequest{
 		Number:    uint64(10),
 		FieldMask: &fieldmaskpb.FieldMask{Paths: fmPaths},
-		Experimental: &observerpb.GetFlowsRequest_Experimental{
-			FieldMask: &fieldmaskpb.FieldMask{Paths: fmPaths},
-		},
 	}
 	err = s.GetFlows(req, fakeServer)
 	assert.NoError(t, err)
@@ -323,9 +311,6 @@ func TestLocalObserverServer_GetFlows(t *testing.T) {
 	req = &observerpb.GetFlowsRequest{
 		Number:    uint64(10),
 		FieldMask: &fieldmaskpb.FieldMask{Paths: []string{""}},
-		Experimental: &observerpb.GetFlowsRequest_Experimental{
-			FieldMask: &fieldmaskpb.FieldMask{Paths: []string{""}},
-		},
 	}
 	err = s.GetFlows(req, fakeServer)
 	assert.EqualError(t, err, "invalid fieldmask")
@@ -357,36 +342,34 @@ func TestLocalObserverServer_GetAgentEvents(t *testing.T) {
 				serviceDelete := response.GetAgentEvent().GetServiceDelete()
 				assert.NotNil(t, serviceDelete)
 			default:
-				assert.Fail(t, "unexpected agent event", ev)
+				assert.Fail(t, "unexpected agent event", "event: %v", ev)
 			}
 			agentEventsReceived++
 			return nil
 		},
 		FakeGRPCServerStream: &testutils.FakeGRPCServerStream{
 			OnContext: func() context.Context {
-				return context.Background()
+				return t.Context()
 			},
 		},
 	}
 
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithMonitorBuffer(queueSize),
 	)
 	require.NoError(t, err)
 	go s.Start()
 
 	m := s.GetEventsChannel()
-	for i := 0; i < numEvents; i++ {
+	for i := range numEvents {
 		ts := time.Unix(int64(i), 0)
 		node := fmt.Sprintf("node #%03d", i)
 		var msg monitorAPI.AgentNotifyMessage
 		if i == 0 {
 			msg = monitorAPI.StartMessage(time.Unix(42, 1))
-		} else if i%2 == 1 {
-			msg = monitorAPI.IPCacheUpsertedMessage(cidr, uint32(i), nil, net.ParseIP("10.1.5.4"), nil, 0xff, "default", "foobar")
 		} else {
-			msg = monitorAPI.ServiceDeleteMessage(uint32(i))
+			msg = monitorAPI.IPCacheUpsertedMessage(cidr, uint32(i), nil, net.ParseIP("10.1.5.4"), nil, 0xff, "default", "foobar")
 		}
 		m <- &observerTypes.MonitorEvent{
 			Timestamp: ts,
@@ -420,8 +403,8 @@ func TestLocalObserverServer_GetFlows_Follow_Since(t *testing.T) {
 		Follow: true,
 	}
 
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithMaxFlows(container.Capacity127),
 		observeroption.WithMonitorBuffer(queueSize),
 	)
@@ -430,7 +413,7 @@ func TestLocalObserverServer_GetFlows_Follow_Since(t *testing.T) {
 
 	generateFlows := func(from, to int, m chan<- *observerTypes.MonitorEvent) {
 		for i := from; i < to; i++ {
-			tn := monitor.TraceNotifyV0{Type: byte(monitorAPI.MessageTypeTrace)}
+			tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
 			data := testutils.MustCreateL3L4Payload(tn)
 			m <- &observerTypes.MonitorEvent{
 				Timestamp: time.Unix(int64(i), 0),
@@ -480,7 +463,7 @@ func TestLocalObserverServer_GetFlows_Follow_Since(t *testing.T) {
 		},
 		FakeGRPCServerStream: &testutils.FakeGRPCServerStream{
 			OnContext: func() context.Context {
-				return context.Background()
+				return t.Context()
 			},
 		},
 	}
@@ -518,8 +501,8 @@ func TestHooks(t *testing.T) {
 		return false, nil
 	}
 
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithMaxFlows(container.Capacity15),
 		observeroption.WithMonitorBuffer(queueSize),
 		observeroption.WithOnMonitorEventFunc(onMonitorEventFirst),
@@ -530,8 +513,8 @@ func TestHooks(t *testing.T) {
 	go s.Start()
 
 	m := s.GetEventsChannel()
-	for i := 0; i < numFlows; i++ {
-		tn := monitor.TraceNotifyV0{Type: byte(monitorAPI.MessageTypeTrace)}
+	for i := range numFlows {
+		tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
 		data := testutils.MustCreateL3L4Payload(tn)
 		m <- &observerTypes.MonitorEvent{
 			Timestamp: time.Unix(int64(i), 0),
@@ -561,7 +544,7 @@ func TestLocalObserverServer_OnFlowDelivery(t *testing.T) {
 		},
 		FakeGRPCServerStream: &testutils.FakeGRPCServerStream{
 			OnContext: func() context.Context {
-				return context.Background()
+				return t.Context()
 			},
 		},
 	}
@@ -575,8 +558,8 @@ func TestLocalObserverServer_OnFlowDelivery(t *testing.T) {
 		return false, nil
 	}
 
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithMaxFlows(container.Capacity127),
 		observeroption.WithMonitorBuffer(queueSize),
 		observeroption.WithOnFlowDeliveryFunc(onFlowDelivery),
@@ -585,8 +568,8 @@ func TestLocalObserverServer_OnFlowDelivery(t *testing.T) {
 	go s.Start()
 
 	m := s.GetEventsChannel()
-	for i := 0; i < numFlows; i++ {
-		tn := monitor.TraceNotifyV0{Type: byte(monitorAPI.MessageTypeTrace)}
+	for i := range numFlows {
+		tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
 		data := testutils.MustCreateL3L4Payload(tn)
 		m <- &observerTypes.MonitorEvent{
 			Timestamp: time.Unix(int64(i), 0),
@@ -619,7 +602,7 @@ func TestLocalObserverServer_OnGetFlows(t *testing.T) {
 		},
 		FakeGRPCServerStream: &testutils.FakeGRPCServerStream{
 			OnContext: func() context.Context {
-				return context.Background()
+				return t.Context()
 			},
 		},
 	}
@@ -638,8 +621,8 @@ func TestLocalObserverServer_OnGetFlows(t *testing.T) {
 		return true, nil
 	}
 
-	pp := noopParser(t)
-	s, err := NewLocalServer(pp, nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithMaxFlows(container.Capacity127),
 		observeroption.WithMonitorBuffer(queueSize),
 		observeroption.WithOnFlowDeliveryFunc(onFlowDelivery),
@@ -649,8 +632,8 @@ func TestLocalObserverServer_OnGetFlows(t *testing.T) {
 	go s.Start()
 
 	m := s.GetEventsChannel()
-	for i := 0; i < numFlows; i++ {
-		tn := monitor.TraceNotifyV0{Type: byte(monitorAPI.MessageTypeTrace)}
+	for i := range numFlows {
+		tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
 		data := testutils.MustCreateL3L4Payload(tn)
 		m <- &observerTypes.MonitorEvent{
 			Timestamp: time.Unix(int64(i), 0),
@@ -674,8 +657,7 @@ func TestLocalObserverServer_OnGetFlows(t *testing.T) {
 // TestLocalObserverServer_NodeLabels test the LocalNodeWatcher integration
 // with the observer.
 func TestLocalObserverServer_NodeLabels(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	// local node stuff setup.
 	localNode := node.LocalNode{
@@ -717,7 +699,8 @@ func TestLocalObserverServer_NodeLabels(t *testing.T) {
 	}
 
 	// local hubble observer setup.
-	s, err := NewLocalServer(noopParser(t), nsManager, log,
+	pp, nm := noopParser(t), testutils.NoopNamespaceManager
+	s, err := NewLocalServer(pp, nm, hivetest.Logger(t),
 		observeroption.WithOnDecodedFlow(localNodeWatcher),
 	)
 	require.NoError(t, err)
@@ -725,7 +708,7 @@ func TestLocalObserverServer_NodeLabels(t *testing.T) {
 
 	// simulate a new monitor event.
 	m := s.GetEventsChannel()
-	tn := monitor.TraceNotifyV0{Type: byte(monitorAPI.MessageTypeTrace)}
+	tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
 	data := testutils.MustCreateL3L4Payload(tn)
 	// NOTE: we need to send an extra event into Hubble's ring buffer to see
 	// the first one sent.
@@ -750,7 +733,7 @@ func TestLocalObserverServer_NodeLabels(t *testing.T) {
 
 func TestLocalObserverServer_GetNamespaces(t *testing.T) {
 	pp := noopParser(t)
-	nsManager := NewNamespaceManager()
+	nsManager := namespace.NewManager()
 	nsManager.AddNamespace(&observerpb.Namespace{
 		Namespace: "zzz",
 	})
@@ -762,9 +745,9 @@ func TestLocalObserverServer_GetNamespaces(t *testing.T) {
 		Namespace: "aaa",
 		Cluster:   "some-cluster",
 	})
-	s, err := NewLocalServer(pp, nsManager, log, observeroption.WithMaxFlows(container.Capacity1))
+	s, err := NewLocalServer(pp, nsManager, hivetest.Logger(t), observeroption.WithMaxFlows(container.Capacity1))
 	require.NoError(t, err)
-	res, err := s.GetNamespaces(context.Background(), &observerpb.GetNamespacesRequest{})
+	res, err := s.GetNamespaces(t.Context(), &observerpb.GetNamespacesRequest{})
 	require.NoError(t, err)
 	expected := &observerpb.GetNamespacesResponse{
 		Namespaces: []*observerpb.Namespace{
@@ -785,23 +768,9 @@ func TestLocalObserverServer_GetNamespaces(t *testing.T) {
 }
 
 func Benchmark_TrackNamespaces(b *testing.B) {
-	pp, err := parser.New(
-		log,
-		&testutils.NoopEndpointGetter,
-		&testutils.NoopIdentityGetter,
-		&testutils.NoopDNSGetter,
-		&testutils.NoopIPGetter,
-		&testutils.NoopServiceGetter,
-		&testutils.NoopLinkGetter,
-		&testutils.NoopPodMetadataGetter,
-		true,
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	nsManager := NewNamespaceManager()
-	s, err := NewLocalServer(pp, nsManager, log, observeroption.WithMaxFlows(container.Capacity1))
+	pp := noopParser(b)
+	nsManager := namespace.NewManager()
+	s, err := NewLocalServer(pp, nsManager, hivetest.Logger(b), observeroption.WithMaxFlows(container.Capacity1))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -811,8 +780,8 @@ func Benchmark_TrackNamespaces(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		s.trackNamespaces(f)
 	}
 }

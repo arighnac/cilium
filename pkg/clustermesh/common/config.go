@@ -6,27 +6,91 @@ package common
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/yaml"
+
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 type Config struct {
 	// ClusterMeshConfig is the path to the clustermesh configuration directory.
 	ClusterMeshConfig string
+
+	// ClusterMeshCacheTTL is the time to live for the cache of a remote cluster after connectivity
+	// is lost. If the connection is not re-established within this duration, the cached data is
+	// revoked to prevent stale state. If not specified or set to 0s, the cache is never revoked.
+	ClusterMeshCacheTTL time.Duration
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
 	flags.String("clustermesh-config", def.ClusterMeshConfig, "Path to the ClusterMesh configuration directory")
+	flags.Duration("clustermesh-cache-ttl", def.ClusterMeshCacheTTL, "The time to live for the cache of a remote cluster after connectivity is lost. If the connection is not re-established within this duration, the cached data is revoked to prevent stale state. If not specified or set to 0s, the cache is never revoked.")
 }
 
 var DefaultConfig = Config{
-	ClusterMeshConfig: "",
+	ClusterMeshConfig:   "",
+	ClusterMeshCacheTTL: 0,
+}
+
+type HostAlias struct {
+	Hostname string       `json:"hostname" yaml:"hostname"`
+	IPs      []netip.Addr `json:"ips" yaml:"ips"`
+}
+
+// CiliumEtcdConfig represents Cilium extensions to the etcd client config.
+// These fields are ignored by etcd but we are conveniently embedding those in
+// the etcd client config so that our config watcher can help retriggering the
+// connection if this change too.
+type CiliumEtcdConfig struct {
+	HostAliases []HostAlias `json:"cilium-host-aliases" yaml:"cilium-host-aliases"`
+}
+
+// ParseCiliumConfig reads Cilium specific fields from the etcd client config.
+func ParseCiliumConfig(path string) (CiliumEtcdConfig, error) {
+	cfg := CiliumEtcdConfig{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	if err := yaml.Unmarshal(b, &cfg); err != nil {
+		return cfg, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	seen := sets.Set[string]{}
+	for _, hostAlias := range cfg.HostAliases {
+		if hostAlias.Hostname == "" {
+			return CiliumEtcdConfig{}, fmt.Errorf("failed to parse config file: cilium-host-aliases entry has an empty hostname")
+		}
+		if len(hostAlias.IPs) == 0 {
+			return CiliumEtcdConfig{}, fmt.Errorf("failed to parse config file: cilium-host-aliases entry for hostname %q has no IPs", hostAlias.Hostname)
+		}
+		if seen.Has(hostAlias.Hostname) {
+			return CiliumEtcdConfig{}, fmt.Errorf("failed to parse config file: cilium-host-aliases has duplicate hostname %q", hostAlias.Hostname)
+		}
+		seen.Insert(hostAlias.Hostname)
+	}
+
+	return cfg, nil
+}
+
+func ConvertHostAliasesToPlainMap(hostAliases []HostAlias) map[string][]netip.Addr {
+	plainMap := make(map[string][]netip.Addr, len(hostAliases))
+	for _, ha := range hostAliases {
+		plainMap[ha.Hostname] = ha.IPs
+	}
+	return plainMap
 }
 
 // clusterLifecycle is the interface to implement in order to receive cluster
@@ -39,6 +103,7 @@ type clusterLifecycle interface {
 type fhash [sha256.Size]byte
 
 type configDirectoryWatcher struct {
+	logger *slog.Logger
 	// Use two separate watchers, one for the directory itself, and one for the
 	// individual config files. We need to explicitly watch the config files
 	// to receive a notification when the underlying file gets updated, if the
@@ -57,7 +122,7 @@ type configDirectoryWatcher struct {
 	stop       chan struct{}
 }
 
-func createConfigDirectoryWatcher(path string, lifecycle clusterLifecycle) (*configDirectoryWatcher, error) {
+func createConfigDirectoryWatcher(logger *slog.Logger, path string, lifecycle clusterLifecycle) (*configDirectoryWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -75,6 +140,7 @@ func createConfigDirectoryWatcher(path string, lifecycle clusterLifecycle) (*con
 	}
 
 	return &configDirectoryWatcher{
+		logger:     logger,
 		watcher:    watcher,
 		cfgWatcher: cfgWatcher,
 		path:       path,
@@ -112,10 +178,11 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 		// If the corresponding cluster was tracked, then trigger the remove
 		// event, since the configuration file is no longer present/readable
 		if _, tracked := cdw.tracked[filename]; tracked {
-			log.WithFields(logrus.Fields{
-				fieldClusterName: filename,
-				fieldConfig:      abspath,
-			}).Debug("Removed cluster configuration")
+			cdw.logger.Debug(
+				"Removed cluster configuration",
+				fieldClusterName, filename,
+				fieldConfig, abspath,
+			)
 
 			// The remove operation returns an error if the file does no longer exists.
 			_ = cdw.cfgWatcher.Remove(abspath)
@@ -132,8 +199,11 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 		// This is required to correctly detect file modifications when the folder
 		// is mounted from a Kubernetes ConfigMap/Secret.
 		if err := cdw.cfgWatcher.Add(abspath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.WithError(err).WithField(fieldConfig, abspath).
-				Warning("Failed adding explicit path watch for config")
+			cdw.logger.Warn(
+				"Failed adding explicit path watch for config",
+				logfields.Error, err,
+				fieldConfig, abspath,
+			)
 		} else {
 			// There is a small chance that the file content changed in the time
 			// window from reading it at the beginning of the function to establishing
@@ -155,17 +225,21 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 		return
 	}
 
-	log.WithFields(logrus.Fields{
-		fieldClusterName: filename,
-		fieldConfig:      abspath,
-	}).Debug("Added or updated cluster configuration")
+	cdw.logger.Debug(
+		"Added or updated cluster configuration",
+		fieldClusterName, filename,
+		fieldConfig, abspath,
+	)
 
 	cdw.tracked[filename] = newHash
 	cdw.lifecycle.add(filename, abspath)
 }
 
 func (cdw *configDirectoryWatcher) watch() error {
-	log.WithField(fieldConfigDir, cdw.path).Debug("Starting config directory watcher")
+	cdw.logger.Debug(
+		"Starting config directory watcher",
+		fieldConfigDir, cdw.path,
+	)
 
 	files, err := os.ReadDir(cdw.path)
 	if err != nil {
@@ -187,10 +261,11 @@ func (cdw *configDirectoryWatcher) watch() error {
 
 func (cdw *configDirectoryWatcher) loop() {
 	handle := func(event fsnotify.Event) {
-		log.WithFields(logrus.Fields{
-			fieldConfigDir: cdw.path,
-			fieldEvent:     event,
-		}).Debug("Received fsnotify event")
+		cdw.logger.Debug(
+			"Received fsnotify event",
+			fieldConfigDir, cdw.path,
+			fieldEvent, event,
+		)
 		cdw.handle(event.Name)
 	}
 
@@ -203,12 +278,18 @@ func (cdw *configDirectoryWatcher) loop() {
 			handle(event)
 
 		case err := <-cdw.watcher.Errors:
-			log.WithError(err).WithField(fieldConfigDir, cdw.path).
-				Warning("Error encountered while watching directory with fsnotify")
+			cdw.logger.Warn(
+				"Error encountered while watching directory with fsnotify",
+				logfields.Error, err,
+				fieldConfigDir, cdw.path,
+			)
 
 		case err := <-cdw.cfgWatcher.Errors:
-			log.WithError(err).WithField(fieldConfigDir, cdw.path).
-				Warning("Error encountered while watching individual configuration with fsnotify")
+			cdw.logger.Warn(
+				"Error encountered while watching individual configuration with fsnotify",
+				logfields.Error, err,
+				fieldConfigDir, cdw.path,
+			)
 
 		case <-cdw.stop:
 			return
@@ -217,7 +298,10 @@ func (cdw *configDirectoryWatcher) loop() {
 }
 
 func (cdw *configDirectoryWatcher) close() {
-	log.WithField(fieldConfigDir, cdw.path).Debug("Stopping config directory watcher")
+	cdw.logger.Debug(
+		"Stopping config directory watcher",
+		fieldConfigDir, cdw.path,
+	)
 	close(cdw.stop)
 	cdw.watcher.Close()
 	cdw.cfgWatcher.Close()

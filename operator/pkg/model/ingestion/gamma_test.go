@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/operator/pkg/model"
@@ -17,17 +18,20 @@ const (
 )
 
 func TestGammaConformance(t *testing.T) {
-	tests := map[string]struct {
-	}{
-		"Mesh Split":    {},
-		"Mesh Ports":    {},
-		"Mesh Frontend": {},
+	tests := map[string]struct{}{
+		"Mesh Split":          {},
+		"Mesh Ports":          {},
+		"Mesh Frontend":       {},
+		"multiple_parentRefs": {},
+		"multiple_HTTPRoutes": {},
+		"Mesh GRPC Weight":    {},
 	}
 
 	for name := range tests {
 		t.Run(name, func(t *testing.T) {
+			logger := hivetest.Logger(t)
 			input := readGammaInput(t, name)
-			listeners := GammaHTTPRoutes(input)
+			listeners := GammaHTTPRoutes(logger, input)
 
 			expected := []model.HTTPListener{}
 			readOutput(t, fmt.Sprintf("%s/%s/%s", basedGammaTestdataDir, rewriteTestName(name), "output-listeners.yaml"), &expected)
@@ -41,6 +45,7 @@ func readGammaInput(t *testing.T, testName string) GammaInput {
 	input := GammaInput{}
 
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGammaTestdataDir, rewriteTestName(testName), "input-httproute.yaml"), &input.HTTPRoutes)
+	readInput(t, fmt.Sprintf("%s/%s/%s", basedGammaTestdataDir, rewriteTestName(testName), "input-grpcroute.yaml"), &input.GRPCRoutes)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGammaTestdataDir, rewriteTestName(testName), "input-service.yaml"), &input.Services)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGammaTestdataDir, rewriteTestName(testName), "input-referencegrant.yaml"), &input.ReferenceGrants)
 

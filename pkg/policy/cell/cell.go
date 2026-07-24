@@ -4,19 +4,23 @@
 package policycell
 
 import (
+	"log/slog"
+
 	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	"github.com/cilium/cilium/pkg/endpointmanager"
-	"github.com/cilium/cilium/pkg/envoy"
+	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
-	"github.com/cilium/cilium/pkg/policy/api"
+	policyapi "github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/compute"
+	"github.com/cilium/cilium/pkg/policy/types"
 )
 
 // Cell provides the PolicyRepository and PolicyUpdater.
@@ -27,7 +31,10 @@ var Cell = cell.Module(
 	cell.Provide(newPolicyRepo),
 	cell.Provide(newPolicyUpdater),
 	cell.Provide(newPolicyImporter),
+	cell.Provide(newIdentityUpdater),
+	cell.Provide(newIPCacher),
 	cell.Config(defaultConfig),
+	metrics.Metric(newIdentityUpdaterMetrics),
 )
 
 type Config struct {
@@ -50,19 +57,21 @@ func (def Config) Flags(flags *pflag.FlagSet) {
 type policyRepoParams struct {
 	cell.In
 
-	Lifecycle       cell.Lifecycle
-	Config          Config
-	CertManager     certificatemanager.CertificateManager
-	SecretManager   certificatemanager.SecretManager
-	IdentityManager identitymanager.IDManager
-	ClusterInfo     cmtypes.ClusterInfo
-	MetricsManager  api.PolicyMetrics
+	Logger            *slog.Logger
+	Lifecycle         cell.Lifecycle
+	Config            Config
+	DaemonConfig      *option.DaemonConfig
+	CertManager       certificatemanager.CertificateManager
+	IdentityManager   identitymanager.IDManager
+	ClusterInfo       cmtypes.ClusterInfo
+	MetricsManager    types.PolicyMetrics
+	L7RulesTranslator envoypolicy.EnvoyL7RulesTranslator
 }
 
 func newPolicyRepo(params policyRepoParams) policy.PolicyRepository {
+	// Must be done before calling policy.NewPolicyRepository() below.
 	if params.Config.EnableWellKnownIdentities {
-		// Must be done before calling policy.NewPolicyRepository() below.
-		num := identity.InitWellKnownIdentities(option.Config, params.ClusterInfo)
+		num := identity.InitWellKnownIdentities(params.DaemonConfig.K8sNamespace, params.ClusterInfo)
 		metrics.Identity.WithLabelValues(identity.WellKnownIdentityType).Add(float64(num))
 		identity.WellKnown.ForEach(func(i *identity.Identity) {
 			for labelSource := range i.Labels.CollectSources() {
@@ -71,17 +80,19 @@ func newPolicyRepo(params policyRepoParams) policy.PolicyRepository {
 		})
 	}
 
+	policyapi.InitEntities(params.ClusterInfo.Name)
+
 	// policy repository: maintains list of active Rules and their subject
 	// security identities. Also constructs the SelectorCache, a precomputed
 	// cache of label selector -> identities for policy peers.
 	policyRepo := policy.NewPolicyRepository(
+		params.Logger,
 		identity.ListReservedIdentities(), // Load SelectorCache with reserved identities
 		params.CertManager,
-		params.SecretManager,
+		params.L7RulesTranslator,
 		params.IdentityManager,
 		params.MetricsManager,
 	)
-	policyRepo.SetEnvoyRulesFunc(envoy.GetEnvoyHTTPRules)
 
 	params.Lifecycle.Append(cell.Hook{
 		OnStart: func(hc cell.HookContext) error {
@@ -96,7 +107,9 @@ func newPolicyRepo(params policyRepoParams) policy.PolicyRepository {
 type policyUpdaterParams struct {
 	cell.In
 
+	Logger           *slog.Logger
 	PolicyRepository policy.PolicyRepository
+	PolicyComputer   compute.PolicyRecomputer
 	EndpointManager  endpointmanager.EndpointManager
 }
 
@@ -104,7 +117,5 @@ func newPolicyUpdater(params policyUpdaterParams) *policy.Updater {
 	// policyUpdater: forces policy recalculation on all endpoints.
 	// Called for various events, such as named port changes
 	// or certain identity updates.
-	policyUpdater := policy.NewUpdater(params.PolicyRepository, params.EndpointManager)
-
-	return policyUpdater
+	return policy.NewUpdater(params.Logger, params.PolicyRepository, params.PolicyComputer, params.EndpointManager)
 }

@@ -3,7 +3,7 @@
 
 #pragma once
 
-#define __section_entry __section("tc")
+#define PROG_TYPE		"tc"
 
 #define __ctx_buff		__sk_buff
 #define __ctx_is		__ctx_skb
@@ -136,10 +136,10 @@ ctx_load_and_clear_meta(struct __sk_buff *ctx, const __u32 off)
 	return val;
 }
 
-static __always_inline __maybe_unused __u16
+static __always_inline __maybe_unused __be16
 ctx_get_protocol(const struct __sk_buff *ctx)
 {
-	return (__u16)ctx->protocol;
+	return (__be16)ctx->protocol;
 }
 
 static __always_inline __maybe_unused __u32

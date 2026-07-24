@@ -23,27 +23,27 @@ jobs:
         include:
         # DON'T USE hourModulo=0 to avoid running ariane scheduled-workflows
         # at the same time as regular main scheduled workflows
-          - branch: '1.14'
+          - branch: 'v1.18'
             hourModulo: 1
-          - branch: '1.15'
+          - branch: 'v1.19'
             hourModulo: 2
-          - branch: '1.16'
+          - branch: 'v1.20'
             hourModulo: 3
-          - branch: '1.17'
-            hourModulo: 4
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: v${{ matrix.branch }}
+          ref: ${{ matrix.branch }}
           persist-credentials: false
 
       - name: Manually run Ariane workflows from the branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          HOUR=$(date -u +"%H")
+          echo "Current date time: $(date --utc --rfc-3339=seconds)"
+
+          HOUR=$(date --utc +"%-H")
           if (( HOUR % 6 == ${{ matrix.hourModulo }} )); then
             echo "Running scheduled workflows for branch ${{ matrix.branch }}"
           else
@@ -51,11 +51,17 @@ jobs:
             exit 0
           fi
 
-          REF="v${{ matrix.branch }}"
+          REF="${{ matrix.branch }}"
           SHA=$(git rev-parse ${REF})
-          readarray workflows < <(yq '.triggers["/test"].workflows[]' .github/ariane-config.yaml)
+          # /test for 1.18 branch and lower
+          # /test\s* for 1.19 branch and higher
+          readarray workflows < <((
+            yq '.triggers["/test"].workflows[]' .github/ariane-config.yaml
+            yq '.triggers["/test\s*"].workflows[]' .github/ariane-config.yaml
+            yq '.schedule.nightly.workflows[]' .github/ariane-config.yaml
+          ) | sort -u)
 
-          for workflow in ${workflows[@]}; do
+          for workflow in "${workflows[@]}"; do
             echo triggering ${workflow}
             gh workflow run ${workflow} \
               --ref ${REF} \

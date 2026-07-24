@@ -5,6 +5,7 @@ package statedb
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,8 +20,8 @@ import (
 	"github.com/cilium/hive/script"
 	"github.com/liggitt/tabwriter"
 	"github.com/spf13/pflag"
+	"go.yaml.in/yaml/v3"
 	"golang.org/x/time/rate"
-	"gopkg.in/yaml.v3"
 )
 
 func ScriptCommands(db *DB) hive.ScriptCmdsOut {
@@ -28,6 +29,7 @@ func ScriptCommands(db *DB) hive.ScriptCmdsOut {
 		"db":             DBCmd(db),
 		"db/show":        ShowCmd(db),
 		"db/cmp":         CompareCmd(db),
+		"db/empty":       EmptyCmd(db),
 		"db/insert":      InsertCmd(db),
 		"db/delete":      DeleteCmd(db),
 		"db/get":         GetCmd(db),
@@ -36,6 +38,7 @@ func ScriptCommands(db *DB) hive.ScriptCmdsOut {
 		"db/lowerbound":  LowerBoundCmd(db),
 		"db/watch":       WatchCmd(db),
 		"db/initialized": InitializedCmd(db),
+		"db/dump":        DumpCmd(db),
 	})
 }
 
@@ -58,14 +61,14 @@ func DBCmd(db *DB) script.Cmd {
 				"",
 				"The individual tables can be manipulated and inspected with the",
 				"other commands. See 'help -v db/show' etc. for detailed help.",
-				"Here is some examples to get you statred:",
+				"Here is some examples to get you started:",
 				"",
 				"> db/show example",
 				"Name   X",
 				"one    1",
 				"two    2",
 				"",
-				"> db/prefix -index=id example o",
+				"> db/prefix --index=id example o",
 				"Name   X",
 				"one    1",
 				"",
@@ -77,15 +80,56 @@ func DBCmd(db *DB) script.Cmd {
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
 			txn := db.ReadTxn()
 			tbls := db.GetTables(txn)
+			slices.SortFunc(tbls, func(a, b TableMeta) int { return cmp.Compare(a.Name(), b.Name()) })
 			w := newTabWriter(s.LogWriter())
 			fmt.Fprintf(w, "Name\tObject count\tZombie objects\tIndexes\tInitializers\tGo type\tLast WriteTxn\n")
 			for _, tbl := range tbls {
 				idxs := strings.Join(tbl.Indexes(), ", ")
-				fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%v\t%T\t%s\n",
-					tbl.Name(), tbl.NumObjects(txn), tbl.numDeletedObjects(txn), idxs, tbl.PendingInitializers(txn), tbl.proto(), tbl.getAcquiredInfo())
+				fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%v\t%s\t%s\n",
+					tbl.Name(), tbl.NumObjects(txn), tbl.numDeletedObjects(txn), idxs, tbl.PendingInitializers(txn), tbl.typeName(), tbl.getAcquiredInfo())
 			}
 			w.Flush()
 			return nil, nil
+		},
+	)
+}
+
+func DumpCmd(db *DB) script.Cmd {
+	return script.Command(
+		script.CmdUsage{
+			Summary: "Dump StateDB contents as JSON",
+			Flags: func(fs *pflag.FlagSet) {
+				fs.StringP("out", "o", "", "File to write to instead of stdout")
+			},
+			Detail: []string{
+				"The contents are written to stdout, but can be written to",
+				"a file instead with the -o flag.",
+			},
+		},
+		func(s *script.State, args ...string) (script.WaitFunc, error) {
+			file, err := s.Flags.GetString("out")
+			if err != nil {
+				return nil, err
+			}
+
+			return func(s *script.State) (stdout string, stderr string, err error) {
+				var (
+					buf strings.Builder
+					w   io.Writer = &buf
+				)
+
+				if file != "" {
+					f, err := os.OpenFile(s.Path(file), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+					if err != nil {
+						return "", "", fmt.Errorf("OpenFile(%s): %w", file, err)
+					}
+					defer f.Close()
+					w = f
+				}
+
+				err = db.ReadTxn().WriteJSON(w)
+				return buf.String(), "", err
+			}, nil
 		},
 	)
 }
@@ -105,6 +149,9 @@ func InitializedCmd(db *DB) script.Cmd {
 				"This command is useful in tests where you might need to wait",
 				"for e.g. a background reflector to have started watching before",
 				"inserting objects.",
+			},
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				return autocompleteTableName(db, before, cur)
 			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
@@ -157,6 +204,49 @@ func InitializedCmd(db *DB) script.Cmd {
 	)
 }
 
+func autocompleteTableName(db *DB, before []string, cur string) []string {
+	var suggestions []string
+	for _, tbl := range db.GetTables(db.ReadTxn()) {
+		if cur == "" || strings.HasPrefix(tbl.Name(), cur) {
+			suggestions = append(suggestions, tbl.Name())
+		}
+	}
+	slices.Sort(suggestions)
+	return suggestions
+}
+
+func autocompleteColumnNames(db *DB, args []string, cur string) []string {
+	if len(args) < 1 {
+		return nil
+	}
+
+	tbl, _, err := getTable(db, args[0])
+	if err != nil {
+		return nil
+	}
+
+	parts := strings.Split(cur, ",")
+
+	var suggestions []string
+	for _, col := range tbl.TableHeader() {
+		if cur == "" {
+			suggestions = append(suggestions, col)
+			continue
+		}
+
+		if slices.Contains(parts, col) {
+			// Already specified, skip.
+			continue
+		}
+
+		if strings.HasPrefix(col, parts[len(parts)-1]) {
+			newList := append(parts[:len(parts)-1], col)
+			suggestions = append(suggestions, strings.Join(newList, ","))
+		}
+	}
+	return suggestions
+}
+
 func ShowCmd(db *DB) script.Cmd {
 	return script.Command(
 		script.CmdUsage{
@@ -168,17 +258,32 @@ func ShowCmd(db *DB) script.Cmd {
 				fs.StringP("format", "f", "table", "Format to write in (table, yaml or json)")
 			},
 			Detail: []string{
-				"Show the contents of a table.",
-				"",
 				"The contents are written to stdout, but can be written to",
 				"a file instead with the -o flag.",
 				"",
 				"By default the table is shown in the table format.",
-				"For YAML use '-format=yaml' and for JSON use '-format=json'",
+				"For YAML use '--format=yaml' and for JSON use '--format=json'",
 				"",
-				"To only show specific columns use the '-columns' flag. The",
+				"To only show specific columns use the '--columns' flag. The",
 				"columns are as specified by 'TableHeader()' method.",
 				"This flag is only supported with 'table' formatting.",
+			},
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
+			},
+			AutocompleteFlag: func(state *script.State, args []string, flag, cur string) []string {
+				switch flag {
+				case "format":
+					return []string{"table", "yaml", "json"}
+				case "columns":
+					return autocompleteColumnNames(db, args, cur)
+				}
+				return nil
 			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
@@ -236,13 +341,21 @@ func CompareCmd(db *DB) script.Cmd {
 				"The comparison is retried until a timeout (1s default).",
 				"",
 				"The file should be formatted in the same style as",
-				"the output from 'db/show -format=table'. Indentation",
+				"the output from 'db/show --format=table'. Indentation",
 				"does not matter as long as header is aligned with the data.",
 				"",
 				"Not all columns need to be specified. Remove the columns",
 				"from the file you do not want compared.",
 				"",
-				"The rows can be filtered with the -grep flag.",
+				"The rows can be filtered with the --grep flag.",
+			},
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
 			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
@@ -268,6 +381,7 @@ func CompareCmd(db *DB) script.Cmd {
 			}
 
 			tableName := args[0]
+			fileName := args[1]
 
 			txn := db.ReadTxn()
 			meta := db.GetTable(txn, tableName)
@@ -277,16 +391,16 @@ func CompareCmd(db *DB) script.Cmd {
 			tbl := AnyTable{Meta: meta}
 			header := tbl.TableHeader()
 
-			data, err := os.ReadFile(s.Path(args[1]))
+			data, err := os.ReadFile(s.Path(fileName))
 			if err != nil {
-				return nil, fmt.Errorf("ReadFile(%s): %w", args[1], err)
+				return nil, fmt.Errorf("ReadFile(%s): %w", fileName, err)
 			}
-			lines := strings.Split(string(data), "\n")
+			lines := strings.Split(s.ExpandEnv(string(data), false), "\n")
 			lines = slices.DeleteFunc(lines, func(line string) bool {
 				return strings.TrimSpace(line) == ""
 			})
 			if len(lines) < 1 {
-				return nil, fmt.Errorf("%q missing header line, e.g. %q", args[1], strings.Join(header, " "))
+				return nil, fmt.Errorf("%q missing header line, e.g. %q", fileName, strings.Join(header, " "))
 			}
 
 			columnNames, columnPositions := splitHeaderLine(lines[0])
@@ -294,9 +408,11 @@ func CompareCmd(db *DB) script.Cmd {
 			if err != nil {
 				return nil, err
 			}
+			padByTabs := strings.ContainsRune(lines[0], '\t')
 			lines = lines[1:]
 			origLines := lines
 			timeoutChan := time.After(timeout)
+			var lastActual string
 
 			for {
 				lines = origLines
@@ -305,15 +421,19 @@ func CompareCmd(db *DB) script.Cmd {
 				equal := true
 				var diff bytes.Buffer
 				w := newTabWriter(&diff)
-				fmt.Fprintf(w, "  %s\n", joinByPositions(columnNames, columnPositions))
+				joined := joinByPositions(columnNames, columnPositions, false)
+				fmt.Fprintf(w, "  %s\n", joined)
+				var actual strings.Builder
+				fmt.Fprintf(&actual, "%s\n", joined)
 
 				objs, watch := tbl.AllWatch(db.ReadTxn())
 				for obj := range objs {
 					rowRaw := takeColumns(obj.(TableWritable).TableRow(), columnIndexes)
-					row := joinByPositions(rowRaw, columnPositions)
+					row := joinByPositions(rowRaw, columnPositions, padByTabs)
 					if grepRe != nil && !grepRe.Match([]byte(row)) {
 						continue
 					}
+					fmt.Fprintf(&actual, "%s\n", row)
 
 					if len(lines) == 0 {
 						equal = false
@@ -321,7 +441,7 @@ func CompareCmd(db *DB) script.Cmd {
 						continue
 					}
 					line := lines[0]
-					splitLine := splitByPositions(line, columnPositions)
+					splitLine := splitByPositions(line, columnPositions, padByTabs)
 
 					if slices.Equal(rowRaw, splitLine) {
 						fmt.Fprintf(w, "  %s\n", row)
@@ -336,6 +456,7 @@ func CompareCmd(db *DB) script.Cmd {
 					fmt.Fprintf(w, "+ %s\n", line)
 					equal = false
 				}
+				lastActual = actual.String()
 				if equal {
 					return nil, nil
 				}
@@ -346,11 +467,45 @@ func CompareCmd(db *DB) script.Cmd {
 					return nil, s.Context().Err()
 
 				case <-timeoutChan:
+					if s.DoUpdate {
+						s.FileUpdates[fileName] = lastActual
+						return nil, nil
+					}
 					return nil, fmt.Errorf("table mismatch:\n%s", diff.String())
 
 				case <-watch:
 				}
 			}
+		})
+}
+
+func EmptyCmd(db *DB) script.Cmd {
+	return script.Command(
+		script.CmdUsage{
+			Summary: "Assert that given table(s) are empty",
+			Args:    "table",
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
+			},
+		},
+		func(s *script.State, args ...string) (script.WaitFunc, error) {
+			txn := db.ReadTxn()
+			for _, tableName := range args {
+				meta := db.GetTable(txn, tableName)
+				if meta == nil {
+					return nil, fmt.Errorf("table %q not found", tableName)
+				}
+				tbl := AnyTable{Meta: meta}
+				if n := tbl.NumObjects(txn); n != 0 {
+					return nil, fmt.Errorf("table %q not empty, found %d obects", tableName, n)
+				}
+			}
+			return nil, nil
 		})
 }
 
@@ -362,6 +517,14 @@ func InsertCmd(db *DB) script.Cmd {
 			Detail: []string{
 				"Insert one or more objects into a table. The input files",
 				"are expected to be YAML.",
+			},
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
 			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
@@ -379,6 +542,14 @@ func DeleteCmd(db *DB) script.Cmd {
 				"Delete one or more objects from the table. The input files",
 				"are expected to be YAML and need to specify enough of the",
 				"object to construct the primary key",
+			},
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
 			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
@@ -414,8 +585,8 @@ func insertOrDelete(insert bool, db *DB, s *script.State, args ...string) (scrip
 		if err != nil {
 			return nil, fmt.Errorf("ReadFile(%s): %w", arg, err)
 		}
-		parts := strings.Split(string(data), "---")
-		for _, part := range parts {
+		parts := strings.SplitSeq(string(data), "---")
+		for part := range parts {
 			obj, err := tbl.UnmarshalYAML([]byte(part))
 			if err != nil {
 				return nil, fmt.Errorf("Unmarshal(%s): %w", arg, err)
@@ -498,6 +669,23 @@ func queryCmd(db *DB, query int, summary string, detail []string) script.Cmd {
 				fs.Bool("delete", false, "Delete all matching objects")
 			},
 			Detail: detail,
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
+			},
+			AutocompleteFlag: func(state *script.State, args []string, flag, cur string) []string {
+				switch flag {
+				case "format":
+					return []string{"table", "yaml", "json"}
+				case "columns":
+					return autocompleteColumnNames(db, args, cur)
+				}
+				return nil
+			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
 			return runQueryCmd(query, db, s, args)
@@ -605,6 +793,14 @@ func WatchCmd(db *DB) script.Cmd {
 				"Watch a table for changes. Streams each insert or delete",
 				"that happens to the table.",
 			},
+			AutocompleteArgs: func(_ *script.State, before []string, cur string) []string {
+				// Only complete table names
+				if len(before) > 0 {
+					return nil
+				}
+
+				return autocompleteTableName(db, before, cur)
+			},
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
 			if len(args) < 1 {
@@ -670,7 +866,7 @@ func firstOfSeq2[A, B any](it iter.Seq2[A, B]) iter.Seq2[A, B] {
 
 func writeObjects(tbl *AnyTable, it iter.Seq2[any, Revision], w io.Writer, columns []string, format string) error {
 	if len(columns) > 0 && format != "table" {
-		return fmt.Errorf("-columns not supported with non-table formats")
+		return fmt.Errorf("--columns not supported with non-table formats")
 	}
 	switch format {
 	case "yaml":
@@ -725,7 +921,7 @@ func writeObjects(tbl *AnyTable, it iter.Seq2[any, Revision], w io.Writer, colum
 		fmt.Fprintf(tw, "%s\n", strings.Join(header, "\t"))
 
 		for obj := range it {
-			row := takeColumns(obj.(TableWritable).TableRow(), idxs)
+			row := takeColumns(tbl.TableRow(obj), idxs)
 			fmt.Fprintf(tw, "%s\n", strings.Join(row, "\t"))
 		}
 		return tw.Flush()
@@ -793,19 +989,29 @@ func splitHeaderLine(line string) (names []string, pos []int) {
 // The whitespace on the right of the start position (e.g. "1  \t") is trimmed.
 // This of course requires that the table is properly formatted in a way that the
 // header columns are indented to fit the data exactly.
-func splitByPositions(line string, positions []int) []string {
+func splitByPositions(line string, positions []int, splitByTabs bool) []string {
 	out := make([]string, 0, len(positions))
 	start := 0
-	for _, pos := range positions[1:] {
+	for i, pos := range positions[1:] {
 		if start >= len(line) {
 			out = append(out, "")
 			start = len(line)
 			continue
 		}
-		out = append(out, strings.TrimRight(line[start:min(pos, len(line))], " \t"))
-		start = pos
+		if splitByTabs {
+			s := strings.Split(line[start:min(pos, len(line))], "\t")[i]
+			out = append(out, s)
+			start += len(s) + i
+		} else {
+			out = append(out, strings.TrimRight(line[start:min(pos, len(line))], " \t"))
+			start = pos
+		}
 	}
-	out = append(out, strings.TrimRight(line[min(start, len(line)):], " \t"))
+	if splitByTabs {
+		out = append(out, strings.Split(line[min(start, len(line)):], "\t")...)
+	} else {
+		out = append(out, strings.TrimRight(line[min(start, len(line)):], " \t"))
+	}
 	return out
 }
 
@@ -814,12 +1020,17 @@ func splitByPositions(line string, positions []int) []string {
 // e.g. [1,a,b] and positions [0,5,9] expands to "1    a   b".
 // NOTE: This does not deal well with mixing tabs and spaces. The test input
 // data should preferably just use spaces.
-func joinByPositions(row []string, positions []int) string {
+func joinByPositions(row []string, positions []int, padByTabs bool) string {
 	var w strings.Builder
 	prev := 0
 	for i, pos := range positions {
-		for pad := pos - prev; pad > 0; pad-- {
-			w.WriteByte(' ')
+		pad := pos - prev
+		if pad > 0 && padByTabs {
+			w.WriteByte('\t')
+		} else {
+			for ; pad > 0; pad-- {
+				w.WriteByte(' ')
+			}
 		}
 		w.WriteString(row[i])
 		prev = pos + len(row[i])

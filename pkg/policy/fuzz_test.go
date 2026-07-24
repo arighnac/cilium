@@ -4,53 +4,52 @@
 package policy
 
 import (
+	"log/slog"
 	"testing"
 
 	fuzz "github.com/AdaLogics/go-fuzz-headers"
 
-	"github.com/cilium/cilium/pkg/container/versioned"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
 	"github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
-func FuzzResolveEgressPolicy(f *testing.F) {
+func FuzzResolvePolicy(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ff := fuzz.NewConsumer(data)
-		label, err := ff.GetString()
-		if err != nil {
-			return
-		}
-		fromBar := &SearchContext{From: labels.ParseSelectLabelArray(label)}
 		r := api.Rule{}
-		err = ff.GenerateStruct(&r)
+		err := ff.GenerateStruct(&r)
 		if err != nil {
 			return
 		}
+		r.EndpointSelector = endpointSelectorA // force the endpoint selector to one that will select, so we definitely evaluate policy
 		err = r.Sanitize()
 		if err != nil {
 			return
 		}
-		rule := &rule{Rule: r}
-		state := traceState{}
-		td := newTestData()
-		_, _ = rule.resolveEgressPolicy(td.testPolicyContext, fromBar, &state, NewL4PolicyMap(), nil, nil)
 
+		logger := slog.New(slog.DiscardHandler)
+		td := newTestData(f, logger).withIDs(ruleTestIDs)
+		td.repo.mustAdd(r)
+		sp, err := td.repo.resolvePolicyLocked(idA)
+		if err != nil {
+			return
+		}
+		sp.DistillPolicy(logger, &endpointInfo{ID: uint64(idA.ID)}, nil)
 	})
 }
 
 func FuzzDenyPreferredInsert(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		keys := emptyMapState()
+		keys := emptyMapState(slog.New(slog.DiscardHandler))
 		key := Key{}
 		entry := NewMapStateEntry(types.AllowEntry())
 		ff := fuzz.NewConsumer(data)
 		ff.GenerateStruct(&key)
 		ff.GenerateStruct(&entry)
-		keys.insertWithChanges(key, entry, allFeatures, ChangeState{})
+		keys.insertWithChanges(types.MaxDenyPrecedence, key, entry, allFeatures, ChangeState{})
 	})
 }
 
@@ -84,9 +83,13 @@ func FuzzAccumulateMapChange(f *testing.F) {
 			proxyPort = 1
 		}
 		key := KeyForDirection(dir).WithPortProto(proto, port)
-		value := newMapStateEntry(singleRuleOrigin(EmptyStringLabels), proxyPort, 0, deny, NoAuthRequirement)
-		policyMaps := MapChanges{}
-		policyMaps.AccumulateMapChanges(adds, deletes, []Key{key}, value)
-		policyMaps.SyncMapChanges(versioned.LatestTx)
+		verdict := types.Allow
+		if deny {
+			verdict = types.Deny
+		}
+		value := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, 0, verdict, NoAuthRequirement)
+		policyMaps := MapChanges{logger: slog.New(slog.DiscardHandler)}
+		policyMaps.AccumulateMapChanges(0, 0, adds, deletes, key, value)
+		policyMaps.SyncMapChanges(types.MockSelectorSnapshot())
 	})
 }

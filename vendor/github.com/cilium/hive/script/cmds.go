@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +36,7 @@ func DefaultCmds() map[string]Cmd {
 		"cd":      Cd(),
 		"chmod":   Chmod(),
 		"cmp":     Cmp(),
+		"empty":   Empty(),
 		"cmpenv":  Cmpenv(),
 		"cp":      Cp(),
 		"echo":    Echo(),
@@ -91,6 +95,32 @@ func firstNonFlag(rawArgs ...string) []int {
 	return nil
 }
 
+func autocompleteFile(state *State, inPath string, dirOnly bool) []string {
+	entries, err := os.ReadDir(state.Path(inPath))
+	dir := inPath
+	file := ""
+	if err != nil {
+		dir, file = path.Split(state.Path(inPath))
+		entries, err = os.ReadDir(dir)
+		if err != nil {
+			return nil
+		}
+	}
+
+	var suggestions []string
+	for _, entry := range entries {
+		if dirOnly && !entry.IsDir() {
+			continue
+		}
+
+		if file == "" || strings.HasPrefix(entry.Name(), file) {
+			suggestions = append(suggestions, path.Join(dir, entry.Name()))
+		}
+	}
+
+	return suggestions
+}
+
 // Cat writes the concatenated contents of the named file(s) to the script's
 // stdout buffer.
 func Cat() Cmd {
@@ -98,6 +128,9 @@ func Cat() Cmd {
 		CmdUsage{
 			Summary: "concatenate files and print to the script's stdout buffer",
 			Args:    "files...",
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args) == 0 {
@@ -137,6 +170,14 @@ func Cd() Cmd {
 		CmdUsage{
 			Summary: "change the working directory",
 			Args:    "dir",
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) != 0 {
+					// Only autocomplete the first argument.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, true)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args) != 1 {
@@ -155,6 +196,14 @@ func Chmod() Cmd {
 			Detail: []string{
 				"Changes the permissions of the named files or directories to be equal to perm.",
 				"Only numerical permissions are supported.",
+			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) < 2 {
+					// Only autocomplete the paths, not the permission.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
 			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
@@ -195,6 +244,14 @@ func Cmp() Cmd {
 				"The command succeeds if the file contents are identical.",
 				"File1 can be 'stdout' or 'stderr' to compare the stdout or stderr buffer from the most recent command.",
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) > 2 {
+					// Only autocomplete the first two arguments.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			return nil, doCompare(s, false, args...)
@@ -214,6 +271,14 @@ func Cmpenv() Cmd {
 				"The command succeeds if the file contents are identical after substituting variables from the script environment.",
 				"File1 can be 'stdout' or 'stderr' to compare the script's stdout or stderr buffer.",
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) > 2 {
+					// Only autocomplete the first two arguments.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			return nil, doCompare(s, true, args...)
@@ -231,17 +296,10 @@ func doCompare(s *State, env bool, args ...string) error {
 
 	name1, name2 := args[0], args[1]
 	var text1, text2 string
-	switch name1 {
-	case "stdout":
-		text1 = s.Stdout()
-	case "stderr":
-		text1 = s.Stderr()
-	default:
-		data, err := os.ReadFile(s.Path(name1))
-		if err != nil {
-			return err
-		}
-		text1 = string(data)
+
+	text1, err = getActualFileData(s, name1)
+	if err != nil {
+		return err
 	}
 
 	data, err := os.ReadFile(s.Path(name2))
@@ -257,11 +315,20 @@ func doCompare(s *State, env bool, args ...string) error {
 
 	if text1 != text2 {
 		if s.DoUpdate {
-			// Updates requested, store the file contents and
-			// ignore mismatches.
-			s.FileUpdates[name1] = text2
-			s.FileUpdates[name2] = text1
-			return nil
+			switch {
+			case len(text1) == 0 || len(text2) == 0:
+				s.Logf("cmp: refusing to update empty files, use 'empty' command instead")
+			case !s.retriesRequested:
+				// Not retrying, just take the contents right away
+				fallthrough
+			case s.retriesRequested && s.RetryCount >= 2:
+				// Updates requested and we've already retried at least twice
+				// (and given time for things to settle down).
+				// Store the file contents and ignore the mismatch.
+				s.FileUpdates[name1] = text2
+				s.FileUpdates[name2] = text1
+				return nil
+			}
 		}
 
 		if !quiet {
@@ -281,6 +348,16 @@ func Cp() Cmd {
 			Args:    "src... dst",
 			Detail: []string{
 				"src can include 'stdout' or 'stderr' to copy from the script's stdout or stderr buffer.",
+			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				fileSuggestions := autocompleteFile(state, cur, false)
+				if strings.HasPrefix("stdout", cur) || cur == "" {
+					fileSuggestions = append([]string{"stdout"}, fileSuggestions...)
+				}
+				if strings.HasPrefix("stderr", cur) || cur == "" {
+					fileSuggestions = append([]string{"stderr"}, fileSuggestions...)
+				}
+				return fileSuggestions
 			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
@@ -372,17 +449,42 @@ func Echo() Cmd {
 // With no arguments, Env reports all variables in the environment.
 // "key=value" arguments set variables, and arguments without "="
 // cause the corresponding value to be printed to the stdout buffer.
+//
+// Passing --from-stdout will set the "key" to the stdout of the previous
+// command as the "value".
 func Env() Cmd {
 	return Command(
 		CmdUsage{
 			Summary: "set or log the values of environment variables",
-			Args:    "[key[=value]...]",
+			Flags: func(fs *pflag.FlagSet) {
+				fs.Bool("from-stdout", false, "Whether to set the value of the variable from stdout")
+			},
+			Args: "[key[=value]...]",
 			Detail: []string{
 				"With no arguments, print the script environment to the log.",
 				"Otherwise, add the listed key=value pairs to the environment or print the listed keys.",
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if cur == "" {
+					return slices.Sorted(maps.Keys(state.envMap))
+				}
+
+				suggestions := make([]string, 0, len(state.envMap))
+				for envKey := range state.envMap {
+					if strings.HasPrefix(envKey, cur) {
+						suggestions = append(suggestions, envKey)
+					}
+				}
+				slices.Sort(suggestions)
+				return suggestions
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
+			fromStdout, err := s.Flags.GetBool("from-stdout")
+			if err != nil {
+				return nil, err
+			}
+
 			out := new(strings.Builder)
 			if len(args) == 0 {
 				for _, kv := range s.env {
@@ -390,14 +492,20 @@ func Env() Cmd {
 				}
 			} else {
 				for _, env := range args {
-					i := strings.Index(env, "=")
-					if i < 0 {
-						// Display value instead of setting it.
-						fmt.Fprintf(out, "%s=%s\n", env, s.envMap[env])
-						continue
-					}
-					if err := s.Setenv(env[:i], env[i+1:]); err != nil {
-						return nil, err
+					if fromStdout {
+						if err := s.Setenv(env, strings.Trim(s.Stdout(), "\n ")); err != nil {
+							return nil, err
+						}
+					} else {
+						i := strings.Index(env, "=")
+						if i < 0 {
+							// Display value instead of setting it.
+							fmt.Fprintf(out, "%s=%s\n", env, s.envMap[env])
+							continue
+						}
+						if err := s.Setenv(env[:i], env[i+1:]); err != nil {
+							return nil, err
+						}
 					}
 				}
 			}
@@ -425,6 +533,79 @@ func Exec(cancel func(*exec.Cmd) error, waitDelay time.Duration) Cmd {
 				"Note that 'exec' does not terminate the script (unlike Unix shells).",
 			},
 			Async: true,
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				// TODO(dylandreimerink): Make multi-platform, currently UNIX only.
+
+				// Only autocomplete the first argument.
+				if len(before) != 0 {
+					return nil
+				}
+
+				// If the current argument is a path, autocomplete it.
+				if strings.Contains(cur, string(filepath.Separator)) {
+					entries, err := os.ReadDir(state.Path(cur))
+					dir := cur
+					file := ""
+					if err != nil {
+						dir, file = path.Split(state.Path(cur))
+						entries, err = os.ReadDir(dir)
+						if err != nil {
+							return nil
+						}
+					}
+
+					var suggestions []string
+					for _, entry := range entries {
+						// If the entry is a directory, add it if it matches the prefix.
+						if entry.IsDir() {
+							if file == "" || strings.HasPrefix(entry.Name(), file) {
+								suggestions = append(suggestions, path.Join(dir, entry.Name()))
+							}
+							continue
+						}
+
+						// If the entry is a file, check if it is executable.
+						if !dirEntryIsExec(entry) {
+							continue
+						}
+
+						// If the entry is executable, add it if it matches the prefix.
+						if file == "" || strings.HasPrefix(entry.Name(), file) {
+							suggestions = append(suggestions, path.Join(dir, entry.Name()))
+						}
+					}
+
+					return suggestions
+				}
+
+				// Otherwise, look for executables in the script's PATH.
+				var suggestions []string
+				for _, dir := range strings.Split(state.envMap["PATH"], ":") {
+					entries, err := os.ReadDir(dir)
+					if err != nil {
+						continue
+					}
+
+					for _, entry := range entries {
+						// If the entry is a directory, skip it.
+						if entry.IsDir() {
+							continue
+						}
+
+						// If the entry is a file, check if it is executable.
+						if !dirEntryIsExec(entry) {
+							continue
+						}
+
+						// If the entry is executable, add it if it matches the prefix.
+						if strings.HasPrefix(entry.Name(), cur) {
+							suggestions = append(suggestions, entry.Name())
+						}
+					}
+				}
+
+				return suggestions
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args) < 1 {
@@ -588,6 +769,14 @@ func Exists() Cmd {
 				fs.Bool("readonly", false, "File must not be writable")
 				fs.Bool("exec", false, "File must not be executable")
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) == 0 {
+					// Only autocomplete the first argument.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			readonly, err := s.Flags.GetBool("readonly")
@@ -637,6 +826,15 @@ func Grep() Cmd {
 				"The -q flag suppresses printing of matches.",
 			},
 			RegexpArgs: firstNonFlag,
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) != 1 {
+					// Only autocomplete the second argument.
+					return nil
+				}
+
+				// Autocomplete the file argument.
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			return nil, match(s, args, "", "grep")
@@ -730,11 +928,30 @@ func Help() Cmd {
 			}
 
 			verbose := false
+			remoteAutocomplete := false
 			if len(args) > 0 {
 				verbose = true
 				if args[0] == "-v" {
 					args = args[1:]
 				}
+				if args[0] == "-a" {
+					remoteAutocomplete = true
+					args = args[1:]
+				}
+			}
+
+			if remoteAutocomplete {
+				out := new(strings.Builder)
+				for cmd := range maps.Keys(s.engine.Cmds) {
+					if len(args) > 0 && !strings.HasPrefix(cmd, args[0]) {
+						continue
+					}
+					fmt.Fprintln(out, cmd)
+				}
+				wait := func(*State) (stdout, stderr string, err error) {
+					return out.String(), "", nil
+				}
+				return wait, nil
 			}
 
 			var cmds, conds []string
@@ -778,6 +995,10 @@ func Mkdir() Cmd {
 			Detail: []string{
 				"Unlike Unix mkdir, parent directories are always created if needed.",
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				// Autocomplete the directory argument.
+				return autocompleteFile(state, cur, true)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args) < 1 {
@@ -800,6 +1021,14 @@ func Mv() Cmd {
 			Args:    "old new",
 			Detail: []string{
 				"OS-specific restrictions may apply when old and new are in different directories.",
+			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) >= 2 {
+					// Only autocomplete the first two arguments.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
 			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
@@ -855,6 +1084,15 @@ func Replace() Cmd {
 			Detail: []string{
 				"The 'old' and 'new' arguments are unquoted as if in quoted Go strings.",
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				// Only autocomplete possible file arguments.
+				if len(before) < 2 || len(before)%2 != 0 {
+					return nil
+				}
+
+				// Autocomplete the file argument.
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args)%2 != 1 {
@@ -897,6 +1135,14 @@ func Sed() Cmd {
 				"https://pkg.go.dev/regexp#Regexp.ReplaceAll",
 			},
 			RegexpArgs: firstNonFlag,
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				// Only autocomplete the file argument.
+				if len(before) != 2 {
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args) != 3 {
@@ -933,6 +1179,10 @@ func Rm() Cmd {
 			Args:    "path...",
 			Detail: []string{
 				"If the path is a directory, its contents are removed recursively.",
+			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				// Autocomplete the file argument.
+				return autocompleteFile(state, cur, false)
 			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
@@ -1085,6 +1335,17 @@ func Symlink() Cmd {
 				"Creates path as a symlink to target.",
 				"The '->' token (like in 'ls -l' output on Unix) is required.",
 			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				if len(before) == 1 {
+					return []string{"->"}
+				}
+				if len(before) > 2 {
+					// Only autocomplete the first three arguments.
+					return nil
+				}
+
+				return autocompleteFile(state, cur, false)
+			},
 		},
 		func(s *State, args ...string) (WaitFunc, error) {
 			if len(args) != 3 || args[1] != "->" {
@@ -1190,29 +1451,144 @@ func Break() Cmd {
 			}
 			defer tty.Close()
 
+			// Flush any pending logs before switching to raw mode.
+			s.FlushLog()
+
+			// Hack: sleep a little bit to allow the log to be written out to stdout
+			// before we switch to raw mode (which might mess up the output)
+			time.Sleep(50 * time.Millisecond)
+
 			prev, err := term.MakeRaw(int(tty.Fd()))
 			if err != nil {
 				return nil, fmt.Errorf("cannot set /dev/tty to raw mode")
 			}
 			defer term.Restore(int(tty.Fd()), prev)
 
-			// Flush any pending logs
+			// Switch the log output to the terminal until we continue
+			terminal := term.NewTerminal(tty, "debug> ")
+			if width, height, err := term.GetSize(int(tty.Fd())); err == nil {
+				terminal.SetSize(width, height)
+			}
+			origLogOut := s.logOut
+			defer func() {
+				s.logOut = origLogOut
+
+			}()
+			s.logOut = terminal
+
+			fmt.Fprintf(terminal, "\nBreak! Control-d to continue.\n")
+
 			engine := s.engine
-
-			term := term.NewTerminal(tty, "debug> ")
-			s.FlushLog()
-			fmt.Fprintf(term, "\nBreak! Control-d to continue.\n")
-
 			for {
-				line, err := term.ReadLine()
+				terminal.AutoCompleteCallback = engine.Autocomplete(terminal, s)
+
+				line, err := terminal.ReadLine()
 				if err != nil {
 					return nil, nil
 				}
-				err = engine.ExecuteLine(s, line, term)
+				err = engine.ExecuteLine(s, line, terminal)
 				if err != nil {
-					fmt.Fprintln(term, err.Error())
+					fmt.Fprintln(terminal, err.Error())
 				}
 			}
 		},
 	)
+}
+
+func emptyFlags(fs *pflag.FlagSet) {
+	fs.BoolP("quiet", "q", false, "Suppress printing of non-empty output diff")
+	fs.BoolP("trim", "t", false, "Trim newline chars")
+}
+
+// Empty checks whether contents of a file, or contents of either "stdout" or "stderr"
+// are empty.
+// Returns non-nil error if this assertion fails.
+func Empty() Cmd {
+	return Command(
+		CmdUsage{
+			Args:    "file",
+			Summary: "check if file is empty",
+			Flags:   emptyFlags,
+			Detail: []string{
+				"The command succeeds if the file is empty.",
+				"File can be 'stdout' or 'stderr' to compare the stdout or stderr buffer from the most recent command.",
+			},
+			AutocompleteArgs: func(state *State, before []string, cur string) []string {
+				// Autocomplete the file argument.
+				if len(before) != 0 {
+					return nil
+				}
+
+				suggestions := autocompleteFile(state, cur, false)
+				for _, stdfile := range []string{"stdout", "stderr"} {
+					if cur == "" || strings.HasPrefix(stdfile, cur) {
+						suggestions = append(suggestions, stdfile)
+					}
+				}
+
+				return suggestions
+			},
+		},
+		func(s *State, args ...string) (WaitFunc, error) {
+			return nil, doEmpty(s, args...)
+		})
+}
+
+func doEmpty(s *State, args ...string) error {
+	quiet, err := s.Flags.GetBool("quiet")
+	if err != nil {
+		return err
+	}
+	trim, err := s.Flags.GetBool("trim")
+	if err != nil {
+		return err
+	}
+	if len(args) != 1 {
+		return ErrUsage
+	}
+
+	name := args[0]
+	text, err := getActualFileData(s, name)
+
+	if trim {
+		text = strings.Trim(text, "\n")
+	}
+
+	if text != "" {
+		if !quiet {
+			diffText := diff.Diff(name, []byte(text), "<empty>", []byte{})
+			s.Logf("%s\n", diffText)
+		}
+		return fmt.Errorf("%s is not empty", name)
+	}
+	return nil
+}
+
+// getActualFileData is used to read "actual" test data (i.e. such as files
+// created by test script or test stdout.
+func getActualFileData(s *State, name string) (string, error) {
+	var text string
+	switch name {
+	case "stdout":
+		text = s.Stdout()
+	case "stderr":
+		text = s.Stderr()
+	default:
+		data, err := os.ReadFile(s.Path(name))
+		if err != nil {
+			return "", err
+		}
+		text = string(data)
+	}
+	return text, nil
+}
+
+func dirEntryIsExec(entry os.DirEntry) bool {
+	// If the entry is a file, check if it is executable.
+	const execAny = 0111
+	info, err := entry.Info()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&execAny != 0
 }

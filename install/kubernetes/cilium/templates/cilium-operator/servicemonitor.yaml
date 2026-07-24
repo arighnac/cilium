@@ -7,6 +7,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: cilium
     app.kubernetes.io/name: cilium-operator
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -33,6 +34,9 @@ spec:
   endpoints:
   - port: metrics
     interval: {{ .Values.operator.prometheus.serviceMonitor.interval | quote }}
+    {{- if .Values.operator.prometheus.serviceMonitor.scrapeTimeout }}
+    scrapeTimeout: {{ .Values.operator.prometheus.serviceMonitor.scrapeTimeout | quote }}
+    {{- end }}
     honorLabels: true
     path: /metrics
     {{- with .Values.operator.prometheus.serviceMonitor.relabelings }}

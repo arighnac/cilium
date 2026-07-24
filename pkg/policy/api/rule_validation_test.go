@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cilium/proxy/pkg/policy/api/kafka"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -21,8 +20,6 @@ import (
 // are invalid if any protocol except TCP is used as a protocol for any port
 // in the list of PortProtocol supplied to the rule.
 func TestL7RulesWithNonTCPProtocols(t *testing.T) {
-	setUpSuite(t)
-
 	// Rule is valid because only ProtoTCP is allowed for L7 rules (except with ToFQDNs, below).
 	validPortRule := Rule{
 		EndpointSelector: WildcardEndpointSelector,
@@ -277,7 +274,7 @@ func TestL7RulesWithNonTCPProtocols(t *testing.T) {
 					Ports: []PortProtocol{
 						{Port: "443", Protocol: ProtoTCP},
 					},
-					ServerNames: []string{"foo.bar.com", "bar.foo.com"},
+					ServerNames: []ServerName{"foo.bar.com", "bar.foo.com"},
 				}},
 			},
 		},
@@ -297,7 +294,7 @@ func TestL7RulesWithNonTCPProtocols(t *testing.T) {
 					Ports: []PortProtocol{
 						{Port: "443", Protocol: ProtoTCP},
 					},
-					ServerNames: []string{""},
+					ServerNames: []ServerName{""},
 				}},
 			},
 		},
@@ -317,7 +314,7 @@ func TestL7RulesWithNonTCPProtocols(t *testing.T) {
 					Ports: []PortProtocol{
 						{Port: "443", Protocol: ProtoTCP},
 					},
-					ServerNames: []string{"foo.bar.com", "bar.foo.com"},
+					ServerNames: []ServerName{"foo.bar.com", "bar.foo.com"},
 					Rules: &L7Rules{
 						HTTP: []PortRuleHTTP{
 							{Method: "GET", Path: "/"},
@@ -348,7 +345,7 @@ func TestL7RulesWithNonTCPProtocols(t *testing.T) {
 							Name: "test-secret",
 						},
 					},
-					ServerNames: []string{"foo.bar.com", "bar.foo.com"},
+					ServerNames: []ServerName{"foo.bar.com", "bar.foo.com"},
 					Rules: &L7Rules{
 						HTTP: []PortRuleHTTP{
 							{Method: "GET", Path: "/"},
@@ -498,8 +495,6 @@ func TestL7RulesWithNonTCPProtocols(t *testing.T) {
 
 // This test ensures that L7 rules reject unspecified ports.
 func TestL7RuleRejectsEmptyPort(t *testing.T) {
-	setUpSuite(t)
-
 	invalidL7PortRule := Rule{
 		EndpointSelector: WildcardEndpointSelector,
 		Ingress: []IngressRule{
@@ -528,8 +523,6 @@ func TestL7RuleRejectsEmptyPort(t *testing.T) {
 // This test ensures that PortRules using the HTTP protocol have valid regular
 // expressions for the method and path fields.
 func TestHTTPRuleRegexes(t *testing.T) {
-	setUpSuite(t)
-
 	invalidHTTPRegexPathRule := Rule{
 		EndpointSelector: WildcardEndpointSelector,
 		Ingress: []IngressRule{
@@ -583,8 +576,8 @@ func TestHTTPRuleRegexes(t *testing.T) {
 
 // Test the validation of CIDR rule prefix definitions
 func TestCIDRsanitize(t *testing.T) {
-	setUpSuite(t)
-	sel := &slim_metav1.LabelSelector{MatchLabels: map[string]string{"foo": "bar"}}
+	sel := EndpointSelector{LabelSelector: &slim_metav1.LabelSelector{MatchLabels: map[string]string{"foo": "bar"}}}
+	expectedSel := NewESFromK8sLabelSelector(labels.LabelSourceCIDRGroupKeyPrefix, sel.LabelSelector)
 
 	cidr := CIDRRule{}
 	err := cidr.sanitize()
@@ -619,6 +612,7 @@ func TestCIDRsanitize(t *testing.T) {
 	cidr = CIDRRule{Cidr: "", CIDRGroupSelector: sel}
 	err = cidr.sanitize()
 	require.NoError(t, err)
+	require.Equal(t, expectedSel, cidr.CIDRGroupSelector)
 
 	cidr = CIDRRule{Cidr: "", CIDRGroupRef: "foo", CIDRGroupSelector: sel}
 	err = cidr.sanitize()
@@ -632,11 +626,33 @@ func TestCIDRsanitize(t *testing.T) {
 	cidr = CIDRRule{Cidr: "10.0.0.0/254.0.0.255"}
 	err = cidr.sanitize()
 	require.Error(t, err)
+
+	// Valid ExceptCIDRs
+	cidr = CIDRRule{
+		Cidr:        "10.0.0.0/24",
+		ExceptCIDRs: []CIDR{"10.0.0.1/32", "10.0.0.128/25"},
+	}
+	err = cidr.sanitize()
+	require.NoError(t, err)
+
+	// Invalid ExceptCIDRs: Broader than main CIDR
+	cidr = CIDRRule{
+		Cidr:        "10.0.0.0/24",
+		ExceptCIDRs: []CIDR{"10.0.0.0/16"},
+	}
+	err = cidr.sanitize()
+	require.Error(t, err)
+
+	// Invalid ExceptCIDRs: Outside main CIDR
+	cidr = CIDRRule{
+		Cidr:        "10.0.0.0/24",
+		ExceptCIDRs: []CIDR{"10.1.0.0/24"},
+	}
+	err = cidr.sanitize()
+	require.Error(t, err)
 }
 
 func TestToServicesSanitize(t *testing.T) {
-	setUpSuite(t)
-
 	svcLabels := map[string]string{
 		"app": "tested-service",
 	}
@@ -695,90 +711,6 @@ func TestToServicesSanitize(t *testing.T) {
 	require.NoError(t, toServicesDenyL3L4.Sanitize())
 }
 
-// This test ensures that PortRules using key-value pairs do not have empty keys
-func TestL7Rules(t *testing.T) {
-	setUpSuite(t)
-
-	validL7Rule := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Ingress: []IngressRule{
-			{
-				IngressCommonRule: IngressCommonRule{
-					FromEndpoints: []EndpointSelector{WildcardEndpointSelector},
-				},
-				ToPorts: []PortRule{{
-					Ports: []PortProtocol{
-						{Port: "80", Protocol: ProtoTCP},
-						{Port: "81", Protocol: ProtoTCP},
-					},
-					Rules: &L7Rules{
-						L7Proto: "test.lineparser",
-						L7: []PortRuleL7{
-							{"method": "PUT", "path": "/"},
-							{"method": "GET", "path": "/"},
-						},
-					},
-				}},
-			},
-		},
-	}
-
-	err := validL7Rule.Sanitize()
-	require.NoError(t, err)
-
-	validL7Rule2 := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Ingress: []IngressRule{
-			{
-				IngressCommonRule: IngressCommonRule{
-					FromEndpoints: []EndpointSelector{WildcardEndpointSelector},
-				},
-				ToPorts: []PortRule{{
-					Ports: []PortProtocol{
-						{Port: "80", Protocol: ProtoTCP},
-						{Port: "81", Protocol: ProtoTCP},
-					},
-					Rules: &L7Rules{
-						L7Proto: "test.lineparser",
-						// No L7 rules
-					},
-				}},
-			},
-		},
-	}
-
-	err = validL7Rule2.Sanitize()
-	require.NoError(t, err)
-
-	invalidL7Rule := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Ingress: []IngressRule{
-			{
-				IngressCommonRule: IngressCommonRule{
-					FromEndpoints: []EndpointSelector{WildcardEndpointSelector},
-				},
-				ToPorts: []PortRule{{
-					Ports: []PortProtocol{
-						{Port: "80", Protocol: ProtoTCP},
-						{Port: "81", Protocol: ProtoTCP},
-					},
-					Rules: &L7Rules{
-						L7Proto: "test.lineparser",
-						L7: []PortRuleL7{
-							map[string]string{
-								"method": "PUT",
-								"":       "Foo"},
-						},
-					},
-				}},
-			},
-		},
-	}
-
-	err = invalidL7Rule.Sanitize()
-	require.Error(t, err)
-}
-
 // This test ensures that DNS rules do not accept port ranges
 func TestPortRangesNotAllowedWithDNSRules(t *testing.T) {
 	// Rule is invalid because DNS rules do not support port ranges.
@@ -809,8 +741,6 @@ func TestPortRangesNotAllowedWithDNSRules(t *testing.T) {
 
 // This test ensures that host policies with L7 rules (except for DNS egress) are rejected.
 func TestL7RulesWithNodeSelector(t *testing.T) {
-	setUpSuite(t)
-
 	toPortsHTTP := []PortRule{{
 		Ports: []PortProtocol{
 			{Port: "80", Protocol: ProtoTCP},
@@ -902,8 +832,6 @@ func TestL7RulesWithNodeSelector(t *testing.T) {
 }
 
 func TestInvalidEndpointSelectors(t *testing.T) {
-	setUpSuite(t)
-
 	// Operator in MatchExpressions is invalid, so sanitization should fail.
 	labelSel := &slim_metav1.LabelSelector{
 		MatchLabels: map[string]string{
@@ -956,34 +884,6 @@ func TestInvalidEndpointSelectors(t *testing.T) {
 	err = invalidEpSelectorIngressDeny.Sanitize()
 	require.Error(t, err)
 
-	invalidEpSelectorIngressFromReq := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Ingress: []IngressRule{
-			{
-				IngressCommonRule: IngressCommonRule{
-					FromRequires: []EndpointSelector{invalidSel},
-				},
-			},
-		},
-	}
-
-	err = invalidEpSelectorIngressFromReq.Sanitize()
-	require.Error(t, err)
-
-	invalidEpSelectorIngressDenyFromReq := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		IngressDeny: []IngressDenyRule{
-			{
-				IngressCommonRule: IngressCommonRule{
-					FromRequires: []EndpointSelector{invalidSel},
-				},
-			},
-		},
-	}
-
-	err = invalidEpSelectorIngressDenyFromReq.Sanitize()
-	require.Error(t, err)
-
 	invalidEpSelectorEgress := Rule{
 		EndpointSelector: WildcardEndpointSelector,
 		Egress: []EgressRule{
@@ -1011,39 +911,9 @@ func TestInvalidEndpointSelectors(t *testing.T) {
 
 	err = invalidEpSelectorEgressDeny.Sanitize()
 	require.Error(t, err)
-
-	invalidEpSelectorEgressToReq := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Egress: []EgressRule{
-			{
-				EgressCommonRule: EgressCommonRule{
-					ToRequires: []EndpointSelector{invalidSel},
-				},
-			},
-		},
-	}
-
-	err = invalidEpSelectorEgressToReq.Sanitize()
-	require.Error(t, err)
-
-	invalidEpSelectorEgressDenyToReq := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		EgressDeny: []EgressDenyRule{
-			{
-				EgressCommonRule: EgressCommonRule{
-					ToRequires: []EndpointSelector{invalidSel},
-				},
-			},
-		},
-	}
-
-	err = invalidEpSelectorEgressDenyToReq.Sanitize()
-	require.Error(t, err)
 }
 
-func TestNodeSelector(t *testing.T) {
-	setUpSuite(t)
-
+func TestPrivilegedNodeSelector(t *testing.T) {
 	// Operator in MatchExpressions is invalid, so sanitization should fail.
 	labelSel := &slim_metav1.LabelSelector{
 		MatchLabels: map[string]string{
@@ -1082,8 +952,6 @@ func TestNodeSelector(t *testing.T) {
 }
 
 func TestTooManyPortsRule(t *testing.T) {
-	setUpSuite(t)
-
 	var portProtocols []PortProtocol
 
 	for i := 80; i <= 80+maxPorts; i++ {
@@ -1126,9 +994,51 @@ func TestTooManyPortsRule(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestTooManyICMPFields(t *testing.T) {
-	setUpSuite(t)
+func TestInvalidIPProtocolRules(t *testing.T) {
+	nonZeroPortRule1 := Rule{
+		EndpointSelector: WildcardEndpointSelector,
+		Ingress: []IngressRule{
+			{
+				ToPorts: []PortRule{
+					{
+						Ports: []PortProtocol{
+							{
+								Port:     "1",
+								Protocol: ProtoVRRP,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
 
+	err := nonZeroPortRule1.Sanitize()
+	require.Error(t, err)
+
+	nonZeroPortRule2 := Rule{
+		EndpointSelector: WildcardEndpointSelector,
+		Egress: []EgressRule{
+			{
+				ToPorts: []PortRule{
+					{
+						Ports: []PortProtocol{
+							{
+								Port:     "1",
+								Protocol: ProtoIGMP,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err = nonZeroPortRule2.Sanitize()
+	require.Error(t, err)
+}
+
+func TestTooManyICMPFields(t *testing.T) {
 	var fields []ICMPField
 
 	for i := 1; i <= 1+maxICMPFields; i++ {
@@ -1172,8 +1082,6 @@ func TestTooManyICMPFields(t *testing.T) {
 }
 
 func TestWrongICMPFieldFamily(t *testing.T) {
-	setUpSuite(t)
-
 	icmpType := intstr.FromInt(0)
 	wrongFamilyICMPRule := Rule{
 		EndpointSelector: WildcardEndpointSelector,
@@ -1215,8 +1123,6 @@ func TestWrongICMPFieldFamily(t *testing.T) {
 }
 
 func TestICMPRuleWithOtherRuleFailed(t *testing.T) {
-	setUpSuite(t)
-
 	icmpType := intstr.FromInt(8)
 
 	ingressICMPWithPort := Rule{
@@ -1314,68 +1220,13 @@ func TestICMPRuleWithOtherRuleFailed(t *testing.T) {
 	require.ErrorIs(t, err, errUnsupportedICMPWithToPorts)
 }
 
-// This test ensures that PortRules aren't configured in the wrong direction,
-// which ends up being a no-op with only vague error messages rather than a
-// clear indication that something is wrong in the policy.
-func TestL7RuleDirectionalitySupport(t *testing.T) {
-	setUpSuite(t)
-
-	// Kafka egress is now supported.
-	egressKafkaRule := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Egress: []EgressRule{
-			{
-				ToPorts: []PortRule{{
-					Ports: []PortProtocol{
-						{Port: "80", Protocol: ProtoTCP},
-						{Port: "81", Protocol: ProtoTCP},
-					},
-					Rules: &L7Rules{
-						Kafka: []kafka.PortRule{{
-							Role:  "consume",
-							Topic: "deathstar-plans",
-						}},
-					},
-				}},
-			},
-		},
-	}
-
-	err := egressKafkaRule.Sanitize()
-	require.NoError(t, err)
-
-	// DNS ingress is not supported.
-	invalidDNSRule := Rule{
-		EndpointSelector: WildcardEndpointSelector,
-		Ingress: []IngressRule{
-			{
-				ToPorts: []PortRule{{
-					Ports: []PortProtocol{
-						{Port: "53", Protocol: ProtoTCP},
-						{Port: "53", Protocol: ProtoUDP},
-					},
-					Rules: &L7Rules{
-						DNS: []PortRuleDNS{{
-							MatchName: "empire.gov",
-						}},
-					},
-				}},
-			},
-		},
-	}
-
-	err = invalidDNSRule.Sanitize()
-	require.Error(t, err)
-
-}
-
 func BenchmarkCIDRSanitize(b *testing.B) {
 	cidr4 := CIDRRule{Cidr: "192.168.100.200/24"}
 	cidr6 := CIDRRule{Cidr: "2001:0db8:85a3:0000:0000:8a2e:0370:7334/128"}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		err := cidr4.sanitize()
 		if err != nil {
 			b.Fatal(err)

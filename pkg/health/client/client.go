@@ -18,6 +18,7 @@ import (
 	"github.com/go-openapi/strfmt"
 
 	clientapi "github.com/cilium/cilium/api/v1/health/client"
+	"github.com/cilium/cilium/api/v1/health/client/connectivity"
 	"github.com/cilium/cilium/api/v1/health/models"
 	"github.com/cilium/cilium/pkg/health/defaults"
 )
@@ -164,23 +165,6 @@ func GetPathConnectivityStatusType(cp *models.PathStatus) ConnectivityStatusType
 	return status
 }
 
-func SummarizePathConnectivityStatus(cps []*models.PathStatus) ConnectivityStatusType {
-	status := ConnStatusReachable
-	for _, cp := range cps {
-		switch GetPathConnectivityStatusType(cp) {
-		case ConnStatusUnreachable:
-			// If any status is unreachable, return it immediately.
-			return ConnStatusUnreachable
-		case ConnStatusUnknown:
-			// If the status is unknown, prepare to return it. It's
-			// going to be returned if there is no unreachable
-			// status in next iterations.
-			status = ConnStatusUnknown
-		}
-	}
-	return status
-}
-
 // Returns a map of ConnectivityStatusType --> # of paths with ConnectivityStatusType
 func SummarizePathConnectivityStatusType(cps []*models.PathStatus) map[ConnectivityStatusType]int {
 	status := make(map[ConnectivityStatusType]int)
@@ -193,12 +177,13 @@ func SummarizePathConnectivityStatusType(cps []*models.PathStatus) map[Connectiv
 
 func formatConnectivityStatus(w io.Writer, cs *models.ConnectivityStatus, path, indent string) {
 	status := cs.Status
+	lastProbed := cs.LastProbed
 	switch GetConnectivityStatusType(cs) {
 	case ConnStatusReachable:
 		latency := time.Duration(cs.Latency)
 		status = fmt.Sprintf("OK, RTT=%s", latency)
 	}
-	fmt.Fprintf(w, "%s%s:\t%s\n", indent, path, status)
+	fmt.Fprintf(w, "%s%s:\t%s\t(Last probed: %s)\n", indent, path, status, lastProbed)
 }
 
 func formatPathStatus(w io.Writer, name string, cp *models.PathStatus, indent string, verbose bool) {
@@ -412,8 +397,8 @@ func FormatHealthStatusResponse(w io.Writer, sr *models.HealthStatusResponse, al
 		}
 	}
 
-	fmt.Fprintf(w, "Cluster health:\t%d/%d reachable\t(%s)\n",
-		healthy, len(sr.Nodes), sr.Timestamp)
+	fmt.Fprintf(w, "Cluster health:\t%d/%d reachable\t(%s)\t(Probe interval: %s)\n",
+		healthy, len(sr.Nodes), sr.Timestamp, sr.ProbeInterval)
 
 	fmt.Fprintf(w, "Name\tIP\tNode\tEndpoints\n")
 
@@ -455,7 +440,7 @@ func GetAndFormatHealthStatus(w io.Writer, allNodes bool, verbose bool, maxLines
 		fmt.Fprintf(w, "Cluster health:\t\t\tClient error: %s\n", err)
 		return
 	}
-	hr, err := client.Connectivity.GetStatus(nil)
+	hr, err := client.Connectivity.GetStatus(connectivity.NewGetStatusParams())
 	if err != nil {
 		// The regular `cilium status` output will print the reason why.
 		fmt.Fprintf(w, "Cluster health:\t\t\tWarning\tcilium-health daemon unreachable\n")

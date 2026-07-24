@@ -6,18 +6,16 @@ package store
 import (
 	"context"
 	"fmt"
-	"path"
+	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -29,8 +27,6 @@ const (
 
 var (
 	controllers controller.Manager
-
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "shared-store")
 
 	kvstoreSyncControllerGroup = controller.NewGroup("kvstore-sync")
 )
@@ -50,7 +46,8 @@ type Configuration struct {
 	Prefix string
 
 	// SynchronizationInterval is the interval in which locally owned keys
-	// are synchronized with the kvstore. This parameter is optional.
+	// are synchronized with the kvstore. Defaults to 0 (i.e., no periodic
+	// synchronization is performed) if unset.
 	SynchronizationInterval time.Duration
 
 	// SharedKeyDeleteDelay is the delay before a shared key delete is
@@ -61,8 +58,7 @@ type Configuration struct {
 	// key is discovered. This parameter is required.
 	KeyCreator KeyCreator
 
-	// Backend is the kvstore to use as a backend. If no backend is
-	// specified, kvstore.Client() is being used.
+	// Backend is the kvstore to use as a backend. This parameter is required.
 	Backend kvstore.BackendOperations
 
 	// Observer is the observe that will receive events on key mutations
@@ -82,12 +78,8 @@ func (c *Configuration) validate() error {
 		return fmt.Errorf("KeyCreator must be specified")
 	}
 
-	if c.SynchronizationInterval == 0 {
-		c.SynchronizationInterval = option.Config.KVstorePeriodicSync
-	}
-
 	if c.Backend == nil {
-		c.Backend = kvstore.Client()
+		return fmt.Errorf("backend must be specified")
 	}
 
 	if c.Context == nil {
@@ -100,6 +92,7 @@ func (c *Configuration) validate() error {
 // SharedStore is an instance of a shared store. It is created with
 // JoinSharedStore() and released with the SharedStore.Close() function.
 type SharedStore struct {
+	logger *slog.Logger
 	// conf is a copy of the store configuration. This field is never
 	// mutated after JoinSharedStore() so it is safe to access this without
 	// a lock.
@@ -122,7 +115,7 @@ type SharedStore struct {
 	// localKeys is a map of keys that are owned by the local instance. All
 	// local keys are synchronized with the kvstore. This map can be
 	// modified with UpdateLocalKey() and DeleteLocalKey().
-	localKeys map[string]LocalKey
+	localKeys map[string]Key
 
 	// sharedKeys is a map of all keys that either have been discovered
 	// from remote collaborators or successfully shared local keys. This
@@ -177,15 +170,7 @@ type Key interface {
 	Unmarshal(key string, data []byte) error
 }
 
-// LocalKey is a Key owned by the local store instance
-type LocalKey interface {
-	Key
-
-	// DeepKeyCopy must return a deep copy of the key
-	DeepKeyCopy() LocalKey
-}
-
-// KVPair represents a basic implementation of the LocalKey interface
+// KVPair represents a basic implementation of the Key interface
 type KVPair struct {
 	Key   string
 	Value []byte
@@ -207,14 +192,15 @@ func (kv *KVPair) Unmarshal(key string, data []byte) error {
 // store is initialized with the contents of the kvstore. An error is returned
 // if the contents cannot be retrieved synchronously from the kvstore. Starts a
 // controller to continuously synchronize the store with the kvstore.
-func JoinSharedStore(c Configuration) (*SharedStore, error) {
+func JoinSharedStore(logger *slog.Logger, c Configuration) (*SharedStore, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
 
 	s := &SharedStore{
+		logger:     logger,
 		conf:       c,
-		localKeys:  map[string]LocalKey{},
+		localKeys:  map[string]Key{},
 		sharedKeys: map[string]Key{},
 		backend:    c.Backend,
 	}
@@ -223,21 +209,24 @@ func JoinSharedStore(c Configuration) (*SharedStore, error) {
 	s.conf.Context, s.stop = context.WithCancel(s.conf.Context)
 
 	s.name = "store-" + s.conf.Prefix
+	s.logger = s.logger.With(logfields.Name, s.name)
 	s.controllerName = "kvstore-sync-" + s.name
 
 	if err := s.listAndStartWatcher(); err != nil {
 		return nil, err
 	}
 
-	controllers.UpdateController(s.controllerName,
-		controller.ControllerParams{
-			Group: kvstoreSyncControllerGroup,
-			DoFunc: func(ctx context.Context) error {
-				return s.syncLocalKeys(ctx, true)
+	if s.conf.SynchronizationInterval > 0 {
+		controllers.UpdateController(s.controllerName,
+			controller.ControllerParams{
+				Group: kvstoreSyncControllerGroup,
+				DoFunc: func(ctx context.Context) error {
+					return s.syncLocalKeys(ctx, true)
+				},
+				RunInterval: s.conf.SynchronizationInterval,
 			},
-			RunInterval: s.conf.SynchronizationInterval,
-		},
-	)
+		)
+	}
 
 	return s, nil
 }
@@ -271,7 +260,7 @@ func (s *SharedStore) Close(ctx context.Context) {
 
 	for name, key := range s.localKeys {
 		if err := s.backend.Delete(ctx, s.keyPath(key)); err != nil {
-			s.getLogger().WithError(err).Warning("Unable to delete key in kvstore")
+			s.logger.Warn("Unable to delete key in kvstore", logfields.Error, err)
 		}
 
 		delete(s.localKeys, name)
@@ -287,11 +276,11 @@ func (s *SharedStore) Close(ctx context.Context) {
 func (s *SharedStore) keyPath(key NamedKey) string {
 	// WARNING - STABLE API: The composition of the absolute key path
 	// cannot be changed without breaking up and downgrades.
-	return path.Join(s.conf.Prefix, key.GetKeyName())
+	return kvstore.JoinKey(s.conf.Prefix, key.GetKeyName())
 }
 
 // syncLocalKey synchronizes a key to the kvstore
-func (s *SharedStore) syncLocalKey(ctx context.Context, key LocalKey, lease bool) error {
+func (s *SharedStore) syncLocalKey(ctx context.Context, key Key, lease bool) error {
 	jsonValue, err := key.Marshal()
 	if err != nil {
 		return err
@@ -311,10 +300,7 @@ func (s *SharedStore) syncLocalKeys(ctx context.Context, lease bool) error {
 	// Create a copy of all local keys so we can unlock and sync to kvstore
 	// without holding the lock
 	s.mutex.RLock()
-	keys := make([]LocalKey, 0, len(s.localKeys))
-	for _, key := range s.localKeys {
-		keys = append(keys, key)
-	}
+	keys := slices.Collect(maps.Values(s.localKeys))
 	s.mutex.RUnlock()
 
 	for _, key := range keys {
@@ -326,7 +312,7 @@ func (s *SharedStore) syncLocalKeys(ctx context.Context, lease bool) error {
 	return nil
 }
 
-func (s *SharedStore) lookupLocalKey(name string) LocalKey {
+func (s *SharedStore) lookupLocalKey(name string) Key {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
@@ -339,47 +325,17 @@ func (s *SharedStore) lookupLocalKey(name string) LocalKey {
 	return nil
 }
 
-// NumEntries returns the number of entries in the store
-func (s *SharedStore) NumEntries() int {
-	if s == nil {
-		return 0
-	}
-
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return len(s.sharedKeys)
-}
-
-// SharedKeysMap returns a copy of the SharedKeysMap, the returned map can
-// be safely modified but the values of the map represent the actual data
-// stored in the internal SharedStore SharedKeys map.
-func (s *SharedStore) SharedKeysMap() map[string]Key {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	sharedKeysCopy := make(map[string]Key, len(s.sharedKeys))
-
-	for k, v := range s.sharedKeys {
-		sharedKeysCopy[k] = v
-	}
-	return sharedKeysCopy
-}
-
 // UpdateLocalKeySync synchronously synchronizes a local key with the kvstore
 // and adds it to the list of local keys to be synchronized if the initial
 // synchronous synchronization was successful
-func (s *SharedStore) UpdateLocalKeySync(ctx context.Context, key LocalKey) error {
+func (s *SharedStore) UpdateLocalKeySync(ctx context.Context, key Key) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	err := s.syncLocalKey(ctx, key, true)
 	if err == nil {
-		s.localKeys[key.GetKeyName()] = key.DeepKeyCopy()
+		s.localKeys[key.GetKeyName()] = key
 	}
 	return err
-}
-
-// UpdateKeySync synchronously synchronizes a key with the kvstore.
-func (s *SharedStore) UpdateKeySync(ctx context.Context, key LocalKey, lease bool) error {
-	return s.syncLocalKey(ctx, key, lease)
 }
 
 // DeleteLocalKey removes a key from being synchronized with the kvstore
@@ -395,17 +351,11 @@ func (s *SharedStore) DeleteLocalKey(ctx context.Context, key NamedKey) {
 
 	if ok {
 		if err != nil {
-			s.getLogger().WithError(err).Warning("Unable to delete key in kvstore")
+			s.logger.Warn("Unable to delete key in kvstore", logfields.Error, err)
 		}
 
 		s.onDelete(key)
 	}
-}
-
-func (s *SharedStore) getLogger() *logrus.Entry {
-	return log.WithFields(logrus.Fields{
-		"storeName": s.name,
-	})
 }
 
 func (s *SharedStore) updateKey(name string, value []byte) error {
@@ -435,27 +385,30 @@ func (s *SharedStore) deleteSharedKey(name string) {
 			_, ok := s.sharedKeys[name]
 			s.mutex.RUnlock()
 			if ok {
-				s.getLogger().WithFields(logrus.Fields{"key": name, "timeWindow": s.conf.SharedKeyDeleteDelay}).
-					Warning("Received delete event for key which re-appeared within delay time window")
+				s.logger.Warn(
+					"Received delete event for key which re-appeared within delay time window",
+					logfields.Key, name,
+					logfields.TimeWindow, s.conf.SharedKeyDeleteDelay,
+				)
 				return
 			}
 
 			s.onDelete(existingKey)
 		}()
 	} else {
-		s.getLogger().WithField("key", name).
-			Warning("Unable to find deleted key in local state")
+		s.logger.Warn(
+			"Unable to find deleted key in local state",
+			logfields.Key, name,
+		)
 	}
 }
 
 func (s *SharedStore) listAndStartWatcher() error {
 	listDone := make(chan struct{})
 
-	s.wg.Add(1)
-	go func() {
+	s.wg.Go(func() {
 		s.watcher(listDone)
-		s.wg.Done()
-	}()
+	})
 
 	select {
 	case <-listDone:
@@ -469,19 +422,19 @@ func (s *SharedStore) listAndStartWatcher() error {
 func (s *SharedStore) watcher(listDone chan struct{}) {
 	events := s.backend.ListAndWatch(s.conf.Context, s.conf.Prefix)
 
+	logger := s.logger
 	for event := range events {
 		if event.Typ == kvstore.EventTypeListDone {
-			s.getLogger().Debug("Initial list of objects received from kvstore")
+			logger.Debug("Initial list of objects received from kvstore")
 			close(listDone)
 			continue
 		}
 
-		logger := s.getLogger().WithFields(logrus.Fields{
-			"key":       event.Key,
-			"eventType": event.Typ,
-		})
-
-		logger.Debugf("Received key update via kvstore [value %s]", string(event.Value))
+		logger.Debug("Received key update via kvstore",
+			logfields.Value, string(event.Value),
+			logfields.Key, event.Key,
+			logfields.EventType, event.Typ,
+		)
 
 		keyName := strings.TrimPrefix(event.Key, s.conf.Prefix)
 		if keyName[0] == '/' {
@@ -491,12 +444,22 @@ func (s *SharedStore) watcher(listDone chan struct{}) {
 		switch event.Typ {
 		case kvstore.EventTypeCreate, kvstore.EventTypeModify:
 			if err := s.updateKey(keyName, event.Value); err != nil {
-				logger.WithError(err).Warningf("Unable to unmarshal store value: %s", string(event.Value))
+				logger.Warn(
+					"Unable to unmarshal store value",
+					logfields.Error, err,
+					logfields.Value, string(event.Value),
+					logfields.Key, event.Key,
+					logfields.EventType, event.Typ,
+				)
 			}
 
 		case kvstore.EventTypeDelete:
 			if localKey := s.lookupLocalKey(keyName); localKey != nil {
-				logger.Warning("Received delete event for local key. Re-creating the key in the kvstore")
+				logger.Warn(
+					"Received delete event for local key. Re-creating the key in the kvstore",
+					logfields.Key, event.Key,
+					logfields.EventType, event.Typ,
+				)
 
 				s.syncLocalKey(s.conf.Context, localKey, true)
 			} else {

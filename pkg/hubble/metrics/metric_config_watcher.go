@@ -9,10 +9,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 
-	"github.com/sirupsen/logrus"
 	"sigs.k8s.io/yaml"
 
 	"github.com/cilium/cilium/pkg/hubble/metrics/api"
@@ -24,7 +24,7 @@ import (
 var metricReloadInterval = 10 * time.Second
 
 type metricConfigWatcher struct {
-	logger         logrus.FieldLogger
+	logger         *slog.Logger
 	configFilePath string
 	callback       func(ctx context.Context, hash uint64, config api.Config)
 	ticker         *time.Ticker
@@ -34,15 +34,19 @@ type metricConfigWatcher struct {
 	mutex          lock.RWMutex
 }
 
-// NewmetricConfigWatcher creates a config watcher instance. Config watcher notifies
+// NewMetricConfigWatcher creates a config watcher instance. Config watcher notifies
 // DynamicFlowProcessor when config file changes and dynamic metric config should be
 // reconciled.
 func NewMetricConfigWatcher(
+	logger *slog.Logger,
 	configFilePath string,
 	callback func(ctx context.Context, hash uint64, config api.Config),
 ) *metricConfigWatcher {
 	watcher := &metricConfigWatcher{
-		logger:         logrus.New().WithField(logfields.LogSubsys, "hubble").WithField("configFilePath", configFilePath),
+		logger: logger.With(
+			logfields.LogSubsys, "hubble",
+			logfields.ConfigFile, configFilePath,
+		),
 		configFilePath: configFilePath,
 		callback:       callback,
 		currentCfgHash: 0,
@@ -73,7 +77,7 @@ func (c *metricConfigWatcher) reload() {
 	c.logger.Debug("Attempting reload")
 	config, isSameHash, hash, err := c.readConfig()
 	if err != nil {
-		c.logger.WithError(err).Error("failed reading dynamic exporter config")
+		c.logger.Error("failed reading dynamic exporter config", logfields.Error, err)
 	} else {
 		if !isSameHash {
 			c.callback(context.TODO(), hash, *config)
@@ -126,7 +130,7 @@ func calculateMetricHash(file []byte) uint64 {
 }
 
 func (c *metricConfigWatcher) validateMetricConfig(config *api.Config) error {
-	metrics := make(map[string]interface{})
+	metrics := make(map[string]any)
 	var errs error
 
 	for i, newMetric := range config.Metrics {

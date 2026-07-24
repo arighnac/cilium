@@ -7,23 +7,22 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/cilium/stream"
 	"github.com/spf13/cobra"
 
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
+	"github.com/cilium/cilium/pkg/maps/nat"
 )
 
 // bpfCtFlushCmd represents the bpf_ct_flush command
 var bpfCtFlushCmd = &cobra.Command{
-	Use:    "flush ( <endpoint identifier> | global )",
-	Short:  "Flush all connection tracking entries",
-	PreRun: requireEndpointIDorGlobal,
+	Use:   "flush",
+	Short: "Flush all connection tracking entries",
 	Run: func(cmd *cobra.Command, args []string) {
 		common.RequireRootPrivilege("cilium bpf ct flush")
-		flushCt(args[0])
+		flushCt()
 	},
 }
 
@@ -31,22 +30,27 @@ func init() {
 	BPFCtCmd.AddCommand(bpfCtFlushCmd)
 }
 
-type dummyEndpoint struct {
-	ID int
-}
+func flushCt() {
+	ipv4, ipv6 := getIpEnableStatuses()
 
-func (d dummyEndpoint) GetID() uint64 {
-	return uint64(d.ID)
-}
-
-func flushCt(eID string) {
-	var maps []*ctmap.Map
-	if eID == "global" {
-		maps = ctmap.GlobalMaps(true, getIpv6EnableStatus())
-	} else {
-		id, _ := strconv.Atoi(eID)
-		maps = ctmap.LocalMaps(&dummyEndpoint{ID: id}, true, true)
+	nat4, nat6 := nat.GlobalMaps(nil, ipv4, ipv6)
+	if nat4 != nil {
+		if err := nat4.Open(); err != nil {
+			nat4 = nil
+		} else {
+			defer func() { nat4.Close() }()
+		}
 	}
+	if nat6 != nil {
+		if err := nat6.Open(); err != nil {
+			nat6 = nil
+		} else {
+			defer func() { nat6.Close() }()
+		}
+	}
+	ctmap.InitMapInfo(nat4, nat6)
+
+	maps := ctmap.Maps(ipv4, ipv6)
 
 	observable4, next4, complete4 := stream.Multicast[ctmap.GCEvent]()
 	observable6, next6, complete6 := stream.Multicast[ctmap.GCEvent]()
@@ -57,11 +61,7 @@ func flushCt(eID string) {
 		path, err := ctmap.OpenCTMap(m)
 		if err != nil {
 			if os.IsNotExist(err) {
-				msg := "Unable to open %s: %s."
-				if eID != "global" {
-					msg = "Unable to open %s: %s: please try using \"cilium bpf ct flush global\"."
-				}
-				fmt.Fprintf(os.Stderr, msg+" Skipping.\n", path, err)
+				fmt.Fprintf(os.Stderr, "Unable to open %s: %s. Skipping.\n", path, err)
 				continue
 			}
 			Fatalf("Unable to open %s: %s", path, err)

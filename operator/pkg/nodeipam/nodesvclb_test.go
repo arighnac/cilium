@@ -5,7 +5,6 @@ package nodeipam
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -21,9 +20,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/cilium/cilium/pkg/nodeipamconfig"
 )
 
 var (
+	nodeSvcLBClass                 = nodeipamconfig.NodeSvcLBClass
+	nodeSvcLBMatchLabelsAnnotation = nodeipamconfig.NodeSvcLBMatchLabelsAnnotation
+
 	nodeSvcLbFixtures = []client.Object{
 		&corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
@@ -360,7 +364,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 				Name:      name,
 				Namespace: "default",
 			}
-			result, err := r.Reconcile(context.Background(), ctrl.Request{
+			result, err := r.Reconcile(t.Context(), ctrl.Request{
 				NamespacedName: key,
 			})
 
@@ -368,7 +372,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 			require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
 			svc := &corev1.Service{}
-			err = c.Get(context.Background(), key, svc)
+			err = c.Get(t.Context(), key, svc)
 
 			require.NoError(t, err)
 			// It did not change the IPs already advertised
@@ -391,7 +395,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 				Name:      param.name,
 				Namespace: "default",
 			}
-			result, err := r.Reconcile(context.Background(), ctrl.Request{
+			result, err := r.Reconcile(t.Context(), ctrl.Request{
 				NamespacedName: key,
 			})
 
@@ -399,7 +403,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 			require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
 			svc := &corev1.Service{}
-			err = c.Get(context.Background(), key, svc)
+			err = c.Get(t.Context(), key, svc)
 
 			require.NoError(t, err)
 			require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
@@ -412,7 +416,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 			Name:      "dualstack-external",
 			Namespace: "default",
 		}
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: key,
 		})
 
@@ -420,7 +424,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
 		svc := &corev1.Service{}
-		err = c.Get(context.Background(), key, svc)
+		err = c.Get(t.Context(), key, svc)
 
 		require.NoError(t, err)
 		require.Len(t, svc.Status.LoadBalancer.Ingress, 2)
@@ -433,7 +437,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 			Name:      "etp-cluster",
 			Namespace: "default",
 		}
-		result, err := r.Reconcile(context.Background(), ctrl.Request{
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
 			NamespacedName: key,
 		})
 
@@ -441,7 +445,7 @@ func Test_nodeIPAM_Reconcile(t *testing.T) {
 		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
 		svc := &corev1.Service{}
-		err = c.Get(context.Background(), key, svc)
+		err = c.Get(t.Context(), key, svc)
 
 		require.NoError(t, err)
 		require.Len(t, svc.Status.LoadBalancer.Ingress, 2)
@@ -461,7 +465,7 @@ func Test_nodeIPAM_defaultIPAM_Reconcile(t *testing.T) {
 		Name:      "default-ipam",
 		Namespace: "default",
 	}
-	result, err := r.Reconcile(context.Background(), ctrl.Request{
+	result, err := r.Reconcile(t.Context(), ctrl.Request{
 		NamespacedName: key,
 	})
 
@@ -469,7 +473,7 @@ func Test_nodeIPAM_defaultIPAM_Reconcile(t *testing.T) {
 	require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
 	svc := &corev1.Service{}
-	err = c.Get(context.Background(), key, svc)
+	err = c.Get(t.Context(), key, svc)
 
 	require.NoError(t, err)
 	require.Len(t, svc.Status.LoadBalancer.Ingress, 2)
@@ -490,7 +494,7 @@ func Test_nodeIPAM_CiliumResources_Reconcile(t *testing.T) {
 	}
 
 	t.Run("Managed Resource", func(t *testing.T) {
-		ctx := context.Background()
+		ctx := t.Context()
 		result, err := r.Reconcile(ctx, ctrl.Request{
 			NamespacedName: key,
 		})
@@ -511,7 +515,7 @@ func Test_nodeIPAM_CiliumResources_Reconcile(t *testing.T) {
 	})
 
 	t.Run("Node Label Filter", func(t *testing.T) {
-		ctx := context.Background()
+		ctx := t.Context()
 
 		for _, param := range []struct {
 			labelFilter string
@@ -548,7 +552,7 @@ func Test_nodeIPAM_CiliumResources_Reconcile(t *testing.T) {
 	})
 
 	t.Run("Bad Node Label Filter", func(t *testing.T) {
-		ctx := context.Background()
+		ctx := t.Context()
 		svc := &corev1.Service{}
 		_ = c.Get(ctx, key, svc)
 		// Add the label to the service which should return on the first node
@@ -567,7 +571,7 @@ func Test_nodeIPAM_CiliumResources_Reconcile(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(&buf, nil))
 		r.Logger = logger
 
-		ctx := context.Background()
+		ctx := t.Context()
 		svc := &corev1.Service{}
 		_ = c.Get(ctx, key, svc)
 		// Add the label to the service which should return on the first node

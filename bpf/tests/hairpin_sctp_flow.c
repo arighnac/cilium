@@ -1,23 +1,16 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
-/* Set the LXC source address to be the address of pod one */
-#define LXC_IPV4 (__be32)v4_pod_one
-
 /* Enable CT debug output */
 #undef QUIET_CT
 
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
+#include "common.h"
 
 /* Enable code paths under test*/
-#define ENABLE_IPV4
-#define ENABLE_SCTP
-
-/* Use to-container for ingress policy: */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
+#define ENABLE_IPV4 1
+#define ENABLE_SCTP 1
 
 #define ctx_redirect_peer mock_ctx_redirect_peer
 static __always_inline __maybe_unused int
@@ -27,23 +20,15 @@ mock_ctx_redirect_peer(const struct __sk_buff *ctx __maybe_unused, int ifindex _
 	return TC_ACT_REDIRECT;
 }
 
-#include <bpf_lxc.c>
+#include "lib/bpf_lxc.h"
+
+/* Set the LXC source address to be the address of pod one */
+ASSIGN_CONFIG(union v4addr, endpoint_ipv4, { .be32 = v4_pod_one })
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 #include "lib/lb.h"
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(max_entries, 2);
-	__array(values, int());
-} entry_call_map __section(".maps") = {
-	.values = {
-		[0] = &cil_from_container,
-		[1] = &cil_to_container,
-	},
-};
 
 /* Setup for this test:
  * +-------ClusterIP--------+    +----------Pod 1---------+
@@ -88,7 +73,7 @@ int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
 	/* Calc lengths, set protocol fields and calc checksums */
 	pktgen__finish(&builder);
 
-	lb_v4_add_service(v4_svc_one, tcp_svc_one, 1, revnat_id);
+	lb_v4_add_service(v4_svc_one, tcp_svc_one, IPPROTO_SCTP, 1, revnat_id);
 	lb_v4_add_backend(v4_svc_one, tcp_svc_one, 1, 124,
 			  v4_pod_one, tcp_svc_one, IPPROTO_SCTP, 0);
 
@@ -97,10 +82,7 @@ int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
 
 	endpoint_v4_add_entry(v4_pod_one, 0, 0, 0, 0, 0, NULL, NULL);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, 0);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return pod_send_packet(ctx);
 }
 
 CHECK("tc", "hairpin_sctp_flow_1_forward_v4")
@@ -113,6 +95,8 @@ int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 	struct sctphdr *l4;
 
 	test_init();
+
+	endpoint_v4_del_entry(v4_pod_one);
 
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
@@ -129,7 +113,7 @@ int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 	if ((void *)l3 + sizeof(struct iphdr) > data_end)
 		test_fatal("l3 out of bounds");
 
-	if (l3->saddr != IPV4_LOOPBACK)
+	if (l3->saddr != CONFIG(service_loopback_ipv4).be32)
 		test_fatal("src IP was not SNAT'ed");
 
 	if (l3->daddr != v4_pod_one)
@@ -166,7 +150,7 @@ int hairpin_flow_forward_ingress_pktgen(struct __ctx_buff *ctx)
 	pktgen__init(&builder, ctx);
 
 	l3 = pktgen__push_ipv4_packet(&builder, (__u8 *)src, (__u8 *)dst,
-				      IPV4_LOOPBACK, v4_pod_one);
+				      CONFIG(service_loopback_ipv4).be32, v4_pod_one);
 	if (!l3)
 		return TEST_ERROR;
 
@@ -188,10 +172,7 @@ int hairpin_flow_forward_ingress_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "hairpin_sctp_flow_2_forward_ingress_v4")
 int hairpin_flow_forward_ingress_setup(struct __ctx_buff *ctx)
 {
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, 1);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return pod_receive_packet(ctx);
 }
 
 CHECK("tc", "hairpin_sctp_flow_2_forward_ingress_v4")
@@ -220,7 +201,7 @@ int hairpin_flow_forward_ingress_check(__maybe_unused const struct __ctx_buff *c
 	if ((void *)l3 + sizeof(struct iphdr) > data_end)
 		test_fatal("l3 out of bounds");
 
-	if (l3->saddr != IPV4_LOOPBACK)
+	if (l3->saddr != CONFIG(service_loopback_ipv4).be32)
 		test_fatal("src IP changed");
 
 	if (l3->daddr != v4_pod_one)
@@ -253,11 +234,13 @@ int hairpin_flow_rev_setup(struct __ctx_buff *ctx)
 	struct iphdr *l3;
 	struct sctphdr *l4;
 
+	endpoint_v4_add_entry(v4_pod_one, 0, 0, 0, 0, 0, NULL, NULL);
+
 	/* Init packet builder */
 	pktgen__init(&builder, ctx);
 
 	l3 = pktgen__push_ipv4_packet(&builder, (__u8 *)src, (__u8 *)dst,
-				      v4_pod_one, IPV4_LOOPBACK);
+				      v4_pod_one, CONFIG(service_loopback_ipv4).be32);
 	if (!l3)
 		return TEST_ERROR;
 
@@ -273,10 +256,7 @@ int hairpin_flow_rev_setup(struct __ctx_buff *ctx)
 	/* Calc lengths, set protocol fields and calc checksums */
 	pktgen__finish(&builder);
 
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, 0);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return pod_send_packet(ctx);
 }
 
 CHECK("tc", "hairpin_sctp_flow_3_reverse_v4")
@@ -289,6 +269,8 @@ int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 	struct sctphdr *l4;
 
 	test_init();
+
+	endpoint_v4_del_entry(v4_pod_one);
 
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
@@ -308,7 +290,7 @@ int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l3->saddr != v4_pod_one)
 		test_fatal("src IP changed");
 
-	if (l3->daddr != IPV4_LOOPBACK)
+	if (l3->daddr != CONFIG(service_loopback_ipv4).be32)
 		test_fatal("dest IP changed");
 
 	l4 = (void *)l3 + sizeof(struct iphdr);
@@ -338,7 +320,7 @@ int hairpin_sctp_flow_4_reverse_ingress_v4_pktgen(struct __ctx_buff *ctx)
 	pktgen__init(&builder, ctx);
 
 	l3 = pktgen__push_ipv4_packet(&builder, (__u8 *)src, (__u8 *)dst,
-				      v4_pod_one, IPV4_LOOPBACK);
+				      v4_pod_one, CONFIG(service_loopback_ipv4).be32);
 	if (!l3)
 		return TEST_ERROR;
 
@@ -360,10 +342,7 @@ int hairpin_sctp_flow_4_reverse_ingress_v4_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "hairpin_sctp_flow_4_reverse_ingress_v4")
 int hairpin_sctp_flow_4_reverse_ingress_v4_setup(struct __ctx_buff *ctx)
 {
-	/* Jump into the entrypoint */
-	tail_call_static(ctx, entry_call_map, 1);
-	/* Fail if we didn't jump */
-	return TEST_ERROR;
+	return pod_receive_packet(ctx);
 }
 
 CHECK("tc", "hairpin_sctp_flow_4_reverse_ingress_v4")

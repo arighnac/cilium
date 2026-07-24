@@ -22,9 +22,16 @@ var supportedFeatures = features.AllFeatures
 
 var gatewayClassSupportedFeatures = getSupportedFeatures()
 
+// This lists the features we do _not_ support, so that we can skip
+// them in the supportedFeatures list in the GatewayClass.
 var exemptFeatures = []features.Feature{
 	features.HTTPRouteParentRefPortFeature,
 	features.MeshConsumerRouteFeature,
+	features.BackendTLSPolicySanValidationFeature,
+	features.TLSRouteModeTerminateFeature,
+	features.GatewayBackendClientCertificateFeature,
+	features.GatewayFrontendClientCertificateValidationFeature,
+	features.GatewayHTTPSListenerDetectMisdirectedRequestsFeature,
 }
 
 // List of Gateway API features supported by Cilium.
@@ -33,7 +40,7 @@ func getSupportedFeatures() []gatewayv1.SupportedFeature {
 	for _, feature := range exemptFeatures {
 		supportedFeatures.Delete(feature)
 	}
-	ret := []gatewayv1.SupportedFeature{}
+	ret := make([]gatewayv1.SupportedFeature, 0, len(supportedFeatures))
 	for _, feat := range supportedFeatures.UnsortedList() {
 		ret = append(ret, gatewayv1.SupportedFeature{Name: gatewayv1.FeatureName(feat.Name)})
 	}
@@ -57,7 +64,6 @@ func setGatewayClassSupportedFeatures(gwc *gatewayv1.GatewayClass) *gatewayv1.Ga
 }
 
 // gatewayClassAcceptedCondition returns the GatewayClass with Accepted status condition.
-// TODO(tam): Update GatewayClassReasonInvalidParameters message when parameter support is added.
 func gatewayClassAcceptedCondition(gwc *gatewayv1.GatewayClass, accepted bool) metav1.Condition {
 	switch accepted {
 	case true:

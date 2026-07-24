@@ -7,24 +7,33 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cilium/cilium/pkg/datapath/connector"
+	fakeconnector "github.com/cilium/cilium/pkg/datapath/connector/fake"
+	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
+	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/kpr"
+	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/option"
+	fakewireguard "github.com/cilium/cilium/pkg/wireguard/fake"
 
 	"github.com/stretchr/testify/assert"
 )
 
 type mockFeaturesParams struct {
-	TunnelConfig                        tunnel.Protocol
+	TunnelConfig                        tunnel.EncapProtocol
 	CNIChainingMode                     string
 	MutualAuth                          bool
 	BandwidthManager                    bool
-	bigTCPMock                          bigTCPMock
+	bigTCPFeatures                      bigTCPFeatures
 	L2PodAnnouncement                   bool
 	isDynamicConfigSourceKindNodeConfig bool
+	ConnectorConfig                     connector.Config
+	KernelVersionString                 string
 }
 
-func (m mockFeaturesParams) TunnelProtocol() tunnel.Protocol {
+func (m mockFeaturesParams) TunnelProtocol() tunnel.EncapProtocol {
 	return m.TunnelConfig
 }
 
@@ -40,8 +49,8 @@ func (m mockFeaturesParams) IsBandwidthManagerEnabled() bool {
 	return m.BandwidthManager
 }
 
-func (m mockFeaturesParams) BigTCPConfig() types.BigTCPConfig {
-	return m.bigTCPMock
+func (m mockFeaturesParams) BigTCPFeatures() bigtcp.Features {
+	return m.bigTCPFeatures
 }
 
 func (m mockFeaturesParams) IsL2PodAnnouncementEnabled() bool {
@@ -52,16 +61,34 @@ func (m mockFeaturesParams) IsDynamicConfigSourceKindNodeConfig() bool {
 	return m.isDynamicConfigSourceKindNodeConfig
 }
 
-type bigTCPMock struct {
+func (m mockFeaturesParams) DatapathConfiguredMode() string {
+	if m.ConnectorConfig != nil {
+		return m.ConnectorConfig.GetConfiguredMode().String()
+	}
+	return "mocked"
+}
+
+func (m mockFeaturesParams) DatapathOperationalMode() string {
+	if m.ConnectorConfig != nil {
+		return m.ConnectorConfig.GetOperationalMode().String()
+	}
+	return "mocked"
+}
+
+func (m mockFeaturesParams) KernelVersion() string {
+	return m.KernelVersionString
+}
+
+type bigTCPFeatures struct {
 	ipv4Enabled bool
 	ipv6Enabled bool
 }
 
-func (b bigTCPMock) IsIPv4Enabled() bool {
+func (b bigTCPFeatures) IsIPv4Enabled() bool {
 	return b.ipv4Enabled
 }
 
-func (b bigTCPMock) IsIPv6Enabled() bool {
+func (b bigTCPFeatures) IsIPv6Enabled() bool {
 	return b.ipv6Enabled
 }
 
@@ -69,7 +96,7 @@ func TestUpdateNetworkMode(t *testing.T) {
 	tests := []struct {
 		name         string
 		tunnelMode   string
-		tunnelProto  tunnel.Protocol
+		tunnelProto  tunnel.EncapProtocol
 		expectedMode string
 	}{
 		{
@@ -93,24 +120,26 @@ func TestUpdateNetworkMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				RoutingMode:            tt.tunnelMode,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				TunnelConfig:    tt.tunnelProto,
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultNetworkModes {
@@ -145,22 +174,24 @@ func TestUpdateIPAMMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				IPAM:                   tt.IPAMMode,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultIPAMModes {
@@ -195,22 +226,24 @@ func TestUpdateCNIChainingMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: tt.chainingMode,
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultChainingModes {
@@ -255,23 +288,24 @@ func TestUpdateInternetProtocol(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				EnableIPv4:             tt.enableIPv4,
 				EnableIPv6:             tt.enableIPv6,
 			}
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultChainingModes {
@@ -306,22 +340,23 @@ func TestUpdateIdentityAllocationMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
-				DatapathMode:           defaultDeviceModes[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				IdentityAllocationMode: tt.identityAllocationMode,
 			}
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultIdentityAllocationModes {
@@ -359,23 +394,25 @@ func TestUpdateCiliumEndpointSlices(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                      defaultIPAMModes[0],
 				EnableIPv4:                true,
 				IdentityAllocationMode:    defaultIdentityAllocationModes[0],
-				DatapathMode:              defaultDeviceModes[0],
-				NodePortMode:              defaultNodePortModes[0],
-				NodePortAlg:               defaultNodePortModeAlgorithms[0],
+				DatapathMode:              defaultConfiguredDatapathMode,
 				NodePortAcceleration:      defaultNodePortModeAccelerations[0],
 				EnableCiliumEndpointSlice: tt.enableCES,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.CPCiliumEndpointSlicesEnabled.Get()
 
@@ -385,49 +422,84 @@ func TestUpdateCiliumEndpointSlices(t *testing.T) {
 }
 
 func TestUpdateDeviceMode(t *testing.T) {
-	type testCase struct {
-		name         string
-		deviceMode   string
-		expectedMode string
-	}
-	var tests []testCase
-	for _, mode := range defaultDeviceModes {
-		tests = append(tests, testCase{
-			name:         fmt.Sprintf("Device %s mode", mode),
-			deviceMode:   mode,
-			expectedMode: mode,
-		})
+	tests := []struct {
+		name                    string
+		configuredMode          connector.Mode
+		operationalMode         connector.Mode
+		expectedConfiguredMode  string
+		expectedOperationalMode string
+	}{
+		{
+			name:                    "veth/veth",
+			configuredMode:          connector.ModeVeth,
+			operationalMode:         connector.ModeVeth,
+			expectedConfiguredMode:  datapathOption.DatapathModeVeth,
+			expectedOperationalMode: datapathOption.DatapathModeVeth,
+		},
+		{
+			name:                    "netkit/netkit",
+			configuredMode:          connector.ModeNetkit,
+			operationalMode:         connector.ModeNetkit,
+			expectedConfiguredMode:  datapathOption.DatapathModeNetkit,
+			expectedOperationalMode: datapathOption.DatapathModeNetkit,
+		},
+		{
+			name:                    "netkit-l2/netkit-l2",
+			configuredMode:          connector.ModeNetkitL2,
+			operationalMode:         connector.ModeNetkitL2,
+			expectedConfiguredMode:  datapathOption.DatapathModeNetkitL2,
+			expectedOperationalMode: datapathOption.DatapathModeNetkitL2,
+		},
+		{
+			name:                    "auto/veth",
+			configuredMode:          connector.ModeAuto,
+			operationalMode:         connector.ModeVeth,
+			expectedConfiguredMode:  datapathOption.DatapathModeAuto,
+			expectedOperationalMode: datapathOption.DatapathModeVeth,
+		},
+		{
+			name:                    "auto/netkit",
+			configuredMode:          connector.ModeAuto,
+			operationalMode:         connector.ModeNetkit,
+			expectedConfiguredMode:  datapathOption.DatapathModeAuto,
+			expectedOperationalMode: datapathOption.DatapathModeNetkit,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
-				DatapathMode:           tt.deviceMode,
 			}
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
+				ConnectorConfig: fakeconnector.NewConfig(tt.configuredMode, tt.operationalMode),
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
-			// Check that only the expected mode's counter is incremented
-			for _, mode := range defaultDeviceModes {
-				counter, err := metrics.DPDeviceConfig.GetMetricWithLabelValues(mode)
-				assert.NoError(t, err)
+			// Check that only the expected mode counters are incremented
+			for _, configuredMode := range defaultConfiguredDatapathModes {
+				for _, operationalMode := range defaultOperationalDatapathModes {
+					counter, err := metrics.DPDeviceConfig.GetMetricWithLabelValues(configuredMode, operationalMode)
+					assert.NoError(t, err)
 
-				counterValue := counter.Get()
-				if mode == tt.expectedMode {
-					assert.Equal(t, float64(1), counterValue, "Expected mode %s to be incremented", mode)
-				} else {
-					assert.Equal(t, float64(0), counterValue, "Expected mode %s to remain at 0", mode)
+					counterValue := counter.Get()
+					if configuredMode == tt.expectedConfiguredMode && operationalMode == tt.expectedOperationalMode {
+						assert.Equal(t, float64(1), counterValue, "Expected mode %s/%s to be incremented",
+							configuredMode, operationalMode)
+					} else {
+						assert.Equal(t, float64(0), counterValue, "Expected mode %s/%s to remain at 0",
+							configuredMode, operationalMode)
+					}
 				}
 			}
 		})
@@ -454,23 +526,24 @@ func TestUpdateHostFirewall(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				EnableHostFirewall:     tt.enableHostFirewall,
 			}
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.NPHostFirewallEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableHostFirewall, counterValue)
@@ -498,23 +571,24 @@ func TestUpdateLocalRedirectPolicies(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                      defaultIPAMModes[0],
 				EnableIPv4:                true,
 				IdentityAllocationMode:    defaultIdentityAllocationModes[0],
-				DatapathMode:              defaultDeviceModes[0],
-				NodePortMode:              defaultNodePortModes[0],
-				NodePortAlg:               defaultNodePortModeAlgorithms[0],
+				DatapathMode:              defaultConfiguredDatapathMode,
 				NodePortAcceleration:      defaultNodePortModeAccelerations[0],
 				EnableLocalRedirectPolicy: tt.enableLRP,
 			}
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.NPLocalRedirectPolicyEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableLRP, counterValue)
@@ -542,23 +616,25 @@ func TestUpdateMutualAuth(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 				MutualAuth:      tt.enableMutualAuth,
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.NPMutualAuthEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableMutualAuth, counterValue)
@@ -586,23 +662,25 @@ func TestUpdateNonDefaultDeny(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                         defaultIPAMModes[0],
 				EnableIPv4:                   true,
 				IdentityAllocationMode:       defaultIdentityAllocationModes[0],
-				DatapathMode:                 defaultDeviceModes[0],
-				NodePortMode:                 defaultNodePortModes[0],
-				NodePortAlg:                  defaultNodePortModeAlgorithms[0],
+				DatapathMode:                 defaultConfiguredDatapathMode,
 				NodePortAcceleration:         defaultNodePortModeAccelerations[0],
 				EnableNonDefaultDenyPolicies: tt.enableNonDefaultDeny,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.NPNonDefaultDenyEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableNonDefaultDeny, counterValue)
@@ -627,27 +705,29 @@ func TestUpdateCIDRPolicyModeToNode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				PolicyCIDRMatchMode:    []string{tt.policyMode},
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultCIDRPolicies {
-				counter, err := metrics.NPCIDRPoliciesToNodes.GetMetricWithLabelValues(mode)
+				counter, err := metrics.NPCIDRPoliciesMode.GetMetricWithLabelValues(mode)
 				assert.NoError(t, err)
 
 				counterValue := counter.Get()
@@ -667,21 +747,25 @@ func TestUpdateEncryptionMode(t *testing.T) {
 		enableIPSec               bool
 		enableWireguard           bool
 		enableNode2NodeEncryption bool
+		enableStrictMode          bool
 
 		expectEncryptionMode      string
 		expectNode2NodeEncryption string
+		expectStrictMode          string
 	}{
 		{
 			name:                      "IPSec enabled",
 			enableIPSec:               true,
 			expectEncryptionMode:      advConnNetEncIPSec,
 			expectNode2NodeEncryption: "false",
+			expectStrictMode:          "false",
 		},
 		{
 			name:                      "IPSec disabled",
 			enableIPSec:               false,
 			expectEncryptionMode:      "",
 			expectNode2NodeEncryption: "",
+			expectStrictMode:          "",
 		},
 		{
 			name:                      "IPSec enabled w/ node2node",
@@ -689,12 +773,31 @@ func TestUpdateEncryptionMode(t *testing.T) {
 			enableNode2NodeEncryption: true,
 			expectEncryptionMode:      advConnNetEncIPSec,
 			expectNode2NodeEncryption: "true",
+			expectStrictMode:          "false",
+		},
+		{
+			name:                      "IPSec enabled w/ strict mode",
+			enableIPSec:               true,
+			enableStrictMode:          true,
+			expectEncryptionMode:      advConnNetEncIPSec,
+			expectNode2NodeEncryption: "false",
+			expectStrictMode:          "true",
+		},
+		{
+			name:                      "IPSec enabled w/ node2node and strict mode",
+			enableIPSec:               true,
+			enableNode2NodeEncryption: true,
+			enableStrictMode:          true,
+			expectEncryptionMode:      advConnNetEncIPSec,
+			expectNode2NodeEncryption: "true",
+			expectStrictMode:          "true",
 		},
 		{
 			name:                      "Wireguard enabled",
 			enableWireguard:           true,
 			expectEncryptionMode:      advConnNetEncWireGuard,
 			expectNode2NodeEncryption: "false",
+			expectStrictMode:          "false",
 		},
 		{
 			name:                      "Wireguard enabled w/ node2node",
@@ -702,42 +805,65 @@ func TestUpdateEncryptionMode(t *testing.T) {
 			enableNode2NodeEncryption: true,
 			expectEncryptionMode:      advConnNetEncWireGuard,
 			expectNode2NodeEncryption: "true",
+			expectStrictMode:          "false",
+		},
+		{
+			name:                      "Wireguard enabled w/ strict mode",
+			enableWireguard:           true,
+			enableStrictMode:          true,
+			expectEncryptionMode:      advConnNetEncWireGuard,
+			expectNode2NodeEncryption: "false",
+			expectStrictMode:          "true",
+		},
+		{
+			name:                      "Wireguard enabled w/ node2node and strict mode",
+			enableWireguard:           true,
+			enableNode2NodeEncryption: true,
+			enableStrictMode:          true,
+			expectEncryptionMode:      advConnNetEncWireGuard,
+			expectNode2NodeEncryption: "true",
+			expectStrictMode:          "true",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
-				IPAM:                   defaultIPAMModes[0],
-				EnableIPv4:             true,
-				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
-				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
-				EnableIPSec:            tt.enableIPSec,
-				EnableWireguard:        tt.enableWireguard,
-				EncryptNode:            tt.enableNode2NodeEncryption,
+				IPAM:                             defaultIPAMModes[0],
+				EnableIPv4:                       true,
+				IdentityAllocationMode:           defaultIdentityAllocationModes[0],
+				DatapathMode:                     defaultConfiguredDatapathMode,
+				NodePortAcceleration:             defaultNodePortModeAccelerations[0],
+				EncryptNode:                      tt.enableNode2NodeEncryption,
+				EnableEncryptionStrictModeEgress: tt.enableStrictMode,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{EnableWireguard: tt.enableWireguard}, fakeipsec.Config{EnableIPsec: tt.enableIPSec})
 
 			// Check that only the expected mode's counter is incremented
 			for _, encMode := range defaultEncryptionModes {
 				for _, node2node := range []string{"true", "false"} {
-					counter, err := metrics.ACLBTransparentEncryption.GetMetricWithLabelValues(encMode, node2node)
-					assert.NoError(t, err)
+					for _, strictMode := range []string{"true", "false"} {
+						counter, err := metrics.ACLBTransparentEncryption.GetMetricWithLabelValues(encMode, node2node, strictMode)
+						assert.NoError(t, err)
 
-					counterValue := counter.Get()
-					if encMode == tt.expectEncryptionMode && node2node == tt.expectNode2NodeEncryption {
-						assert.Equal(t, float64(1), counterValue, "Expected mode %s to be incremented", encMode)
-					} else {
-						assert.Equal(t, float64(0), counterValue, "Expected mode %s to remain at 0", encMode)
+						counterValue := counter.Get()
+						if encMode == tt.expectEncryptionMode &&
+							node2node == tt.expectNode2NodeEncryption &&
+							strictMode == tt.expectStrictMode {
+							assert.Equal(t, float64(1), counterValue, "Expected mode %s with node2node=%s and strict=%s to be incremented", encMode, node2node, strictMode)
+						} else {
+							assert.Equal(t, float64(0), counterValue, "Expected mode %s with node2node=%s and strict=%s to remain at 0", encMode, node2node, strictMode)
+						}
 					}
 				}
 			}
@@ -748,40 +874,41 @@ func TestUpdateEncryptionMode(t *testing.T) {
 func TestUpdateKubeProxyReplacement(t *testing.T) {
 	tests := []struct {
 		name                       string
-		enableKubeProxyReplacement string
+		enableKubeProxyReplacement bool
 		expected                   float64
 	}{
 		{
 			name:                       "KubeProxyReplacement enabled",
-			enableKubeProxyReplacement: "true",
+			enableKubeProxyReplacement: true,
 			expected:                   1,
 		},
 		{
 			name:                       "KubeProxyReplacement disabled",
-			enableKubeProxyReplacement: "false",
+			enableKubeProxyReplacement: false,
 			expected:                   0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
-				KubeProxyReplacement:   tt.enableKubeProxyReplacement,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{KubeProxyReplacement: tt.enableKubeProxyReplacement}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBKubeProxyReplacementEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableKubeProxyReplacement, counterValue)
@@ -820,22 +947,24 @@ func TestUpdateNodePortConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           tt.portMode,
-				NodePortAlg:            tt.algoMode,
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   tt.accelerationMode,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = tt.algoMode
+			lbConfig.LBMode = tt.portMode
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, portMode := range defaultNodePortModes {
@@ -878,23 +1007,25 @@ func TestUpdateBGP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				EnableBGPControlPlane:  tt.bgpControlPlane,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBBGPEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for bgpControlPlane: %t, got %.f", tt.expected, tt.bgpControlPlane, counterValue)
@@ -922,23 +1053,25 @@ func TestUpdateIPv4EgressGateway(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
-				IPAM:                    defaultIPAMModes[0],
-				EnableIPv4:              true,
-				IdentityAllocationMode:  defaultIdentityAllocationModes[0],
-				DatapathMode:            defaultDeviceModes[0],
-				NodePortMode:            defaultNodePortModes[0],
-				NodePortAlg:             defaultNodePortModeAlgorithms[0],
-				NodePortAcceleration:    defaultNodePortModeAccelerations[0],
-				EnableIPv4EgressGateway: tt.enableEGW,
+				IPAM:                   defaultIPAMModes[0],
+				EnableIPv4:             true,
+				IdentityAllocationMode: defaultIdentityAllocationModes[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
+				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
+				EnableEgressGateway:    tt.enableEGW,
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBEgressGatewayEnabled.Get()
 
@@ -967,23 +1100,25 @@ func TestUpdateBandwidthManager(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode:  defaultChainingModes[0],
 				BandwidthManager: tt.enableBandwidthManager,
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBBandwidthManagerEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableBandwidthManager, counterValue)
@@ -1011,70 +1146,28 @@ func TestUpdateSCTP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				EnableSCTP:             tt.enableSCTP,
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
 
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
+
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBSCTPEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableSCTP, counterValue)
-		})
-	}
-}
-
-func TestUpdateInternalTrafficPolicy(t *testing.T) {
-	tests := []struct {
-		name                        string
-		enableInternalTrafficPolicy bool
-		expected                    float64
-	}{
-		{
-			name:                        "InternalTrafficPolicy enabled",
-			enableInternalTrafficPolicy: true,
-			expected:                    1,
-		},
-		{
-			name:                        "InternalTrafficPolicy disabled",
-			enableInternalTrafficPolicy: false,
-			expected:                    0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
-			config := &option.DaemonConfig{
-				EnableInternalTrafficPolicy: tt.enableInternalTrafficPolicy,
-				IPAM:                        defaultIPAMModes[0],
-				EnableIPv4:                  true,
-				IdentityAllocationMode:      defaultIdentityAllocationModes[0],
-				DatapathMode:                defaultDeviceModes[0],
-				NodePortMode:                defaultNodePortModes[0],
-				NodePortAlg:                 defaultNodePortModeAlgorithms[0],
-				NodePortAcceleration:        defaultNodePortModeAccelerations[0],
-			}
-
-			params := mockFeaturesParams{
-				CNIChainingMode: defaultChainingModes[0],
-			}
-
-			metrics.update(params, config)
-
-			counterValue := metrics.ACLBInternalTrafficPolicyEnabled.Get()
-			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableInternalTrafficPolicy, counterValue)
 		})
 	}
 }
@@ -1099,23 +1192,25 @@ func TestUpdateVTEP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				EnableVTEP:             tt.enableVTEP,
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBVTEPEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableVTEP, counterValue)
@@ -1143,23 +1238,25 @@ func TestUpdateEnvoyConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				EnableEnvoyConfig:      tt.enableEnvoyConfig,
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBCiliumEnvoyConfigEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableEnvoyConfig, counterValue)
@@ -1194,26 +1291,28 @@ func TestUpdateBigTCPProtocol(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 				EnableIPv4:             true,
 			}
 
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
+
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
-				bigTCPMock: bigTCPMock{
+				bigTCPFeatures: bigTCPFeatures{
 					ipv4Enabled: tt.enableIPv4,
 					ipv6Enabled: tt.enableIPv6,
 				},
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultBigTCPAddressFamilies {
@@ -1251,23 +1350,25 @@ func TestUpdateL2Announcements(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				EnableL2Announcements:  tt.enableL2Announcements,
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBL2LBEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableL2Announcements, counterValue)
@@ -1295,23 +1396,25 @@ func TestUpdateL2PodAnnouncements(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode:   defaultChainingModes[0],
 				L2PodAnnouncement: tt.enableL2PodAnnouncements,
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBL2PodAnnouncementEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableL2PodAnnouncements, counterValue)
@@ -1339,23 +1442,25 @@ func TestUpdateExtEnvoyProxyMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				ExternalEnvoyProxy:     tt.externalEnvoyProxy,
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode: defaultChainingModes[0],
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			// Check that only the expected mode's counter is incremented
 			for _, mode := range defaultExternalEnvoyProxyModes {
@@ -1393,26 +1498,80 @@ func TestUpdateDynamicNodeConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics := NewMetrics(true)
+			metrics := NewMetrics(true, false)
 			config := &option.DaemonConfig{
 				IPAM:                   defaultIPAMModes[0],
 				EnableIPv4:             true,
 				IdentityAllocationMode: defaultIdentityAllocationModes[0],
-				DatapathMode:           defaultDeviceModes[0],
-				NodePortMode:           defaultNodePortModes[0],
-				NodePortAlg:            defaultNodePortModeAlgorithms[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
 				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
 			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
 
 			params := mockFeaturesParams{
 				CNIChainingMode:                     defaultChainingModes[0],
 				isDynamicConfigSourceKindNodeConfig: tt.enableDynamicNodeConfig,
 			}
 
-			metrics.update(params, config)
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
 
 			counterValue := metrics.ACLBCiliumNodeConfigEnabled.Get()
 			assert.Equal(t, tt.expected, counterValue, "Expected value to be %.f for enabled: %t, got %.f", tt.expected, tt.enableDynamicNodeConfig, counterValue)
+		})
+	}
+}
+func TestUpdateKernelVersion(t *testing.T) {
+	tests := []struct {
+		name           string
+		withEnvVersion bool
+		enabled        bool
+		expected       float64
+	}{
+		{
+			name:           "Kernel version metric withEnvVersion=true",
+			withEnvVersion: true,
+			enabled:        true,
+			expected:       1,
+		},
+		{
+			name:           "Kernel version metric withEnvVersion=false",
+			withEnvVersion: false,
+			enabled:        false,
+			expected:       0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metrics := NewMetrics(true, tt.withEnvVersion)
+
+			config := &option.DaemonConfig{
+				IPAM:                   defaultIPAMModes[0],
+				IdentityAllocationMode: defaultIdentityAllocationModes[0],
+				DatapathMode:           defaultConfiguredDatapathMode,
+				NodePortAcceleration:   defaultNodePortModeAccelerations[0],
+				EnableIPv4:             true,
+			}
+
+			lbConfig := loadbalancer.DefaultConfig
+			lbConfig.LBAlgorithm = defaultNodePortModeAlgorithms[0]
+			lbConfig.LBMode = defaultNodePortModes[0]
+
+			params := mockFeaturesParams{
+				KernelVersionString: "3.2.1",
+			}
+
+			metrics.update(params, config, lbConfig, kpr.KPRConfig{}, fakewireguard.Config{}, fakeipsec.Config{})
+
+			counter, err := metrics.DPKernelVersion.GetMetricWithLabelValues(params.KernelVersion())
+			assert.NoError(t, err)
+			assert.Equal(t, tt.enabled, counter.IsEnabled())
+
+			counterValue := counter.Get()
+			assert.Equal(t, tt.expected, counterValue, "Expected version %s to be %f", params.KernelVersion(), tt.expected)
 		})
 	}
 }

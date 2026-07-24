@@ -6,17 +6,20 @@ package agent
 import (
 	"context"
 	"iter"
+	"log/slog"
 	"maps"
 	"net"
 	"net/netip"
 	"slices"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/cilium/cilium/pkg/cidr"
+	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/option"
@@ -186,27 +189,23 @@ func containsIP(allowedIPs iter.Seq[net.IPNet], ipnet *net.IPNet) bool {
 	return false
 }
 
-func newTestAgent(ctx context.Context, wgClient wireguardClient) (*Agent, *ipcache.IPCache) {
-	// Mimic the same condition in NewAgent.
-	var needIPCacheEvents bool
-	if !option.Config.TunnelingEnabled() || option.Config.WireguardTrackAllIPsFallback {
-		needIPCacheEvents = true
-	}
+func newTestAgent(ctx context.Context, logger *slog.Logger, wgClient wireguardClient, config Config) (*Agent, *ipcache.IPCache) {
 	ipCache := ipcache.NewIPCache(&ipcache.Configuration{
 		Context: ctx,
+		Logger:  logger,
 	})
 	wgAgent := &Agent{
+		logger:           logger,
+		config:           config,
 		wgClient:         wgClient,
 		ipCache:          ipCache,
 		listenPort:       types.ListenPort,
 		peerByNodeName:   map[string]*peerConfig{},
 		nodeNameByNodeIP: map[string]string{},
 		nodeNameByPubKey: map[wgtypes.Key]string{},
-
-		needIPCacheEvents: needIPCacheEvents,
 	}
 	// Mimic the same condition in Agent.Init
-	if wgAgent.needIPCacheEvents {
+	if wgAgent.needsIPCache() {
 		ipCache.AddListener(wgAgent)
 	}
 	return wgAgent, ipCache
@@ -226,6 +225,26 @@ type config struct {
 	Expectations [][]expectation
 }
 
+// toAgentConfig returns the needed config for the WireGuard agent.
+func (c *config) toAgentConfig() Config {
+	return Config{
+		UserConfig: UserConfig{
+			EnableConfig: EnableConfig{
+				EnableWireguard: true,
+			},
+			WireguardTrackAllIPsFallback: c.Fallback,
+			WireguardPersistentKeepalive: 0,
+			NodeEncryptionOptOutLabels:   "",
+		},
+
+		StateDir:         "",
+		EnableIPv4:       true,
+		EnableIPv6:       true,
+		TunnelingEnabled: c.RoutingMode != option.RoutingModeNative,
+		EncryptNode:      false,
+	}
+}
+
 // CheckExpectations is used to assert that all current expectations are met.
 func (c *config) CheckExpectations(fn func(e expectation)) {
 	defer func() { c.Expectations = c.Expectations[1:] }()
@@ -235,8 +254,8 @@ func (c *config) CheckExpectations(fn func(e expectation)) {
 }
 
 // Expectations in TestAgent_PeerConfig are checked as follows:
-// 1. assertion on peer k8s1 after IPCache updates before UpdatePeer
-// 2. assertion on both peers k8s1 and k8s2 after IPCache updates blocked by a concurrent UpdatePeer
+// 1. assertion on peer k8s1 after IPCache updates before updatePeer
+// 2. assertion on both peers k8s1 and k8s2 after IPCache updates blocked by a concurrent updatePeer
 func TestAgent_PeerConfig(t *testing.T) {
 	var (
 		k8s1NodeIPv4Pfx, k8s1NodeIPv6Pfx = iputil.IPToPrefix(k8s1NodeIPv4), iputil.IPToPrefix(k8s1NodeIPv6)
@@ -269,27 +288,16 @@ func TestAgent_PeerConfig(t *testing.T) {
 		{"TunnelRouting Without Fallback", option.RoutingModeTunnel, false, tunnelRoutingAllowedIPs},
 	} {
 		t.Run(c.Name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			prevRoutingMode := option.Config.RoutingMode
-			defer func() { option.Config.RoutingMode = prevRoutingMode }()
-			option.Config.RoutingMode = c.RoutingMode
-
-			prevFallback := option.Config.WireguardTrackAllIPsFallback
-			defer func() { option.Config.WireguardTrackAllIPsFallback = prevFallback }()
-			option.Config.WireguardTrackAllIPsFallback = c.Fallback
-
-			wgAgent, ipCache := newTestAgent(ctx, newFakeWgClient())
+			wgAgent, ipCache := newTestAgent(t.Context(), hivetest.Logger(t), newFakeWgClient(), c.toAgentConfig())
 			defer ipCache.Shutdown()
 
-			// Test that IPCache updates before UpdatePeer are handled correctly
+			// Test that IPCache updates before updatePeer are handled correctly
 			ipCache.Upsert(pod1IPv4Str, k8s1NodeIPv4, 0, nil, ipcache.Identity{ID: 1, Source: source.Kubernetes})
 			ipCache.Upsert(pod1IPv6Str, k8s1NodeIPv6, 0, nil, ipcache.Identity{ID: 1, Source: source.Kubernetes})
 			ipCache.Upsert(pod2IPv4Str, k8s1NodeIPv4, 0, nil, ipcache.Identity{ID: 2, Source: source.Kubernetes})
 			ipCache.Upsert(pod2IPv6Str, k8s1NodeIPv6, 0, nil, ipcache.Identity{ID: 2, Source: source.Kubernetes})
 
-			err := wgAgent.UpdatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
+			err := wgAgent.updatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
 			require.NoError(t, err)
 
 			assertAllowedIPs := func(e expectation) {
@@ -302,17 +310,17 @@ func TestAgent_PeerConfig(t *testing.T) {
 
 			k8s1 := wgAgent.peerByNodeName[k8s1NodeName]
 			require.NotNil(t, k8s1)
-			require.EqualValues(t, k8s1NodeIPv4, k8s1.nodeIPv4)
-			require.EqualValues(t, k8s1NodeIPv6, k8s1.nodeIPv6)
+			require.Equal(t, k8s1NodeIPv4, k8s1.nodeIPv4)
+			require.Equal(t, k8s1NodeIPv6, k8s1.nodeIPv6)
 			require.Equal(t, k8s1PubKey, k8s1.pubKey.String())
 			c.CheckExpectations(assertAllowedIPs) // checks entry 1
 
-			// Tests that IPCache updates are blocked by a concurrent UpdatePeer.
-			// We test this by issuing an UpdatePeer request while holding
-			// the agent lock (meaning the UpdatePeer call will first take the IPCache
+			// Tests that IPCache updates are blocked by a concurrent updatePeer.
+			// We test this by issuing an updatePeer request while holding
+			// the agent lock (meaning the updatePeer call will first take the IPCache
 			// lock and then wait for the agent lock to become available),
 			// then issuing an IPCache update (which will be blocked because
-			// UpdatePeer already holds the IPCache lock), and then releasing the
+			// updatePeer already holds the IPCache lock), and then releasing the
 			// agent lock to allow both operations to proceed.
 			wgAgent.Lock()
 
@@ -320,7 +328,7 @@ func TestAgent_PeerConfig(t *testing.T) {
 			agentUpdatePending := make(chan struct{})
 			go func() {
 				close(agentUpdatePending)
-				err = wgAgent.UpdatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
+				err = wgAgent.updatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
 				require.NoError(t, err)
 				close(agentUpdated)
 			}()
@@ -356,7 +364,7 @@ func TestAgent_PeerConfig(t *testing.T) {
 			case <-agentUpdated:
 				t.Fatal("agent update not blocked by agent lock")
 			case <-ipCacheUpdated:
-				if wgAgent.needIPCacheEvents {
+				if wgAgent.needsIPCache() {
 					t.Fatal("ipcache update not blocked by agent lock")
 				}
 			default:
@@ -369,23 +377,23 @@ func TestAgent_PeerConfig(t *testing.T) {
 			<-ipCacheUpdated
 
 			k8s1 = wgAgent.peerByNodeName[k8s1NodeName]
-			require.EqualValues(t, k8s1NodeIPv4, k8s1.nodeIPv4)
-			require.EqualValues(t, k8s1NodeIPv6, k8s1.nodeIPv6)
+			require.Equal(t, k8s1NodeIPv4, k8s1.nodeIPv4)
+			require.Equal(t, k8s1NodeIPv6, k8s1.nodeIPv6)
 			require.Equal(t, k8s1PubKey, k8s1.pubKey.String())
 
 			k8s2 := wgAgent.peerByNodeName[k8s2NodeName]
-			require.EqualValues(t, k8s2NodeIPv4, k8s2.nodeIPv4)
-			require.EqualValues(t, k8s2NodeIPv6, k8s2.nodeIPv6)
+			require.Equal(t, k8s2NodeIPv4, k8s2.nodeIPv4)
+			require.Equal(t, k8s2NodeIPv6, k8s2.nodeIPv6)
 			require.Equal(t, k8s2PubKey, k8s2.pubKey.String())
 			c.CheckExpectations(assertAllowedIPs) // checks entry 2
 
 			// Tests that duplicate public keys are rejected (k8s2 imitates k8s1)
-			err = wgAgent.UpdatePeer(k8s2NodeName, k8s1PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
+			err = wgAgent.updatePeer(k8s2NodeName, k8s1PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
 			require.ErrorContains(t, err, "detected duplicate public key")
 
 			// Node Deletion
-			wgAgent.DeletePeer(k8s1NodeName)
-			wgAgent.DeletePeer(k8s2NodeName)
+			wgAgent.deletePeer(k8s1NodeName)
+			wgAgent.deletePeer(k8s2NodeName)
 			require.Empty(t, wgAgent.peerByNodeName)
 			require.Empty(t, wgAgent.nodeNameByNodeIP)
 			require.Empty(t, wgAgent.nodeNameByPubKey)
@@ -478,16 +486,6 @@ func TestAgent_AllowedIPsRestoration(t *testing.T) {
 		{"TunnelRouting Without Fallback", option.RoutingModeTunnel, false, tunnelRoutingAllowedIPs},
 	} {
 		t.Run(c.Name, func(t *testing.T) {
-			ctx := context.Background()
-
-			prevRoutingMode := option.Config.RoutingMode
-			defer func() { option.Config.RoutingMode = prevRoutingMode }()
-			option.Config.RoutingMode = c.RoutingMode
-
-			prevFallback := option.Config.WireguardTrackAllIPsFallback
-			defer func() { option.Config.WireguardTrackAllIPsFallback = prevFallback }()
-			option.Config.WireguardTrackAllIPsFallback = c.Fallback
-
 			key1, err := wgtypes.ParseKey(k8s1PubKey)
 			require.NoError(t, err, "Failed to parse WG key")
 
@@ -499,7 +497,7 @@ func TestAgent_AllowedIPsRestoration(t *testing.T) {
 				},
 			})
 
-			wgAgent, ipCache := newTestAgent(ctx, wgClient)
+			wgAgent, ipCache := newTestAgent(t.Context(), hivetest.Logger(t), wgClient, c.toAgentConfig())
 			defer ipCache.Shutdown()
 
 			assertAllowedIPs := func(e expectation) {
@@ -516,7 +514,7 @@ func TestAgent_AllowedIPsRestoration(t *testing.T) {
 			ipCache.Upsert(pod1IPv4Str, k8s1NodeIPv4, 0, nil, ipcache.Identity{ID: 1, Source: source.Kubernetes})
 			ipCache.Upsert(pod1IPv6Str, k8s1NodeIPv6, 0, nil, ipcache.Identity{ID: 1, Source: source.Kubernetes})
 
-			err = wgAgent.UpdatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
+			err = wgAgent.updatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
 			require.NoError(t, err, "Failed to update peer")
 
 			// Assert that the AllowedIPs are updated correctly, preserving the restored ones
@@ -531,39 +529,216 @@ func TestAgent_AllowedIPsRestoration(t *testing.T) {
 			// Associate previously restored allowed IPs with a different peer, and
 			// assert that the updates are propagated correctly, without flipping.
 			ipCache.Upsert(pod4IPv4Str, k8s2NodeIPv4, 0, nil, ipcache.Identity{ID: 1, Source: source.Kubernetes})
-			err = wgAgent.UpdatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
+			err = wgAgent.updatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
 			require.NoError(t, err, "Failed to update peer")
 			ipCache.Upsert(pod4IPv6Str, k8s2NodeIPv6, 0, nil, ipcache.Identity{ID: 1, Source: source.Kubernetes})
 
-			// We explicitly trigger UpdatePeer here to cause the allowed IPs to be
+			// We explicitly trigger updatePeer here to cause the allowed IPs to be
 			// synchronized, so that we can test that the cache got correctly updated.
-			err = wgAgent.UpdatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
+			err = wgAgent.updatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
 			require.NoError(t, err, "Failed to update peer")
 
 			c.CheckExpectations(assertAllowedIPs) // checks entry 3
 
 			// Run the GC process, and assert the AllowedIPs correctness again
-			require.NoError(t, wgAgent.RestoreFinished(nil))
+			require.NoError(t, wgAgent.restoreFinished())
 			c.CheckExpectations(assertAllowedIPs) // checks entry 4
 
 			// Ensure that a public key change results in deletion of the old peer entry.
-			err = wgAgent.UpdatePeer(k8s2NodeName, k8s2PubKey2, k8s2NodeIPv4, k8s2NodeIPv6)
+			err = wgAgent.updatePeer(k8s2NodeName, k8s2PubKey2, k8s2NodeIPv4, k8s2NodeIPv6)
 			require.NoError(t, err)
 			c.CheckExpectations(assertAllowedIPs) // checks entry 5
 
 			// Ensure that a node IP change gets reflected
-			err = wgAgent.UpdatePeer(k8s2NodeName, k8s2PubKey2, k8s2NodeIPv4_2, k8s2NodeIPv6_2)
+			err = wgAgent.updatePeer(k8s2NodeName, k8s2PubKey2, k8s2NodeIPv4_2, k8s2NodeIPv6_2)
 			require.NoError(t, err)
 			c.CheckExpectations(assertAllowedIPs) // checks entry 6
 
 			// Ensure that a public key change and node IP change gets reflected.
-			err = wgAgent.UpdatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
+			err = wgAgent.updatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
 			require.NoError(t, err)
 			c.CheckExpectations(assertAllowedIPs) // checks entry 7
 
 			// Ensure that a node IP change gets reflected
-			err = wgAgent.UpdatePeer(k8s2NodeName, wgDummyPeerKey.String(), k8s2NodeIPv4_2, k8s2NodeIPv6_2)
+			err = wgAgent.updatePeer(k8s2NodeName, wgDummyPeerKey.String(), k8s2NodeIPv4_2, k8s2NodeIPv6_2)
 			require.Error(t, err, "node %q is not allowed to use the dummy peer key", k8s2NodeName)
+		})
+	}
+}
+
+func TestAgent_PeerEndpointSelection(t *testing.T) {
+	tests := []struct {
+		name         string
+		config       Config
+		nodeIPv4     net.IP
+		nodeIPv6     net.IP
+		expectError  bool
+		expectedIP   net.IP
+		expectedPort int
+	}{
+		{
+			name: "IPv6 underlay with dual-stack selects IPv6 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.IPv6,
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     k8s1NodeIPv6,
+			expectedIP:   k8s1NodeIPv6,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "IPv4 underlay with dual-stack selects IPv4 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.IPv4,
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     k8s1NodeIPv6,
+			expectedIP:   k8s1NodeIPv4,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "Auto underlay with dual-stack selects IPv4 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.Auto,
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     k8s1NodeIPv6,
+			expectedIP:   k8s1NodeIPv4,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "Empty underlay with dual-stack selects IPv4 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.UnderlayProtocol(""),
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     k8s1NodeIPv6,
+			expectedIP:   k8s1NodeIPv4,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "Native routing with dual-stack selects IPv4 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: false,
+				UnderlayProtocol: tunnel.IPv6,
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     k8s1NodeIPv6,
+			expectedIP:   k8s1NodeIPv4,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "IPv6 underlay with IPv6-only cluster selects IPv6 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       false,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.IPv6,
+			},
+			nodeIPv4:     nil,
+			nodeIPv6:     k8s1NodeIPv6,
+			expectedIP:   k8s1NodeIPv6,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "IPv6 underlay without nodeIPv6 falls back to IPv4",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.IPv6,
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     nil,
+			expectedIP:   k8s1NodeIPv4,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "IPv4-only cluster selects IPv4 endpoint",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       false,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.IPv4,
+			},
+			nodeIPv4:     k8s1NodeIPv4,
+			nodeIPv6:     nil,
+			expectedIP:   k8s1NodeIPv4,
+			expectedPort: types.ListenPort,
+		},
+		{
+			name: "No node IPs returns error",
+			config: Config{
+				UserConfig: UserConfig{
+					EnableConfig: EnableConfig{EnableWireguard: true},
+				},
+				EnableIPv4:       true,
+				EnableIPv6:       true,
+				TunnelingEnabled: true,
+				UnderlayProtocol: tunnel.IPv4,
+			},
+			nodeIPv4:    nil,
+			nodeIPv6:    nil,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wgAgent, _ := newTestAgent(t.Context(), hivetest.Logger(t), newFakeWgClient(), tt.config)
+
+			err := wgAgent.updatePeer(k8s1NodeName, k8s1PubKey, tt.nodeIPv4, tt.nodeIPv6)
+
+			if tt.expectError {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+
+			peer := wgAgent.peerByNodeName[k8s1NodeName]
+			require.NotNil(t, peer)
+			require.NotNil(t, peer.endpoint)
+			require.Equal(t, tt.expectedIP.String(), peer.endpoint.IP.String())
+			require.Equal(t, tt.expectedPort, peer.endpoint.Port)
 		})
 	}
 }

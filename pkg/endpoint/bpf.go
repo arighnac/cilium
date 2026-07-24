@@ -9,14 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/google/renameio/v2"
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
@@ -26,33 +24,26 @@ import (
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
-	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	"github.com/cilium/cilium/pkg/identity"
+	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/loadinfo"
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
-	"github.com/cilium/cilium/pkg/maps/lxcmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	policyapi "github.com/cilium/cilium/pkg/policy/api"
-	"github.com/cilium/cilium/pkg/policy/trafficdirection"
+	policytypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/revert"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/u8proto"
-	"github.com/cilium/cilium/pkg/version"
 )
 
 const (
 	// EndpointGenerationTimeout specifies timeout for proxy completion context
 	EndpointGenerationTimeout = 330 * time.Second
-
-	// ciliumCHeaderPrefix is the prefix using when printing/writing an endpoint in a
-	// base64 form.
-	ciliumCHeaderPrefix = "CILIUM_BASE64_"
 )
 
 var (
@@ -83,24 +74,13 @@ func init() {
 	}
 }
 
-// policyMapPath returns the path to the policy map of endpoint.
-func (e *Endpoint) policyMapPath() string {
-	return bpf.LocalMapPath(policymap.MapName, e.ID)
-}
-
 // callsMapPath returns the path to cilium tail calls map of an endpoint.
 func (e *Endpoint) callsMapPath() string {
-	return e.owner.Loader().CallsMapPath(e.ID)
-}
-
-// callsCustomMapPath returns the path to cilium custom tail calls map of an
-// endpoint.
-func (e *Endpoint) customCallsMapPath() string {
-	return e.owner.Loader().CustomCallsMapPath(e.ID)
+	return e.loader.CallsMapPath(e.ID)
 }
 
 // writeInformationalComments writes annotations to the specified writer,
-// including a base64 encoding of the endpoint object, and human-readable
+// including information about the endpoint, and human-readable
 // strings describing the configuration of the datapath.
 //
 // For configuration of actual datapath behavior, see WriteEndpointConfig().
@@ -112,26 +92,7 @@ func (e *Endpoint) writeInformationalComments(w io.Writer) error {
 	fmt.Fprint(fw, "/*\n")
 	fmt.Fprintln(fw, " * This file is not using during compilation of endpoint programs.")
 
-	epStr64, err := e.base64()
-	if err == nil {
-		var verBase64 string
-		verBase64, err = version.Base64()
-		if err == nil {
-			// Current versions ignore the comment, but we need to retain it
-			// so that downgrades work.
-			fmt.Fprintln(fw, " * The line below is retained for backwards compatibility only.")
-			fmt.Fprintf(fw, " * %s%s:%s\n * \n", ciliumCHeaderPrefix,
-				verBase64, epStr64)
-		}
-	}
-	if err != nil {
-		e.logStatusLocked(BPF, Warning, fmt.Sprintf("Unable to create a base64: %s", err))
-	}
-
-	if cid := e.GetContainerID(); cid == "" {
-		fmt.Fprintf(fw, " * Docker Network ID: %s\n", e.dockerNetworkID)
-		fmt.Fprintf(fw, " * Docker Endpoint ID: %s\n", e.dockerEndpointID)
-	} else {
+	if cid := e.GetContainerID(); cid != "" {
 		fmt.Fprintf(fw, " * Container ID: %s\n", cid)
 		fmt.Fprintf(fw, " * Container Interface: %s\n", e.containerIfName)
 	}
@@ -174,9 +135,10 @@ func (e *Endpoint) writeInformationalComments(w io.Writer) error {
 // e.mutex must be write-locked.
 func (e *Endpoint) writeHeaderfile(prefix string) error {
 	headerPath := filepath.Join(prefix, common.CHeaderFileName)
-	e.getLogger().WithFields(logrus.Fields{
-		logfields.Path: headerPath,
-	}).Debug("writing header file")
+	e.getLogger().Debug(
+		"writing header file",
+		logfields.Path, headerPath,
+	)
 
 	// Write state as a plain JSON.
 	jsonState, err := e.MarshalJSON()
@@ -204,21 +166,22 @@ func (e *Endpoint) writeHeaderfile(prefix string) error {
 	}
 	defer f.Cleanup()
 
-	if e.DNSRulesV2 != nil {
-		// Note: e.DNSRulesV2 is updated by syncEndpointHeaderFile and regenerateBPF
+	if e.DNSRules != nil {
+		// Note: e.DNSRules is updated by syncEndpointHeaderFile and regenerateBPF
 		// before they call into writeHeaderfile, because GetDNSRules must not be
 		// called with endpoint.mutex held.
-		e.getLogger().WithFields(logrus.Fields{
-			logfields.Path: headerPath,
-			"DNSRulesV2":   e.DNSRulesV2,
-		}).Debug("writing header file with DNSRules")
+		e.getLogger().Debug(
+			"writing header file with DNSRules",
+			logfields.Path, headerPath,
+			logfields.DNSRules, e.DNSRules,
+		)
 	}
 
 	if err = e.writeInformationalComments(f); err != nil {
 		return err
 	}
 
-	if err = e.owner.Orchestrator().WriteEndpointConfig(f, e); err != nil {
+	if err = e.orchestrator.WriteEndpointConfig(f, e); err != nil {
 		return err
 	}
 
@@ -230,14 +193,19 @@ func (e *Endpoint) writeHeaderfile(prefix string) error {
 // instead of returning a 0 port number.
 type proxyPolicy struct {
 	*policy.L4Filter
+	l7Parser policy.L7ParserType
 	listener string
 	port     uint16
 	protocol u8proto.U8proto
 }
 
 // newProxyPolicy returns a new instance of proxyPolicy by value
-func newProxyPolicy(l4 *policy.L4Filter, listener string, port uint16, proto u8proto.U8proto) proxyPolicy {
-	return proxyPolicy{L4Filter: l4, listener: listener, port: port, protocol: proto}
+func newProxyPolicy(l4 *policy.L4Filter, l7Parser policy.L7ParserType, listener string, port uint16, proto u8proto.U8proto) proxyPolicy {
+	return proxyPolicy{L4Filter: l4, l7Parser: l7Parser, listener: listener, port: port, protocol: proto}
+}
+
+func (p *proxyPolicy) GetL7Parser() policy.L7ParserType {
+	return p.l7Parser
 }
 
 // GetPort returns the destination port number on which the proxy policy applies
@@ -260,11 +228,12 @@ func (p *proxyPolicy) GetListener() string {
 // The returned map contains the exact set of IDs of proxy redirects that is
 // required to implement the given L4 policy.
 // Only called after a new selector policy has been computed.
-func (e *Endpoint) addNewRedirects(selectorPolicy policy.SelectorPolicy, proxyWaitGroup *completion.WaitGroup) (desiredRedirects map[string]uint16, rf revert.RevertFunc) {
-	if e.isProperty(PropertyFakeEndpoint) || e.IsProxyDisabled() {
-		return nil, nil
+func (e *Endpoint) addNewRedirects(selectorPolicy policy.SelectorPolicy, proxyWaitGroup *completion.WaitGroup) (desiredRedirects map[string]uint16, skipped uint, rf revert.RevertFunc) {
+	if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) || e.IsProxyDisabled() {
+		return nil, 0, nil
 	}
 
+	selectors := selectorPolicy.GetSelectorSnapshot()
 	desiredRedirects = make(map[string]uint16)
 
 	var (
@@ -273,48 +242,56 @@ func (e *Endpoint) addNewRedirects(selectorPolicy policy.SelectorPolicy, proxyWa
 	)
 
 	// create or update proxy redirects
-	for l4, perSelectorPolicy := range selectorPolicy.RedirectFilters() {
+	for l4, policySelectorTuple := range selectorPolicy.RedirectFilters() {
 		// Possible listener name for both the proxy ID and the proxyPolicy below.
-		listener := perSelectorPolicy.GetListener()
+		listener := policySelectorTuple.Policy.GetListener()
 
-		// proxyID() returns also the destination port for the policy,
-		// which may be resolved from a named port
-		proxyID, dstPort, dstProto := e.proxyID(l4, listener)
-		if proxyID == "" {
-			// Skip redirects for which a proxyID cannot be created.
-			// This may happen due to the named port mapping not
-			// existing or multiple PODs defining the same port name
-			// with different port values. The redirect will be created
-			// when the mapping is available or when the port name
-			// conflicts have been resolved in POD specs.
-			continue
-		}
-		// desiredRedirects starts out empty, so we can use it check
-		// if the redirect has already been updated on this round.
-		if desiredRedirects[proxyID] != 0 {
-			continue
-		}
+		n := 0
+		for proxyID, dstPort := range e.proxyIDs(selectorPolicy, l4, listener, selectors) {
+			n++
+			// desiredRedirects starts out empty, so we can use it to check if this
+			// redirect has already been updated on this round.
+			if desiredRedirects[proxyID] != 0 {
+				continue
+			}
+			pp := newProxyPolicy(l4, policySelectorTuple.Policy.L7Parser, listener, dstPort, l4.U8Proto)
+			proxyPort, err, revertFunc := e.proxy.CreateOrUpdateRedirect(e.aliveCtx, &pp, proxyID, e.ID, proxyWaitGroup)
+			if err != nil {
+				// Skip redirects that can not be created or updated.  This
+				// can happen when a listener is missing, for example when
+				// restarting and k8s delivers the CNP before the related
+				// CEC.
+				// Policy is regenerated when listeners are added or removed
+				// to fix this condition when the listener is available.
+				if listener != "" {
+					e.getLogger().Debug(
+						"Redirect rule with missing listener skipped, will be applied once the listener is available",
+						logfields.Error, err,
+						logfields.Listener, listener,
+					)
+				} else {
+					e.getLogger().Error(
+						"Redirect rule with missing listener skipped, policy will drop",
+						logfields.Error, err,
+					)
 
-		pp := newProxyPolicy(l4, listener, dstPort, dstProto)
-		proxyPort, err, revertFunc := e.proxy.CreateOrUpdateRedirect(e.aliveCtx, &pp, proxyID, e.ID, proxyWaitGroup)
-		if err != nil {
-			// Skip redirects that can not be created or updated.  This
-			// can happen when a listener is missing, for example when
-			// restarting and k8s delivers the CNP before the related
-			// CEC.
-			// Policy is regenerated when listeners are added or removed
-			// to fix this condition when the listener is available.
-			e.getLogger().WithField(logfields.Listener, pp.GetListener()).WithError(err).Debug("Redirect rule with missing listener skipped, will be applied once the listener is available")
-			continue
-		}
-		revertStack.Push(revertFunc)
-		desiredRedirects[proxyID] = proxyPort
+				}
+				skipped++
+				continue
+			}
+			revertStack.Push(revertFunc)
+			desiredRedirects[proxyID] = proxyPort
 
-		// Update the endpoint API model to report that Cilium manages a
-		// redirect for that port.
-		statsKey := policy.ProxyStatsKey(l4.Ingress, string(l4.Protocol), dstPort, proxyPort)
-		proxyStats := e.getProxyStatistics(statsKey, string(l4.L7Parser), dstPort, l4.Ingress, proxyPort)
-		updatedStats = append(updatedStats, proxyStats)
+			// Update the endpoint API model to report that Cilium manages a
+			// redirect for that port.
+			statsKey := policy.ProxyStatsKey(l4.Ingress, string(l4.Protocol), dstPort, proxyPort)
+			proxyStats := e.getProxyStatistics(statsKey, string(policySelectorTuple.Policy.L7Parser), dstPort, l4.Ingress, proxyPort)
+			updatedStats = append(updatedStats, proxyStats)
+		}
+		// count missing proxy port mapping as skipped
+		if n == 0 {
+			skipped++
+		}
 	}
 
 	// revert function is called with endpoint mutex held
@@ -329,13 +306,13 @@ func (e *Endpoint) addNewRedirects(selectorPolicy policy.SelectorPolicy, proxyWa
 		return nil
 	})
 
-	return desiredRedirects, revertStack.Revert
+	return desiredRedirects, skipped, revertStack.Revert
 }
 
 // Must be called with endpoint.mutex locked for writing, as this calls back to
 // 'e.OnDNSPolicyUpdateLocked()'.
 func (e *Endpoint) removeOldRedirects(desiredRedirects, realizedRedirects map[string]uint16) {
-	if e.isProperty(PropertyFakeEndpoint) || e.IsProxyDisabled() {
+	if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) || e.IsProxyDisabled() {
 		return
 	}
 
@@ -359,7 +336,10 @@ func (e *Endpoint) removeOldRedirects(desiredRedirects, realizedRedirects map[st
 		if proxyStats, ok := e.proxyStatistics[key]; ok {
 			proxyStats.AllocatedProxyPort = 0
 		} else {
-			e.getLogger().WithField(logfields.L4PolicyID, id).Warn("Proxy stats not found")
+			e.getLogger().Warn(
+				"Proxy stats not found",
+				logfields.L4PolicyID, id,
+			)
 		}
 		e.proxyStatisticsMutex.Unlock()
 	}
@@ -382,11 +362,18 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 
 	datapathRegenCtxt := regenContext.datapathRegenerationContext
 
+	// Wait for the datapath to be initialized before we take the compilation read lock.
+	// If we take the read lock before the datapath is initialized, we end up blocking
+	// the datapath initialization which needs the write lock on `e.compilationLock`.
+	// Yet, we will be blocked while waiting for the initialization to finish, thus causing
+	// a deadlock.
+	<-e.orchestrator.DatapathInitialized()
+
 	// Make sure that owner is not compiling base programs while we are
 	// regenerating an endpoint.
-	e.owner.GetCompilationLock().RLock()
+	e.compilationLock.RLock()
 	stats.waitingForLock.End(true)
-	defer e.owner.GetCompilationLock().RUnlock()
+	defer e.compilationLock.RUnlock()
 
 	if err := e.aliveCtx.Err(); err != nil {
 		return 0, fmt.Errorf("endpoint was closed while waiting for datapath lock: %w", err)
@@ -396,40 +383,70 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 	defer datapathRegenCtxt.completionCancel()
 
 	err = e.runPreCompilationSteps(regenContext)
-	// Keep track of the side-effects of the regeneration that need to be
-	// reverted in case of failure.
-	// Also keep track of the regeneration finalization code that can't be
-	// reverted, and execute it in case of regeneration success.
-	defer func() {
-		// Ignore finalizing of proxy state in dry mode.
-		if !e.isProperty(PropertyFakeEndpoint) &&
-			option.Config.DatapathMode != datapathOption.DatapathModeLBOnly {
-			e.finalizeProxyState(regenContext, reterr)
-		}
-	}()
+
+	// Ignore finalizing of proxy state in dry mode.
+	if !e.IsProperty(endpointtypes.PropertyFakeEndpoint) {
+		// Keep track of the side-effects of the regeneration that need to be
+		// reverted in case of failure.
+		// Also keep track of the regeneration finalization code that can't be
+		// reverted, and execute it in case of regeneration success.
+		defer e.finalizeEndpointRegeneration(regenContext, reterr)
+	}
 
 	if err != nil {
 		return 0, err
 	}
 
+	// Avoid BPF program compilation and installation if the endpoint or node
+	// configuration hasn't changed. Hashing the endpoint configuration requires
+	// getting the security identity, which takes out a read lock on the Endpoint.
+	// Make sure to calculate the endpoint hash outside of a locked context.
+	datapathRegenCtxt.bpfHeaderfilesHash, err = e.orchestrator.EndpointHash(e)
+	if err != nil {
+		return 0, newRegenerationErrorf(regenerationFailureReasonDatapathOrchestrationError, "hash endpoint configuration: %w", err)
+	}
+
+	if datapathRegenCtxt.bpfHeaderfilesHash != e.bpfHeaderfileHash {
+		e.getLogger().Debug(
+			"BPF endpoint configuration hashed",
+			logfields.BPFHeaderfileHashOld, e.bpfHeaderfileHash,
+			logfields.BPFHeaderfileHash, datapathRegenCtxt.bpfHeaderfilesHash,
+		)
+
+		datapathRegenCtxt.regenerationLevel = regeneration.RegenerateWithDatapath
+	}
+
+	if err := e.lockAlive(); err != nil {
+		return 0, err
+	}
+	dir := datapathRegenCtxt.currentDir
+	if datapathRegenCtxt.regenerationLevel >= regeneration.RegenerateWithDatapath {
+		if err := e.writeHeaderfile(datapathRegenCtxt.nextDir); err != nil {
+			e.unlock()
+			return 0, newRegenerationErrorf(regenerationFailureReasonDatapathOrchestrationError, "write endpoint header file: %w", err)
+		}
+		dir = datapathRegenCtxt.nextDir
+	}
+	datapathRegenCtxt.epInfoCache = e.createEpInfoCache(dir)
+	e.unlock()
+
 	// No need to compile BPF in dry mode. Also, in lb-only mode we do not
 	// support local Pods on the worker node, hence endpoint BPF regeneration
 	// is skipped everywhere.
-	if e.isProperty(PropertyFakeEndpoint) ||
-		(option.Config.DatapathMode == datapathOption.DatapathModeLBOnly && !datapathRegenCtxt.epInfoCache.IsHost()) {
-		return e.nextPolicyRevision, nil
+	if e.IsProperty(endpointtypes.PropertyFakeEndpoint) {
+		return e.desiredPolicyRevision, nil
 	}
 
 	// Skip BPF if the endpoint has no policy map
-	if e.isProperty(PropertySkipBPFPolicy) {
+	if e.IsProperty(endpointtypes.PropertySkipBPFPolicy) {
 		// Ingress endpoint needs entries in the endpoints map so that the return traffic,
 		// ARP, and IPv6 ND are delivered to the host stack in all datapath configurations.
-		if e.isProperty(PropertyAtHostNS) {
+		if e.IsProperty(endpointtypes.PropertyAtHostNS) {
 			stats.mapSync.Start()
-			err = lxcmap.WriteEndpoint(datapathRegenCtxt.epInfoCache)
+			err = e.lxcMap.WriteEndpoint(datapathRegenCtxt.epInfoCache)
 			stats.mapSync.End(err == nil)
 			if err != nil {
-				return 0, fmt.Errorf("Exposing endpoint in endpoints BPF map failed: %w", err)
+				return 0, newRegenerationErrorf(regenerationFailureReasonBPFError, "exposing endpoint in endpoints BPF map failed: %w", err)
 			}
 		}
 
@@ -442,10 +459,10 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 		err = e.waitForProxyCompletions(datapathRegenCtxt.proxyWaitGroup)
 		stats.proxyWaitForAck.End(err == nil)
 		if err != nil {
-			return 0, fmt.Errorf("Error while updating network policy: %w", err)
+			return 0, newRegenerationErrorf(regenerationFailureReasonProxyPolicyError, "error waiting for proxy network policy update: %w", err)
 		}
 
-		return e.nextPolicyRevision, nil
+		return e.desiredPolicyRevision, nil
 	}
 
 	// Wait for connection tracking cleaning to complete
@@ -453,18 +470,26 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 	<-datapathRegenCtxt.ctCleaned
 	stats.waitingForCTClean.End(true)
 
-	err = e.realizeBPFState(regenContext)
-	if err != nil {
-		return datapathRegenCtxt.epInfoCache.revision, err
+	if datapathRegenCtxt.regenerationLevel >= regeneration.RegenerateWithDatapath {
+		err = e.realizeBPFState(regenContext)
+		if err != nil {
+			return datapathRegenCtxt.epInfoCache.revision, newRegenerationError(regenerationFailureReasonDatapathOrchestrationError, err)
+		}
+	} else {
+		e.getLogger().Debug(
+			"Skipping BPF datapath regeneration",
+			fieldRegenLevel, datapathRegenCtxt.regenerationLevel,
+			logfields.BPFHeaderfileHash, datapathRegenCtxt.bpfHeaderfilesHash,
+		)
 	}
 
 	if !datapathRegenCtxt.epInfoCache.IsHost() || option.Config.EnableHostFirewall {
 		// Hook the endpoint into the endpoint and endpoint to policy tables then expose it
 		stats.mapSync.Start()
-		err = lxcmap.WriteEndpoint(datapathRegenCtxt.epInfoCache)
+		err = e.lxcMap.WriteEndpoint(datapathRegenCtxt.epInfoCache)
 		stats.mapSync.End(err == nil)
 		if err != nil {
-			return 0, fmt.Errorf("Exposing new BPF failed: %w", err)
+			return 0, newRegenerationErrorf(regenerationFailureReasonBPFError, "exposing endpoint in endpoints BPF map failed: %w", err)
 		}
 	}
 
@@ -481,7 +506,7 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 	err = e.waitForProxyCompletions(datapathRegenCtxt.proxyWaitGroup)
 	stats.proxyWaitForAck.End(err == nil)
 	if err != nil {
-		return 0, fmt.Errorf("error while configuring proxy redirects: %w", err)
+		return 0, newRegenerationErrorf(regenerationFailureReasonProxyPolicyError, "error waiting for proxy network policy update: %w", err)
 	}
 
 	stats.waitingForLock.Start()
@@ -497,7 +522,7 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 	if !datapathRegenCtxt.policyMapSyncDone {
 		err = e.policyMapSync(datapathRegenCtxt.policyMapDump, stats)
 		if err != nil {
-			return 0, fmt.Errorf("unable to regenerate policy because PolicyMap synchronization failed: %w", err)
+			return 0, newRegenerationErrorf(regenerationFailureReasonPolicyBPFError, "policymap synchronization failed: %w", err)
 		}
 		datapathRegenCtxt.policyMapSyncDone = true
 	}
@@ -539,39 +564,39 @@ func (e *Endpoint) policyMapSync(policyMapDump policy.MapStateMap, stats *regene
 func (e *Endpoint) realizeBPFState(regenContext *regenerationContext) (err error) {
 	stats := &regenContext.Stats
 	datapathRegenCtxt := regenContext.datapathRegenerationContext
-	debugEnabled := logging.CanLogAt(e.getLogger().Logger, logrus.DebugLevel)
 
-	if debugEnabled {
-		e.getLogger().WithFields(logrus.Fields{fieldRegenLevel: datapathRegenCtxt.regenerationLevel}).Debug("Preparing to compile BPF")
+	e.getLogger().Debug(
+		"Preparing to compile and reload BPF datapath",
+		fieldRegenLevel, datapathRegenCtxt.regenerationLevel,
+	)
+
+	if e.Options.IsEnabled(option.Debug) {
+		debugFunc := func(format string, args ...any) {
+			e.getLogger().Debug(fmt.Sprintf(format, args...))
+		}
+		ctx, cancel := context.WithCancel(regenContext.parentContext)
+		defer cancel()
+		loadinfo.LogPeriodicSystemLoad(ctx, debugFunc, time.Second)
 	}
 
-	if datapathRegenCtxt.regenerationLevel > regeneration.RegenerateWithoutDatapath {
-		if debugEnabled {
-			debugFunc := log.WithFields(logrus.Fields{logfields.EndpointID: e.StringID()}).Debugf
-			ctx, cancel := context.WithCancel(regenContext.parentContext)
-			defer cancel()
-			loadinfo.LogPeriodicSystemLoad(ctx, debugFunc, time.Second)
+	// Compile and install BPF programs for this endpoint
+	templateHash, err := e.orchestrator.ReloadDatapath(datapathRegenCtxt.completionCtx, datapathRegenCtxt.epInfoCache, &stats.datapathRealization)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			e.getLogger().Error(
+				"Error while reloading endpoint BPF program",
+				logfields.Error, err,
+			)
 		}
-
-		// Compile and install BPF programs for this endpoint
-		templateHash, err := e.owner.Orchestrator().ReloadDatapath(datapathRegenCtxt.completionCtx, datapathRegenCtxt.epInfoCache, &stats.datapathRealization)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				e.getLogger().WithError(err).Error("Error while reloading endpoint BPF program")
-			}
-			return err
-		}
-
-		if err := os.WriteFile(filepath.Join(datapathRegenCtxt.nextDir, defaults.TemplateIDPath), []byte(templateHash+"\n"), 0644); err != nil {
-			return fmt.Errorf("unable to write template id: %w", err)
-		}
-
-		e.getLogger().Info("Reloaded endpoint BPF program")
-		e.bpfHeaderfileHash = datapathRegenCtxt.bpfHeaderfilesHash
-	} else if debugEnabled {
-		e.getLogger().WithField(logfields.BPFHeaderfileHash, datapathRegenCtxt.bpfHeaderfilesHash).
-			Debug("BPF header file unchanged, skipping BPF compilation and installation")
+		return err
 	}
+
+	if err := os.WriteFile(filepath.Join(datapathRegenCtxt.nextDir, defaults.TemplateIDPath), []byte(templateHash+"\n"), 0o644); err != nil {
+		return fmt.Errorf("unable to write template id: %w", err)
+	}
+
+	e.getLogger().Info("Reloaded endpoint BPF program")
+	e.bpfHeaderfileHash = datapathRegenCtxt.bpfHeaderfilesHash
 
 	return nil
 }
@@ -585,6 +610,15 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 	stats := &regenContext.Stats
 	datapathRegenCtxt := regenContext.datapathRegenerationContext
 
+	// Signal computation of the initial Envoy policy even if we fail out so
+	// that Envoy xDS server can start serving even if some endpoint
+	// computations fail.
+	defer func() {
+		e.unconditionalLock()
+		e.initialPolicyComputedLocked()
+		e.unlock()
+	}()
+
 	// lock the endpoint, read our values, then unlock
 	err := e.lockAlive()
 	if err != nil {
@@ -592,7 +626,7 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 	}
 	identityRevision := e.identityRevision
 	e.unlock()
-	policyRevision := e.policyGetter.GetPolicyRepository().GetRevision()
+	policyRevision := e.policyRepo.GetRevision()
 
 	// regenerate policy without holding the lock.
 	// This is because policy generation needs the ipcache to make progress, and the ipcache
@@ -607,15 +641,23 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 		err := e.regeneratePolicy(stats, datapathRegenCtxt)
 		stats.policyCalculation.End(err == nil)
 		if err != nil {
-			return fmt.Errorf("unable to regenerate policy for '%s': %w", e.StringID(), err)
+			return newRegenerationError(regenerationFailureReasonPolicyRegenerationError, err)
 		}
+	}
+
+	// Once the policy has been calculated, we can update the standalone dns proxy as well.
+	// We need to send the snapshot of the policyRules to SDP.
+	if !e.IsProperty(endpointtypes.PropertyFakeEndpoint) && !e.IsProxyDisabled() && e.proxy.IsSDPEnabled() {
+		e.getLogger().Debug("Updating standalone DNS proxy with policy rules")
+		policyRules := e.policyFetcher.GetPolicySnapshot()
+		e.proxy.UpdateSDP(policyRules)
 	}
 
 	// Any possible DNS redirects had their rules updated by 'e.regeneratePolicy' above, so we
 	// can get the new DNS rules for restoration now, before we take the endpoint lock below.
 	// NOTE: Endpoint lock must not be held during 'GetDNSRules' as it locks IPCache, which
 	// leads to a deadlock if endpoint lock is held.
-	rules := e.owner.GetDNSRules(e.ID)
+	rules := e.dnsRulesAPI.GetDNSRules(e.ID)
 
 	stats.waitingForLock.Start()
 	err = e.lockAlive()
@@ -631,17 +673,8 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 	// pre-existing connections using that IP are now invalid.
 	if !e.ctCleaned {
 		go func() {
-			if !e.isProperty(PropertyFakeEndpoint) &&
-				option.Config.DatapathMode != datapathOption.DatapathModeLBOnly {
-				ipv4 := option.Config.EnableIPv4
-				ipv6 := option.Config.EnableIPv6
-				exists := ctmap.Exists(nil, ipv4, ipv6)
-				if e.ConntrackLocal() {
-					exists = ctmap.Exists(e, ipv4, ipv6)
-				}
-				if exists {
-					e.scrubIPsInConntrackTable()
-				}
+			if !e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) {
+				e.scrubIPsInConntrackTable()
 			}
 			close(datapathRegenCtxt.ctCleaned)
 		}()
@@ -655,7 +688,7 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 	// where an unnecessary policy computation was skipped. In that case
 	// e.desiredPolicy == e.realizedPolicy also after this call.
 	if err := e.setDesiredPolicy(datapathRegenCtxt); err != nil {
-		return err
+		return newRegenerationError(regenerationFailureReasonEndpointPolicyUpdateError, err)
 	}
 	// Mark the new desired policy as ready when done before the lock is released
 	if e.desiredPolicy != e.realizedPolicy {
@@ -686,11 +719,11 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 		// bpf policy maps have been synchronized for the new policy.
 		err = e.applyPolicyMapChangesLocked(regenContext, e.desiredPolicy != e.realizedPolicy)
 		if err != nil && !errors.Is(err, ErrPolicyEntryMaxExceeded) {
-			return err
+			return newRegenerationError(regenerationFailureReasonPolicyBPFError, err)
 		}
 
 		// Signal computation of the initial Envoy policy if not done yet
-		e.InitialPolicyComputedLocked()
+		e.initialPolicyComputedLocked()
 	}
 
 	currentDir := datapathRegenCtxt.currentDir
@@ -703,32 +736,35 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 	e.setDNSRulesLocked(rules)
 
 	// If dry mode is enabled, no further changes to BPF maps are performed
-	if e.isProperty(PropertySkipBPFPolicy) {
+	if e.isPropertyLocked(endpointtypes.PropertySkipBPFPolicy) {
 		// Ingress endpoint needs epInfoCache for endpointmap population
-		if e.isProperty(PropertyAtHostNS) {
+		if e.isPropertyLocked(endpointtypes.PropertyAtHostNS) {
 			datapathRegenCtxt.epInfoCache = e.createEpInfoCache(currentDir)
 		}
 
-		if e.isProperty(PropertyFakeEndpoint) {
+		if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) {
 			if err = e.writeHeaderfile(nextDir); err != nil {
-				return fmt.Errorf("Unable to write header file: %w", err)
+				return newRegenerationErrorf(regenerationFailureReasonDatapathOrchestrationError, "unable to write header file: %w", err)
 			}
 		}
 		return nil
 	}
 
 	if e.policyMap == nil {
-		e.policyMap, err = policymap.OpenOrCreate(e.policyMapPath())
+		if e.policyMapFactory == nil {
+			return newRegenerationError(regenerationFailureReasonPolicyBPFError, errors.New("endpoint has nil policyMapFactory"))
+		}
+		e.policyMap, err = e.policyMapFactory.OpenEndpoint(e.ID)
 		if err != nil {
-			return err
+			return newRegenerationErrorf(regenerationFailureReasonPolicyBPFError, "failed to open endpoint BPF policymap: %w", err)
 		}
 	}
 
 	// Collect a dump of the bpf policymap if needed for the sync.
 	if e.realizedPolicy != e.desiredPolicy && e.realizedPolicy.Empty() {
-		datapathRegenCtxt.policyMapDump, err = e.dumpPolicyMapToMapStateMap()
+		datapathRegenCtxt.policyMapDump, err = e.policyMap.DumpToMapStateMap()
 		if err != nil {
-			return fmt.Errorf("policymap dump failed: %w", err)
+			return newRegenerationErrorf(regenerationFailureReasonPolicyBPFError, "policymap dump failed: %w", err)
 		}
 
 		// Sync policy map before bpf compilation if the bpf policymap is empty.
@@ -736,13 +772,49 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 		if len(datapathRegenCtxt.policyMapDump) == 0 {
 			err = e.policyMapSync(nil, stats)
 			if err != nil {
-				return fmt.Errorf("policymap synchronization failed: %w", err)
+				return newRegenerationErrorf(regenerationFailureReasonPolicyBPFError, "policymap synchronization failed: %w", err)
 			}
+			datapathRegenCtxt.policyMapSyncDone = true
+		} else {
+			// There is an edge case where on startup, the policy map for an endpoint
+			// is not empty (policyMapDump > 0) but no policy has been realized yet (realizedPolicy is empty).
+			// Default policy may exist in map to allow all ingress/egress traffic, something like this:
+			// --------------------------------------------------------------------------------------------------------------------------
+			// POLICY   DIRECTION   LABELS (source:key[=value])   PORT/PROTO   PROXY PORT   AUTH TYPE   BYTES   PACKETS   PREFIX
+			// Allow    Ingress     ANY                           ANY          NONE         disabled    2426    29        0
+			// Allow    Ingress     reserved:host                 ANY          NONE         disabled    0       0         0
+			// Allow    Egress      ANY                           ANY          NONE         disabled    30639   165       0
+			// ----------------------------------------------------------------------------------------------------------------------------
+			// If the code has reached here, it means:
+			// 1. The endpoint has a policy map that is not empty (default policy exists)
+			// 2. No policies has been realized (realized policy is empty)
+			// 3. New policies need to be applied for this endpoint (hence desiredPolicy != realizedPolicy)
+			// GH-37724: https://github.com/cilium/cilium/issues/37724
+			e.getLogger().Debug(
+				"Policy map is not empty, but no policy has been realized yet, setting policyMapSyncDone to false",
+			)
+			// Ensure that e.realizedPolicy actually represents the
+			// current policy map state in case rollback is
+			// necessary, so we don't try to "roll back" to an empty
+			// map and delete all the entries, even momentarily.
+			// This may be the case if the agent just restarted,
+			// for example. See GH-38998.
+			e.realizedPolicy.CopyMapStateFrom(datapathRegenCtxt.policyMapDump)
+			// Not strictly required to set as false, but it is a good idea to absolutely
+			// ensure that the policy map is in sync with the desired policy.
+			datapathRegenCtxt.policyMapSyncDone = false
 		}
-		datapathRegenCtxt.policyMapSyncDone = true
 	}
 
-	if e.isProperty(PropertySkipBPFRegeneration) {
+	// sync policy map for fake endpoints, bpf compilation will be skipped for them.
+	if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) {
+		err = e.policyMapSync(nil, stats)
+		if err != nil {
+			return newRegenerationErrorf(regenerationFailureReasonPolicyBPFError, "fake ep policymap synchronization failed: %w", err)
+		}
+	}
+
+	if e.isPropertyLocked(endpointtypes.PropertySkipBPFRegeneration) {
 		return nil
 	}
 
@@ -751,36 +823,10 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 		stats.prepareBuild.End(preCompilationError == nil)
 	}()
 
-	// Avoid BPF program compilation and installation if the headerfile for the endpoint
-	// or the node have not changed.
-	datapathRegenCtxt.bpfHeaderfilesHash, err = e.owner.Orchestrator().EndpointHash(e)
-	if err != nil {
-		return fmt.Errorf("hash header file: %w", err)
-	}
-
-	if datapathRegenCtxt.bpfHeaderfilesHash != e.bpfHeaderfileHash {
-		if logger := e.getLogger(); logging.CanLogAt(logger.Logger, logrus.DebugLevel) {
-			logger.WithField(logfields.BPFHeaderfileHash, datapathRegenCtxt.bpfHeaderfilesHash).
-				Debugf("BPF header file hashed (was: %q)", e.bpfHeaderfileHash)
-		}
-
-		datapathRegenCtxt.regenerationLevel = regeneration.RegenerateWithDatapath
-	}
-
-	if datapathRegenCtxt.regenerationLevel >= regeneration.RegenerateWithDatapath {
-		if err := e.writeHeaderfile(nextDir); err != nil {
-			return fmt.Errorf("unable to write header file: %w", err)
-		}
-
-		datapathRegenCtxt.epInfoCache = e.createEpInfoCache(nextDir)
-	} else {
-		datapathRegenCtxt.epInfoCache = e.createEpInfoCache(currentDir)
-	}
-
 	return nil
 }
 
-func (e *Endpoint) finalizeProxyState(regenContext *regenerationContext, err error) {
+func (e *Endpoint) finalizeEndpointRegeneration(regenContext *regenerationContext, err error) {
 	datapathRegenCtx := regenContext.datapathRegenerationContext
 	if err == nil {
 		// Always execute the finalization code, even if the endpoint is
@@ -791,26 +837,27 @@ func (e *Endpoint) finalizeProxyState(regenContext *regenerationContext, err err
 		datapathRegenCtx.finalizeList.Finalize()
 	} else {
 		if err := e.lockAlive(); err != nil {
-			e.getLogger().WithError(err).Debug("Skipping unnecessary reverting of endpoint regeneration changes")
+			e.getLogger().Debug(
+				"Skipping unnecessary reverting of endpoint regeneration changes",
+				logfields.Error, err,
+			)
 			return
 		}
 		defer e.unlock() // In case Revert() panics
 		e.getLogger().Debug("Reverting endpoint changes after BPF regeneration failed")
 		if err := datapathRegenCtx.revertStack.Revert(); err != nil {
-			e.getLogger().WithError(err).Error("Reverting endpoint regeneration changes failed")
+			e.getLogger().Error(
+				"Reverting endpoint regeneration changes failed",
+				logfields.Error, err,
+			)
 		}
 		e.getLogger().Debug("Finished reverting endpoint changes after BPF regeneration failed")
 	}
 }
 
-// InitMap creates the policy map in the kernel.
-func (e *Endpoint) InitMap() error {
-	return policymap.Create(e.policyMapPath())
-}
-
 // deleteMaps deletes the endpoint's entry from the global
 // cilium_(egress)call_policy maps and removes endpoint-specific cilium_calls_,
-// cilium_policy_v2_ and cilium_ct{4,6}_ map pins.
+// cilium_policy_ and cilium_ct{4,6}_ map pins.
 //
 // Call this after the endpoint's tc hook has been detached.
 func (e *Endpoint) deleteMaps() []error {
@@ -819,34 +866,23 @@ func (e *Endpoint) deleteMaps() []error {
 	// Remove the endpoint from cilium_lxc. After this point, ip->epID lookups
 	// will fail, causing packets to/from the Pod to be dropped in many cases,
 	// stopping packet evaluation.
-	if err := lxcmap.DeleteElement(e); err != nil {
+	if err := e.lxcMap.DeleteElement(e.getLogger(), e); err != nil {
 		errors = append(errors, err...)
 	}
 
 	// Remove the policy tail call entry for the endpoint. This will disable
 	// policy evaluation for the endpoint and will result in missing tail calls if
 	// e.g. bpf_host or bpf_overlay call into the endpoint's policy program.
-	if err := policymap.RemoveGlobalMapping(uint32(e.ID), option.Config.EnableEnvoyConfig); err != nil {
+	if err := policymap.RemoveGlobalMapping(e.getLogger(), uint32(e.ID)); err != nil {
 		errors = append(errors, fmt.Errorf("removing endpoint program from global policy map: %w", err))
 	}
 
 	// Remove rate limit from bandwidth manager map.
 	if e.bps != 0 {
-		e.owner.BandwidthManager().DeleteBandwidthLimit(e.ID)
+		e.bandwidthManager.DeleteBandwidthLimit(e.ID)
 	}
-
-	if e.ConntrackLocalLocked() {
-		// Remove endpoint-specific CT map pins.
-		for _, m := range ctmap.LocalMaps(e, option.Config.EnableIPv4, option.Config.EnableIPv6) {
-			ctPath, err := m.Path()
-			if err != nil {
-				errors = append(errors, fmt.Errorf("getting path for CT map pin %s: %w", m.Name(), err))
-				continue
-			}
-			if err := os.RemoveAll(ctPath); err != nil {
-				errors = append(errors, fmt.Errorf("removing CT map pin %s: %w", ctPath, err))
-			}
-		}
+	if e.ingressBps != 0 {
+		e.bandwidthManager.DeleteIngressBandwidthLimit(e.ID)
 	}
 
 	// Remove program array pins as the last step. This permanently invalidates
@@ -854,55 +890,24 @@ func (e *Endpoint) deleteMaps() []error {
 	// removes the map's entries even if the map is still referenced by any live
 	// bpf programs, potentially resulting in missed tail calls if any packets are
 	// still in flight.
-	if err := os.RemoveAll(e.policyMapPath()); err != nil {
-		errors = append(errors, fmt.Errorf("removing policy map pin for endpoint %s: %w", e.StringID(), err))
+	if e.policyMapFactory != nil {
+		if err := e.policyMapFactory.RemoveEndpoint(e.ID); err != nil {
+			errors = append(errors, fmt.Errorf("removing policy map pin for endpoint %s: %w", e.StringID(), err))
+		}
 	}
 	if err := os.RemoveAll(e.callsMapPath()); err != nil {
 		errors = append(errors, fmt.Errorf("removing calls map pin for endpoint %s: %w", e.StringID(), err))
-	}
-	if !e.isHost {
-		if err := os.RemoveAll(e.customCallsMapPath()); err != nil {
-			errors = append(errors, fmt.Errorf("removing custom calls map pin for endpoint %s: %w", e.StringID(), err))
-		}
 	}
 
 	return errors
 }
 
-// garbageCollectConntrack will run the ctmap.GC() on either the endpoint's
-// local conntrack table or the global conntrack table.
-//
-// The endpoint lock must be held
-func (e *Endpoint) garbageCollectConntrack(filter ctmap.GCFilter) {
-	var maps []*ctmap.Map
-
-	if e.ConntrackLocalLocked() {
-		maps = ctmap.LocalMaps(e, option.Config.EnableIPv4, option.Config.EnableIPv6)
-	} else {
-		maps = ctmap.GlobalMaps(option.Config.EnableIPv4, option.Config.EnableIPv6)
-	}
-	for _, m := range maps {
-		if err := m.Open(); err != nil {
-			// If the CT table doesn't exist, there's nothing to GC.
-			scopedLog := log.WithError(err).WithField(logfields.EndpointID, e.ID)
-			if os.IsNotExist(err) {
-				scopedLog.WithError(err).Debug("Skipping GC for endpoint")
-			} else {
-				scopedLog.WithError(err).Warn("Unable to open map")
-			}
-			continue
-		}
-		defer m.Close()
-
-		e.ctMapGC.Run(m, filter)
-	}
-}
-
+// scrubIPsInConntrackTableLocked will run the CTMap garbagecollector with the endpoint IPs.
 func (e *Endpoint) scrubIPsInConntrackTableLocked() {
-	e.garbageCollectConntrack(ctmap.GCFilter{
-		MatchIPs: map[netip.Addr]struct{}{
-			e.IPv4: {},
-			e.IPv6: {},
+	e.ctMapGC.Run(ctmap.GCFilter{
+		MatchIPs: map[ctmap.NetAddr]struct{}{
+			{Addr: e.IPv4}: {},
+			{Addr: e.IPv6}: {},
 		},
 	})
 }
@@ -938,13 +943,11 @@ type policyMapPressureUpdater interface {
 	Remove(uint16)
 }
 
-func (e *Endpoint) updatePolicyMapPressureMetric(add float64) {
-	// We want to use desiredPolicy, but it can be nil.
-	policyLen := add
-	if e.desiredPolicy != nil {
-		policyLen += float64(e.desiredPolicy.Len())
+func (e *Endpoint) updatePolicyMapPressureMetric(len int) {
+	if e.policyMap == nil {
+		return
 	}
-	value := policyLen / float64(e.policyMap.MaxEntries())
+	value := float64(len) / float64(e.policyMap.MaxEntries())
 	e.PolicyMapPressureUpdater.Update(PolicyMapPressureEvent{
 		Value:      value,
 		EndpointID: e.ID,
@@ -964,8 +967,7 @@ func (e *Endpoint) deletePolicyKeys(deletes, adds policy.Keys) int {
 }
 
 func (e *Endpoint) deletePolicyKey(keyToDelete policy.Key) bool {
-	// Convert from policy.Key to policymap.Key
-	policymapKey := policymap.NewKey(keyToDelete.TrafficDirection(), keyToDelete.Identity, keyToDelete.Nexthdr, keyToDelete.DestPort, keyToDelete.PortPrefixLen())
+	policymapKey := policymap.NewKeyFromPolicyKey(keyToDelete)
 
 	// Do not error out if the map entry was already deleted from the bpf map.
 	// Incremental updates depend on this being OK in cases where identity change
@@ -977,15 +979,18 @@ func (e *Endpoint) deletePolicyKey(keyToDelete policy.Key) bool {
 	var errno unix.Errno
 	errors.As(err, &errno)
 	if err != nil && errno != unix.ENOENT {
-		e.getLogger().WithError(err).WithField(logfields.BPFMapKey, policymapKey).Error("Failed to delete PolicyMap key")
+		e.getLogger().Error(
+			"Failed to delete PolicyMap key",
+			logfields.Error, err,
+			logfields.BPFMapKey, policymapKey,
+		)
 		return false
 	}
 
-	e.updatePolicyMapPressureMetric(0)
-
-	e.PolicyDebug(logrus.Fields{
-		logfields.BPFMapKey: keyToDelete,
-	}, "deletePolicyKey")
+	e.PolicyDebug(
+		"deletePolicyKey",
+		logfields.BPFMapKey, keyToDelete,
+	)
 
 	return true
 }
@@ -995,9 +1000,10 @@ func (e *Endpoint) addPolicyKeys(adds policy.Keys) int {
 	for keyToAdd := range adds {
 		entry, exists := e.desiredPolicy.Get(keyToAdd)
 		if !exists {
-			e.getLogger().WithFields(logrus.Fields{
-				logfields.AddedPolicyID: keyToAdd,
-			}).Warn("Tried adding policy map key not in policy")
+			e.getLogger().Warn(
+				"Tried adding policy map key not in policy",
+				logfields.AddedPolicyID, keyToAdd,
+			)
 			continue
 		}
 
@@ -1010,49 +1016,81 @@ func (e *Endpoint) addPolicyKeys(adds policy.Keys) int {
 }
 
 func (e *Endpoint) addPolicyKey(keyToAdd policy.Key, entry policy.MapStateEntry) bool {
-	// Convert from policy.Key to policymap.Key
-	policymapKey := policymap.NewKey(keyToAdd.TrafficDirection(), keyToAdd.Identity, keyToAdd.Nexthdr, keyToAdd.DestPort, keyToAdd.PortPrefixLen())
+	// Convert from policy.Key to policymap.PolicyKey and Entry, respectively
+	policymapKey := policymap.NewKeyFromPolicyKey(keyToAdd)
+	policymapEntry := policymap.NewEntryFromPolicyEntry(policymapKey, entry)
 
-	var err error
-	if entry.IsDeny() {
-		err = e.policyMap.DenyKey(policymapKey)
-	} else {
-		err = e.policyMap.AllowKey(policymapKey, entry.ProxyPortPriority, entry.AuthRequirement, entry.ProxyPort)
-	}
+	err := e.policyMap.Update(&policymapKey, &policymapEntry)
 	if err != nil {
-		e.getLogger().WithError(err).WithFields(logrus.Fields{
-			logfields.BPFMapKey: policymapKey,
-			logfields.Port:      entry.ProxyPort,
-		}).Error("Failed to add PolicyMap key")
+		e.getLogger().Error(
+			"Failed to add PolicyMap key",
+			logfields.Error, err,
+			logfields.BPFMapKey, policymapKey,
+			logfields.Port, entry.ProxyPort,
+		)
 		return false
 	}
 
-	e.updatePolicyMapPressureMetric(0)
-
-	e.PolicyDebug(logrus.Fields{
-		logfields.BPFMapKey:   keyToAdd,
-		logfields.BPFMapValue: entry,
-	}, "addPolicyKey")
+	e.PolicyDebug(
+		"addPolicyKey",
+		logfields.BPFMapKey, keyToAdd,
+		logfields.BPFMapValue, entry,
+	)
 	return true
 }
 
 // ApplyPolicyMapChanges updates the Endpoint's PolicyMap with the changes
 // that have accumulated for the PolicyMap via various outside events (e.g.,
 // identities added / deleted).
-// 'proxyWaitGroup' may not be nil.
-func (e *Endpoint) ApplyPolicyMapChanges(proxyWaitGroup *completion.WaitGroup) error {
-	if err := e.lockAlive(); err != nil {
-		return err
+// 'proxyWaitGroup' may not be nil. Caller must ultimately call either the returned revert or
+// finalize func, if non-nil and proxyWaitGroup.Wait fails or succeeds, respectively.
+func (e *Endpoint) ApplyPolicyMapChanges(proxyWaitGroup *completion.WaitGroup) (err error, rf revert.RevertFunc, ff revert.FinalizeFunc) {
+	if err = e.lockAlive(); err != nil {
+		return err, nil, nil
 	}
 	defer e.unlock()
 
-	e.PolicyDebug(nil, "ApplyPolicyMapChanges")
+	e.PolicyDebug("ApplyPolicyMapChanges")
 
-	return e.applyPolicyMapChangesLocked(&regenerationContext{
+	if isDetached, t := e.desiredPolicy.SelectorPolicy.IsDetached(); isDetached {
+		metrics.EndpointDetachedSelectorPolicyTimeStats.WithLabelValues("incremental-update").Observe(time.Since(t).Seconds())
+	}
+
+	if !e.desiredPolicy.IsValid() {
+		// The endpoint has no computed policy yet, so it is pointless to try apply
+		// incremental changes on it.
+		return nil, nil, nil
+	}
+
+	regenCtx := regenerationContext{
 		datapathRegenerationContext: &datapathRegenerationContext{
 			proxyWaitGroup: proxyWaitGroup,
 		},
-	}, false)
+	}
+	err = e.applyPolicyMapChangesLocked(&regenCtx, false)
+
+	if err != nil {
+		e.logStatusLocked(Policy, Failure, err.Error())
+
+		// revert any changes on synchronous error for an endpoint
+		regenCtx.datapathRegenerationContext.revertStack.Revert()
+
+		return err, nil, nil
+	}
+
+	e.LogStatusOKLocked(Policy, "Policy Map changes applied")
+
+	// otherwise the revert/finalize decision is postponed after
+	// eventual proxyWaitGroup.Wait by the caller
+
+	if !regenCtx.datapathRegenerationContext.revertStack.Empty() {
+		rf = regenCtx.datapathRegenerationContext.revertStack.Revert
+	}
+	if !regenCtx.datapathRegenerationContext.finalizeList.Empty() {
+		ff = regenCtx.datapathRegenerationContext.finalizeList.Finalize
+	}
+
+	return nil, rf, ff
 }
 
 // applyPolicyMapChangesLocked applies any incremental policy map changes
@@ -1060,10 +1098,7 @@ func (e *Endpoint) ApplyPolicyMapChanges(proxyWaitGroup *completion.WaitGroup) e
 // updated if needed. Endpoint must be locked. It returns one special error
 // that must be considered, "ErrPolicyEntryMaxExceeded".
 func (e *Endpoint) applyPolicyMapChangesLocked(regenContext *regenerationContext, hasNewPolicy bool) error {
-	e.PolicyDebug(nil, "applyPolicyMapChanges")
-
-	// Always update Envoy if policy has changed
-	updateEnvoy := hasNewPolicy
+	e.PolicyDebug("applyPolicyMapChanges")
 
 	// Note that after successful endpoint regeneration the desired and realized policies are
 	// the same pointer. During the bpf regeneration possible incremental updates are collected
@@ -1075,42 +1110,25 @@ func (e *Endpoint) applyPolicyMapChangesLocked(regenContext *regenerationContext
 	closer, changes := e.desiredPolicy.ConsumeMapChanges()
 	defer closer()
 
-	changeSize := changes.Size()
-	if e.shouldLockdownLocked(changeSize) {
-		return e.startLockdownLocked(changeSize)
+	e.updatePolicyMapPressureMetric(e.desiredPolicy.Len())
+
+	if e.shouldLockdownLocked() {
+		return e.startLockdownLocked()
 	}
 	if e.stopLockdownLocked() {
 		return ErrComingOutOfLockdown
 	}
 
-	hasEnvoyRedirect := e.desiredPolicy.L4Policy.HasEnvoyRedirect()
-	if !changes.Empty() {
-		// updateEnvoy if there were any mapChanges, but only if the endpoint has Envoy
-		// redirects, or is an Ingress endpoint, which needs to enforce also the full L3/4
-		// policy.
-		//
-		// Even if there are no changes, we update the proxyWaitGroup for any in-progress
-		// NetworkPolicy update to be done if the endpoint has envoy redirects, so that the
-		// the expected policy is in place.
-		//
-		// 'updateEnvoy' is already set to 'true' if policy changed. In that case there can
-		// be new redirects and a full policy map update even if there were no incremental
-		// updates.
-		updateEnvoy = updateEnvoy || hasEnvoyRedirect || e.isIngress
-	}
-
 	stats := &regenContext.Stats
 	datapathRegenCtxt := regenContext.datapathRegenerationContext
-	var err error
-
 	proxyWaitGroup := datapathRegenCtxt.proxyWaitGroup
 
 	// Ingress endpoint does not need to wait.
 	// This also lets daemon/cmd integration tests to proceed
-	if e.isProperty(PropertySkipBPFPolicy) {
-		if logging.CanLogAt(log.Logger, logrus.DebugLevel) {
-			log.WithField(logfields.EndpointID, e.ID).Debug("Ingress Endpoint updating Network policy")
-		}
+	if e.isPropertyLocked(endpointtypes.PropertySkipBPFPolicy) {
+		e.getLogger().Debug(
+			"Ingress Endpoint updating Network policy",
+		)
 		proxyWaitGroup = nil
 	}
 
@@ -1125,32 +1143,39 @@ func (e *Endpoint) applyPolicyMapChangesLocked(regenContext *regenerationContext
 	// NOTE: unlike regeneratePolicy, UpdateNetworkPolicy requires the endpoint read lock for
 	// 'e.desiredPolicy' access.
 	if !e.IsProxyDisabled() {
-		if updateEnvoy {
-			e.getLogger().
-				WithField(logfields.SelectorCacheVersion, e.desiredPolicy.VersionHandle).
-				Debug("applyPolicyMapChanges: Updating Envoy NetworkPolicy")
+		hasEnvoyRedirect := e.desiredPolicy.SelectorPolicy.L4Policy.HasEnvoyRedirect()
+
+		// updateEnvoy when policy has changed (due to the possible removed redirects), if
+		// the endpoint has Envoy redirects, or is an Ingress endpoint, which needs to
+		// enforce also the full L3/4 policy.
+		//
+		// When EnvoyConfig is enabled, policy filters will be applied on listeners that might
+		// not be referenced in policy rules(eg. L7 load balancing). Always update proxy policy
+		// in such cases to propagate incremental updates.
+		if option.Config.EnableEnvoyConfig || hasNewPolicy || hasEnvoyRedirect || e.isIngress {
+			e.getLogger().Debug("applyPolicyMapChanges: Updating Envoy NetworkPolicy")
 			stats.proxyPolicyCalculation.Start()
-			var rf revert.RevertFunc
-			err, rf = e.proxy.UpdateNetworkPolicy(e, &e.desiredPolicy.L4Policy, e.desiredPolicy.IngressPolicyEnabled, e.desiredPolicy.EgressPolicyEnabled, proxyWaitGroup)
-			stats.proxyPolicyCalculation.End(err == nil)
-			if err == nil {
+			proxyErr, rf, ff := e.proxy.UpdateNetworkPolicy(context.Background(), e, e.desiredPolicy, proxyWaitGroup)
+			stats.proxyPolicyCalculation.End(proxyErr == nil)
+
+			// UpdateNetworkPolicy only returns revert/finalize func if there is no
+			// synchronous error
+			if proxyErr == nil {
 				datapathRegenCtxt.revertStack.Push(rf)
+				datapathRegenCtxt.finalizeList.Append(ff)
+			} else {
+				e.getLogger().Debug("applyPolicyMapChanges: UpdateNetworkPolicy failed",
+					logfields.Error, proxyErr)
+				return proxyErr
 			}
-		} else if hasEnvoyRedirect {
-			// Wait for a possible ongoing update to be done if there were no current changes.
-			e.getLogger().
-				WithField(logfields.SelectorCacheVersion, e.desiredPolicy.VersionHandle).
-				Debug("applyPolicyMapChanges: Using current Networkpolicy")
-			e.proxy.UseCurrentNetworkPolicy(e, &e.desiredPolicy.L4Policy, proxyWaitGroup)
 		}
 	}
 
 	// Ingress endpoint has no bpf policy maps, so return before applying changes to bpf.
-	if e.isProperty(PropertySkipBPFPolicy) {
-
-		if logging.CanLogAt(log.Logger, logrus.DebugLevel) {
-			log.WithField(logfields.EndpointID, e.ID).Debug("Skipping bpf updates due to dry mode")
-		}
+	if e.isPropertyLocked(endpointtypes.PropertySkipBPFPolicy) {
+		e.getLogger().Debug(
+			"Skipping bpf updates due to dry mode",
+		)
 		return nil
 	}
 
@@ -1160,47 +1185,58 @@ func (e *Endpoint) applyPolicyMapChangesLocked(regenContext *regenerationContext
 		return nil
 	}
 
+	if e.policyMap == nil {
+		e.getLogger().Debug("Skipping bpf updates due to endpoint not having policy map yet")
+		return nil
+	}
+
 	// Add policy map entries before deleting to avoid transient drops. If there
 	// isn't enough space to add all the entries before deleting some, then delete
 	// first. If e.realizedPolicy or e.policyMap is nil then the map has not been
 	// populated yet.
 	errors := 0
-	if e.realizedPolicy == nil || e.policyMap == nil ||
+	if e.realizedPolicy == nil ||
 		e.realizedPolicy.Len()+len(changes.Adds) <= int(e.policyMap.MaxEntries()) {
 		errors += e.addPolicyKeys(changes.Adds)
 		errors += e.deletePolicyKeys(changes.Deletes, changes.Adds)
 	} else {
 		errors += e.deletePolicyKeys(changes.Deletes, changes.Adds)
 		errors += e.addPolicyKeys(changes.Adds)
-		e.getLogger().WithFields(logrus.Fields{
-			logfields.EndpointID: e.ID,
-		}).Warn("A policy map update had to delete changes before it added them in order to prevent a map overflow, a transient drop may have occurred.")
+		e.getLogger().Warn(
+			"A policy map update had to delete changes before it added them in order to prevent a map overflow, a transient drop may have occurred.",
+		)
 	}
 
 	if errors > 0 {
 		return fmt.Errorf("updating bpf policy maps failed")
 	}
+
 	if len(changes.Adds) > 0 || len(changes.Deletes) > 0 {
-		e.getLogger().WithFields(logrus.Fields{
-			logfields.AddedPolicyID:   changes.Adds,
-			logfields.DeletedPolicyID: changes.Deletes,
-		}).Debug("Applied policy map updates due to identity changes")
+		e.getLogger().Debug(
+			"Applied policy map updates due to identity changes",
+			logfields.AddedPolicyID, changes.Adds,
+			logfields.DeletedPolicyID, changes.Deletes,
+		)
 	}
+
 	return nil
 }
 
 // shouldLockdownLockdown returns true if the desiredPolicy, after changes,
 // will be larger than policymap.MaxEntries. The Endpoint must be locked.
-func (e *Endpoint) shouldLockdownLocked(changeSize int) bool {
+func (e *Endpoint) shouldLockdownLocked() bool {
+	if !option.Config.EnableEndpointLockdownOnPolicyOverflow {
+		return false
+	}
 	// The desiredPolicy will be larger than the BPF maximum after
 	// the changes.
 	return e.desiredPolicy != nil && e.policyMap != nil &&
-		e.desiredPolicy.Len()+changeSize > int(e.policyMap.MaxEntries())
+		e.desiredPolicy.Len() > int(e.policyMap.MaxEntries())
 }
 
 // startLockdownLocked initiates an endpoint lockdown, and returns an
 // error if it fails. The Endpoint must be locked.
-func (e *Endpoint) startLockdownLocked(changeSize int) error {
+func (e *Endpoint) startLockdownLocked() error {
 	// We only need to go through the mechanics of
 	// lockdown once.
 	if !e.lockdown {
@@ -1209,20 +1245,20 @@ func (e *Endpoint) startLockdownLocked(changeSize int) error {
 			return nil
 		}
 
-		e.getLogger().WithFields(logrus.Fields{
-			logfields.EndpointID: e.ID,
-		}).Warnf("The policy map exceeds the max entries limit, %s is enabled, locking the endpoint down.",
-			option.EnableEndpointLockdownOnPolicyOverflow)
+		e.getLogger().Warn(
+			fmt.Sprintf("The policy map exceeds the max entries limit, %s is enabled, locking the endpoint down.",
+				option.EnableEndpointLockdownOnPolicyOverflow),
+		)
 
 		if err := e.endpointPolicyLockdown(); err != nil {
-			e.getLogger().WithFields(logrus.Fields{
-				logfields.EndpointID: e.ID,
-			}).WithError(err).Error("Failed to lockdown endpoint:" +
-				"Consider quarantining or shutting down this node.")
+			e.getLogger().Error(
+				"Failed to lockdown endpoint:"+
+					"Consider quarantining or shutting down this node.",
+				logfields.Error, err,
+			)
 			return err
 		}
 		e.lockdown = true
-		e.updatePolicyMapPressureMetric(float64(changeSize))
 	}
 	return ErrPolicyEntryMaxExceeded
 }
@@ -1243,24 +1279,25 @@ func (e *Endpoint) stopLockdownLocked() bool {
 // mode. The bpf policy map is populated with deny all traffic entries,
 // and all other entries are deleted.
 func (e *Endpoint) endpointPolicyLockdown() error {
-	denyMap := make(map[policymap.PolicyKey]struct{}, len(allTrafficKeys))
+	denyMap := make(map[policymap.PolicyKey]policymap.PolicyEntry, len(allTrafficKeys))
 	for _, k := range allTrafficKeys {
-		denyMap[policymap.NewKey(k.TrafficDirection(), k.Identity, k.Nexthdr, k.DestPort, k.PortPrefixLen())] = struct{}{}
+		mk := policymap.NewKeyFromPolicyKey(k)
+		denyMap[mk] = policymap.NewEntryFromPolicyEntry(mk, policytypes.DenyEntry())
 	}
 	// realizedPolicy is not accurrate at this point, we need a dump
-	currentMap, err := e.dumpPolicyMapToMapStateMap()
+	currentMap, err := e.policyMap.DumpToMapStateMap()
 	if err != nil {
 		return fmt.Errorf("could not dump current map state: %w", err)
 	}
 
 	defer func() {
-		e.realizedPolicy = policy.NewEndpointPolicy(e.policyGetter.GetPolicyRepository())
+		e.realizedPolicy = policy.NewEndpointPolicy(e.getLogger(), e.policyRepo)
 	}()
 
 	i := 0
 	addedDenyEntries := false
 	for k := range currentMap {
-		pmKey := policymap.NewKey(k.TrafficDirection(), k.Identity, k.Nexthdr, k.DestPort, k.PortPrefixLen())
+		pmKey := policymap.NewKeyFromPolicyKey(k)
 		if _, ok := denyMap[pmKey]; !ok {
 			err := e.policyMap.DeleteKey(pmKey)
 			var errno unix.Errno
@@ -1270,15 +1307,14 @@ func (e *Endpoint) endpointPolicyLockdown() error {
 			}
 		}
 		// We can increment this, even if we did not delete a key,
-		// because the only non-deleted keys match what is already
-		// in the deny map, they will be replaced.
+		// because non-deleted keys match what is already in the
+		// deny map, they will be replaced.
 		i++
 		// Once the length of the deny keys to be added has been deleted we can safely add them.
 		if i == len(denyMap) {
-			for denyKey := range denyMap {
-				e.policyMap.DenyKey(denyKey)
-				if err := e.policyMap.DenyKey(denyKey); err != nil {
-					return fmt.Errorf("failed to add deny all policy (%v): %w", denyKey, err)
+			for mk, mv := range denyMap {
+				if err := e.policyMap.Update(&mk, &mv); err != nil {
+					return fmt.Errorf("failed to add deny all policy (%v): %w", mv, err)
 				}
 			}
 			addedDenyEntries = true
@@ -1288,10 +1324,9 @@ func (e *Endpoint) endpointPolicyLockdown() error {
 	// is set to a really low value in a custom build of Cilium,
 	// but it is worth having for testing purposes.
 	if !addedDenyEntries {
-		for denyKey := range denyMap {
-			e.policyMap.DenyKey(denyKey)
-			if err := e.policyMap.DenyKey(denyKey); err != nil {
-				return fmt.Errorf("failed to add deny all policy (%v): %w", denyKey, err)
+		for mk, mv := range denyMap {
+			if err := e.policyMap.Update(&mk, &mv); err != nil {
+				return fmt.Errorf("failed to add deny all policy (%v): %w", mk, err)
 			}
 		}
 	}
@@ -1305,8 +1340,10 @@ func (e *Endpoint) endpointPolicyLockdown() error {
 func (e *Endpoint) syncPolicyMap() error {
 	addErrors, deleteErrors := 0, 0
 
-	if e.shouldLockdownLocked(0) {
-		return e.startLockdownLocked(0)
+	e.updatePolicyMapPressureMetric(e.desiredPolicy.Len())
+
+	if e.shouldLockdownLocked() {
+		return e.startLockdownLocked()
 	}
 	if e.stopLockdownLocked() {
 		return ErrComingOutOfLockdown
@@ -1350,8 +1387,10 @@ func (e *Endpoint) syncPolicyMap() error {
 func (e *Endpoint) syncPolicyMapWith(realized policy.MapStateMap, withDiffs bool) (diffCount int, diffs []policy.MapChange, err error) {
 	addErrors, deleteErrors := 0, 0
 
-	if e.shouldLockdownLocked(0) {
-		err = e.startLockdownLocked(0)
+	e.updatePolicyMapPressureMetric(e.desiredPolicy.Len())
+
+	if e.shouldLockdownLocked() {
+		err = e.startLockdownLocked()
 		return
 	}
 	if e.stopLockdownLocked() {
@@ -1423,36 +1462,6 @@ func (e *Endpoint) syncPolicyMapWith(realized policy.MapStateMap, withDiffs bool
 	return diffCount, diffs, err
 }
 
-// dumpPolicyMapToMapStateMap dumps the current bpf policy map for this endpoint
-// into a MapStateMap.
-func (e *Endpoint) dumpPolicyMapToMapStateMap() (policy.MapStateMap, error) {
-	currentMap := make(policy.MapStateMap)
-
-	cb := func(key bpf.MapKey, value bpf.MapValue) {
-		policymapKey := key.(*policymap.PolicyKey)
-		// Convert from policymap.Key to policy.Key
-		policyKey := policy.KeyForDirection(trafficdirection.TrafficDirection(policymapKey.TrafficDirection)).
-			WithIdentity(identity.NumericIdentity(policymapKey.Identity)).
-			WithPortProtoPrefix(u8proto.U8proto(policymapKey.Nexthdr), policymapKey.GetDestPort(), policymapKey.GetPortPrefixLen())
-		policymapEntry := value.(*policymap.PolicyEntry)
-		// Convert from policymap.PolicyEntry to policy.MapStateEntry.
-		policyEntry := policy.MapStateEntry{
-			ProxyPortPriority: policymapEntry.ProxyPortPriority,
-			ProxyPort:         policymapEntry.GetProxyPort(),
-			AuthRequirement:   policymapEntry.AuthRequirement,
-		}.WithDeny(policymapEntry.IsDeny())
-		// if policymapEntry has invalid prefix length, force update by storing as an
-		// invalid MapStateEntry
-		if !policymapEntry.IsValid(policymapKey) {
-			policyEntry.Invalid = true
-		}
-		currentMap[policyKey] = policyEntry
-	}
-	err := e.policyMap.DumpWithCallback(cb)
-
-	return currentMap, err
-}
-
 // syncPolicyMapWithDump is invoked periodically to perform a full reconciliation
 // of the endpoint's PolicyMap against the BPF maps to catch cases where either
 // due to kernel issue or user intervention the agent's view of the PolicyMap
@@ -1473,49 +1482,53 @@ func (e *Endpoint) syncPolicyMapWithDump() error {
 		return nil
 	}
 
-	currentMap, err := e.dumpPolicyMapToMapStateMap()
+	currentMap, err := e.policyMap.DumpToMapStateMap()
 	// If map is unable to be dumped, attempt to close map and open it again.
 	// See GH-4229.
 	if err != nil {
-		e.getLogger().WithError(err).Error("unable to dump PolicyMap when trying to sync desired and realized PolicyMap state")
+		e.getLogger().Error("unable to dump PolicyMap when trying to sync desired and realized PolicyMap state", logfields.Error, err)
 
 		// Close to avoid leaking of file descriptors, but still continue in case
 		// Close() does not succeed, because otherwise the map will never be
 		// opened again unless the agent is restarted.
 		err := e.policyMap.Close()
 		if err != nil {
-			e.getLogger().WithError(err).Error("unable to close PolicyMap which was not able to be dumped")
+			e.getLogger().Error("unable to close PolicyMap which was not able to be dumped", logfields.Error, err)
 		}
 
-		e.policyMap, err = policymap.OpenOrCreate(e.policyMapPath())
+		if e.policyMapFactory == nil {
+			return fmt.Errorf("endpoint has nil policyMapFactory")
+		}
+		e.policyMap, err = e.policyMapFactory.OpenEndpoint(e.ID)
 		if err != nil {
 			return fmt.Errorf("unable to open PolicyMap for endpoint: %w", err)
 		}
 
 		// Try to dump again, fail if error occurs.
-		currentMap, err = e.dumpPolicyMapToMapStateMap()
+		currentMap, err = e.policyMap.DumpToMapStateMap()
 		if err != nil {
 			return err
 		}
 	}
 
 	// Log full policy map for every dump
-	e.PolicyDebug(logrus.Fields{"dumpedPolicyMap": currentMap}, "syncPolicyMapWithDump")
+	e.PolicyDebug("syncPolicyMapWithDump", logfields.DumpedPolicyMap, currentMap)
 	// Diffs between the maps indicate an error in the policy map update logic.
 	// Collect and log diffs if policy logging is enabled.
-	diffCount, diffs, err := e.syncPolicyMapWith(currentMap, e.getPolicyLogger() != nil)
+	diffCount, diffs, err := e.syncPolicyMapWith(currentMap, e.getLogger() != nil)
 
 	if diffCount > 0 {
-		e.getLogger().WithField(logfields.Count, diffCount).Warning("Policy map sync fixed errors, consider running with debug verbose = policy to get detailed dumps")
-		e.PolicyDebug(logrus.Fields{"dumpedDiffs": diffs}, "syncPolicyMapWithDump")
+		e.getLogger().Warn("Policy map sync fixed errors, consider running with debug verbose = policy to get detailed dumps", logfields.Count, diffCount)
+		e.PolicyDebug("syncPolicyMapWithDump", logfields.DumpedDiffs, diffs)
 	}
 
 	return err
 }
 
+// startSyncPolicyMapController starts the policymap sync controller. Must be called with the endpoint mutex held.
 func (e *Endpoint) startSyncPolicyMapController() {
 	// Skip the controller if the endpoint has no policy map
-	if e.isProperty(PropertySkipBPFPolicy) {
+	if e.isPropertyLocked(endpointtypes.PropertySkipBPFPolicy) {
 		return
 	}
 
@@ -1577,10 +1590,10 @@ func (e *Endpoint) RequireEndpointRoute() bool {
 // consistent with how it is used in policy_verdict_filter_allow() in bpf/lib/policy_log.h
 func (e *Endpoint) GetPolicyVerdictLogFilter() uint32 {
 	var filter uint32 = 0
-	if e.desiredPolicy.IngressPolicyEnabled {
+	if e.desiredPolicy.SelectorPolicy.IngressPolicyEnabled {
 		filter = (filter | 0x1)
 	}
-	if e.desiredPolicy.EgressPolicyEnabled {
+	if e.desiredPolicy.SelectorPolicy.EgressPolicyEnabled {
 		filter = (filter | 0x2)
 	}
 	return filter
@@ -1610,10 +1623,11 @@ func CheckHealth(ep *Endpoint) error {
 	iface := ep.HostInterface()
 	if iface == "" {
 		handleNoHostInterfaceOnce.Do(func() {
-			log.WithFields(logrus.Fields{
-				logfields.URL:         "https://github.com/cilium/cilium/pull/14541",
-				logfields.HelpMessage: "For more information, see the linked URL. Pass endpoint-gc-interval=\"0\" to disable",
-			}).Info("Endpoint garbage collection is ineffective, ignoring endpoint")
+			ep.getLogger().Info(
+				"Endpoint garbage collection is ineffective, ignoring endpoint",
+				logfields.URL, "https://github.com/cilium/cilium/pull/14541",
+				logfields.HelpMessage, "For more information, see the linked URL. Pass endpoint-gc-interval=\"0\" to disable",
+			)
 		})
 		return nil
 	}
@@ -1623,11 +1637,10 @@ func CheckHealth(ep *Endpoint) error {
 		return fmt.Errorf("Endpoint is invalid: %w", err)
 	}
 	if err != nil {
-		log.WithError(err).WithFields(logrus.Fields{
-			logfields.EndpointID:  ep.StringID(),
-			logfields.ContainerID: ep.GetShortContainerID(),
-			logfields.K8sPodName:  ep.GetK8sNamespaceAndPodName(),
-		}).Warning("An error occurred while checking endpoint health")
+		ep.getLogger().Warn(
+			"An error occurred while checking endpoint health",
+			logfields.Error, err,
+		)
 	}
 	return nil
 }

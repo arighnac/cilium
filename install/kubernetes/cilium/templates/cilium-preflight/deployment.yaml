@@ -11,9 +11,10 @@ metadata:
   labels:
     app.kubernetes.io/part-of: cilium
     app.kubernetes.io/name: cilium-pre-flight-check
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
-    {{- end }}    
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -30,6 +31,7 @@ spec:
         k8s-app: cilium-pre-flight-check-deployment
         kubernetes.io/cluster-service: "true"
         app.kubernetes.io/name: cilium-pre-flight-check
+        helm.sh/chart: {{ include "cilium.chart" . }}
         {{- with .Values.commonLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -64,7 +66,16 @@ spec:
           {{- toYaml . | nindent 10 }}
           {{- end }}
           env:
-          {{- if .Values.k8sServiceHost }}
+          {{- if and .Values.k8sServiceHostRef.name .Values.k8sServiceHostRef.key }}
+          - name: KUBERNETES_SERVICE_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: {{ .Values.k8sServiceHostRef.name }}
+                key: {{ .Values.k8sServiceHostRef.key }}
+          - name: KUBERNETES_SERVICE_PORT
+            value: {{ include "k8sServicePort" . }}
+          {{- end }}
+            {{- if .Values.k8sServiceHost }}
           - name: KUBERNETES_SERVICE_HOST
             value: {{ include "k8sServiceHost" . }}
           - name: KUBERNETES_SERVICE_PORT
@@ -83,6 +94,9 @@ spec:
       {{- toYaml . | trim | nindent 6 }}
       {{- end }}
       hostNetwork: true
+      {{- if (semverCompare ">= 1.33-0" .Capabilities.KubeVersion.Version) }}
+      hostUsers: true
+      {{- end }}
       restartPolicy: Always
       priorityClassName: {{ include "cilium.priorityClass" (list $ .Values.preflight.priorityClassName "system-cluster-critical") }}
       serviceAccountName: {{ .Values.serviceAccounts.preflight.name | quote }}

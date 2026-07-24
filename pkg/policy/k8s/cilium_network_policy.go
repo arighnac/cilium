@@ -7,8 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/sirupsen/logrus"
-
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/types"
@@ -16,6 +15,7 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	policytypes "github.com/cilium/cilium/pkg/policy/types"
+	policyutils "github.com/cilium/cilium/pkg/policy/utils"
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -43,17 +43,14 @@ func (p *policyWatcher) onUpsert(
 			return nil
 		}
 
-		p.log.WithFields(logrus.Fields{
-			logfields.K8sAPIVersion:           cnp.TypeMeta.APIVersion,
-			logfields.CiliumNetworkPolicyName: cnp.ObjectMeta.Name,
-			logfields.K8sNamespace:            cnp.ObjectMeta.Namespace,
-			"annotations.old":                 oldCNP.ObjectMeta.Annotations,
-			"annotations":                     cnp.ObjectMeta.Annotations,
-		}).Debug("Modified CiliumNetworkPolicy")
-	}
-
-	if cnp.RequiresDerivative() {
-		return nil
+		p.log.Debug(
+			"Modified CiliumNetworkPolicy",
+			logfields.K8sAPIVersion, cnp.TypeMeta.APIVersion,
+			logfields.CiliumNetworkPolicyName, cnp.ObjectMeta.Name,
+			logfields.K8sNamespace, cnp.ObjectMeta.Namespace,
+			logfields.AnnotationsOld, oldCNP.ObjectMeta.Annotations,
+			logfields.Annotations, cnp.ObjectMeta.Annotations,
+		)
 	}
 
 	// check if this cnp was referencing or is now referencing at least one ToServices rule
@@ -124,13 +121,15 @@ func (p *policyWatcher) resolveCiliumNetworkPolicyRefs(
 }
 
 func (p *policyWatcher) upsertCiliumNetworkPolicyV2(cnp *types.SlimCNP, initialRecvTime time.Time, resourceID ipcacheTypes.ResourceID, dc chan uint64) error {
-	scopedLog := p.log.WithFields(logrus.Fields{
-		logfields.CiliumNetworkPolicyName: cnp.ObjectMeta.Name,
-		logfields.K8sAPIVersion:           cnp.TypeMeta.APIVersion,
-		logfields.K8sNamespace:            cnp.ObjectMeta.Namespace,
-	})
+	scopedLog := p.log.With(
+		logfields.CiliumNetworkPolicyName, cnp.ObjectMeta.Name,
+		logfields.K8sAPIVersion, cnp.TypeMeta.APIVersion,
+		logfields.K8sNamespace, cnp.ObjectMeta.Namespace,
+	)
 
-	scopedLog.Debug("Adding CiliumNetworkPolicy")
+	scopedLog.Debug(
+		"Adding CiliumNetworkPolicy",
+	)
 	namespace := k8sUtils.ExtractNamespace(&cnp.ObjectMeta)
 	if namespace == "" {
 		p.metricsManager.AddCCNP(cnp.CiliumNetworkPolicy)
@@ -138,9 +137,12 @@ func (p *policyWatcher) upsertCiliumNetworkPolicyV2(cnp *types.SlimCNP, initialR
 		p.metricsManager.AddCNP(cnp.CiliumNetworkPolicy)
 	}
 
-	rules, err := cnp.Parse()
+	rules, err := cnp.Parse(scopedLog, cmtypes.LocalClusterNameForPolicies(p.clusterMeshPolicyConfig, p.config.ClusterName))
 	if err != nil {
-		scopedLog.WithError(err).Warn("Unable to add CiliumNetworkPolicy")
+		scopedLog.Warn(
+			"Unable to add CiliumNetworkPolicy",
+			logfields.Error, err,
+		)
 		return fmt.Errorf("failed to parse CiliumNetworkPolicy %s/%s: %w", cnp.ObjectMeta.Namespace, cnp.ObjectMeta.Name, err)
 	}
 	if dc != nil {
@@ -151,24 +153,24 @@ func (p *policyWatcher) upsertCiliumNetworkPolicyV2(cnp *types.SlimCNP, initialR
 		}
 	}
 	p.policyImporter.UpdatePolicy(&policytypes.PolicyUpdate{
-		Rules:               rules,
+		Rules:               policyutils.RulesToPolicyEntries(rules),
 		Source:              source.CustomResource,
 		ProcessingStartTime: initialRecvTime,
 		Resource:            resourceID,
 		DoneChan:            dc,
 	})
-	scopedLog.Info("Imported CiliumNetworkPolicy")
+	scopedLog.Info(
+		"Imported CiliumNetworkPolicy",
+	)
 	return nil
 }
 
 func (p *policyWatcher) deleteCiliumNetworkPolicyV2(cnp *types.SlimCNP, resourceID ipcacheTypes.ResourceID, dc chan uint64) {
-	scopedLog := p.log.WithFields(logrus.Fields{
-		logfields.CiliumNetworkPolicyName: cnp.ObjectMeta.Name,
-		logfields.K8sAPIVersion:           cnp.TypeMeta.APIVersion,
-		logfields.K8sNamespace:            cnp.ObjectMeta.Namespace,
-	})
-
-	scopedLog.Debug("Deleting CiliumNetworkPolicy")
+	p.log.Debug("Deleting CiliumNetworkPolicy",
+		logfields.CiliumNetworkPolicyName, cnp.ObjectMeta.Name,
+		logfields.K8sAPIVersion, cnp.TypeMeta.APIVersion,
+		logfields.K8sNamespace, cnp.ObjectMeta.Namespace,
+	)
 	namespace := k8sUtils.ExtractNamespace(&cnp.ObjectMeta)
 	if namespace == "" {
 		p.metricsManager.DelCCNP(cnp.CiliumNetworkPolicy)
@@ -188,7 +190,11 @@ func (p *policyWatcher) deleteCiliumNetworkPolicyV2(cnp *types.SlimCNP, resource
 		Resource: resourceID,
 		DoneChan: dc,
 	})
-	scopedLog.Info("Deleted CiliumNetworkPolicy")
+	p.log.Info("Deleted CiliumNetworkPolicy",
+		logfields.CiliumNetworkPolicyName, cnp.ObjectMeta.Name,
+		logfields.K8sAPIVersion, cnp.TypeMeta.APIVersion,
+		logfields.K8sNamespace, cnp.ObjectMeta.Namespace,
+	)
 }
 
 func (p *policyWatcher) registerResourceWithSyncFn(ctx context.Context, resource string, syncFn func() bool) {
@@ -196,13 +202,13 @@ func (p *policyWatcher) registerResourceWithSyncFn(ctx context.Context, resource
 	p.k8sAPIGroups.AddAPI(resource)
 }
 
-// reportCNPChangeMetrics generates metrics for changes (Add, Update, Delete) to
+// reportCNPChangeMetrics generates metrics for changes(Update, Delete) to
 // Cilium Network Policies depending on the operation's success.
-func reportCNPChangeMetrics(err error) {
+func reportCNPChangeMetrics(op string, err error) {
 	if err != nil {
-		metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeFail).Inc()
+		metrics.PolicyChangeTotal.WithLabelValues(string(source.CustomResource), op, metrics.LabelValueOutcomeFail).Inc()
 	} else {
-		metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeSuccess).Inc()
+		metrics.PolicyChangeTotal.WithLabelValues(string(source.CustomResource), op, metrics.LabelValueOutcomeSuccess).Inc()
 	}
 }
 
